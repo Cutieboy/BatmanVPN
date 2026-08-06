@@ -1,6 +1,7 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
+    sync::{atomic::AtomicBool, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -23,17 +24,34 @@ pub(crate) fn negotiate(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    negotiate_with_stop(socket, config, None)
+}
+
+pub(crate) fn negotiate_interruptible(
+    socket: UdpSocket,
+    config: &ValidatedClientConfig,
+    stopping: &AtomicBool,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    negotiate_with_stop(socket, config, Some(stopping))
+}
+
+fn negotiate_with_stop(
+    socket: UdpSocket,
+    config: &ValidatedClientConfig,
+    stopping: Option<&AtomicBool>,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
     socket
         .connect(config.server)
         .context("UDP connect failed")?;
     let mut transport = UdpTransport::from_socket(socket, config.server)?;
-    let (plane, parameters) = renegotiate(&mut transport, config)?;
+    let (plane, parameters) = renegotiate(&mut transport, config, stopping)?;
     Ok((transport, plane, parameters))
 }
 
-pub(crate) fn renegotiate(
+fn renegotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
+    stopping: Option<&AtomicBool>,
 ) -> Result<(TunnelDataPlane, SessionParameters)> {
     let mut session_bytes = [0_u8; 8];
     getrandom::fill(&mut session_bytes).context("random generator failed")?;
@@ -64,6 +82,9 @@ pub(crate) fn renegotiate(
 
     let mut buffer = vec![0_u8; 65_535];
     loop {
+        if stopping.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(anyhow!("handshake cancelled"));
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(anyhow!("handshake timed out"));

@@ -1,6 +1,10 @@
 package dev.mousevpn.app
 
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import org.json.JSONObject
@@ -11,6 +15,21 @@ class MouseVpnService : VpnService() {
     private val executor = Executors.newSingleThreadExecutor()
     private var task: Future<*>? = null
     @Volatile private var handle = 0L
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = signalNetworkChange()
+
+        override fun onLost(network: Network) = signalNetworkChange()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        getSystemService(ConnectivityManager::class.java)
+            .registerNetworkCallback(request, networkCallback)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_DISCONNECT) {
@@ -101,6 +120,11 @@ class MouseVpnService : VpnService() {
         )
     }
 
+    private fun signalNetworkChange() {
+        val current = handle
+        if (current != 0L) NativeBridge.networkChanged(current)
+    }
+
     override fun onRevoke() {
         disconnect()
         super.onRevoke()
@@ -110,6 +134,10 @@ class MouseVpnService : VpnService() {
         val current = handle
         handle = 0L
         if (current != 0L) NativeBridge.stop(current)
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)
+                .unregisterNetworkCallback(networkCallback)
+        }
         super.onDestroy()
     }
 
