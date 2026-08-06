@@ -36,8 +36,11 @@ selected explicitly:
 ```sh
 sudo ./mousevpn-proxy-client \
   --config /etc/mousevpn/friend-linux-proxy.toml \
-  --listen 127.0.0.1:1081
+  --port 1081
 ```
+
+The proxy still binds only to `127.0.0.1`. The equivalent advanced form is
+`--listen 127.0.0.1:1081`; do not pass both options together.
 
 Stop it with `Ctrl+C`. Normal shutdown removes the TUN interface and policy
 route.
