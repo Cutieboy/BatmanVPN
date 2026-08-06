@@ -36,17 +36,26 @@ fn serves_three_authorized_udp_clients_and_ignores_unknown_key() {
     });
 
     assert_unknown_client_is_ignored(server_addr, server_public, context);
-    for (index, device) in devices.iter().enumerate() {
-        let message = format!("hello from friend {index}");
-        let echoed = run_client(
-            server_addr,
-            server_public,
-            context,
-            100 + u64::try_from(index).expect("session index"),
-            device,
-            message.as_bytes(),
-        );
-        assert_eq!(echoed, message.as_bytes());
+    let clients: Vec<_> = devices
+        .into_iter()
+        .enumerate()
+        .map(|(index, device)| {
+            thread::spawn(move || {
+                let message = format!("hello from friend {index}");
+                let echoed = run_client(
+                    server_addr,
+                    server_public,
+                    context,
+                    100 + u64::try_from(index).expect("session index"),
+                    &device,
+                    message.as_bytes(),
+                );
+                assert_eq!(echoed, message.as_bytes());
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().expect("client thread");
     }
 
     server_thread.join().expect("server thread");

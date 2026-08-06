@@ -24,12 +24,16 @@ struct ClientLease {
 }
 
 struct RuntimeSession {
-    peer: SocketAddr,
     client_address: Ipv4Addr,
+    state: Mutex<SessionState>,
+}
+
+struct SessionState {
+    peer: SocketAddr,
     plane: TunnelDataPlane,
 }
 
-type SessionMap = Arc<Mutex<HashMap<u64, RuntimeSession>>>;
+type SessionMap = Arc<Mutex<HashMap<u64, Arc<RuntimeSession>>>>;
 
 /// Creates the server TUN/UDP endpoints and runs until a fatal I/O error.
 ///
@@ -81,20 +85,20 @@ fn handle_keepalive(
     sessions: &SessionMap,
 ) {
     let response = {
-        let Ok(mut guard) = sessions.lock() else {
+        let Some(session) = find_session(sessions, datagram.header.session_id) else {
             return;
         };
-        let Some(session) = guard.get_mut(&datagram.header.session_id) else {
+        let Ok(mut state) = session.state.lock() else {
             return;
         };
-        if session.peer != peer {
+        if state.peer != peer {
             return;
         }
         let encoded = datagram.encode();
-        if !matches!(session.plane.decode(&encoded), Ok(DecodedPacket::Keepalive)) {
+        if !matches!(state.plane.decode(&encoded), Ok(DecodedPacket::Keepalive)) {
             return;
         }
-        let Ok(response) = session.plane.encode_keepalive() else {
+        let Ok(response) = state.plane.encode_keepalive() else {
             return;
         };
         response
@@ -156,15 +160,17 @@ fn handle_handshake(
     }
     guard.insert(
         datagram.header.session_id,
-        RuntimeSession {
-            peer,
+        Arc::new(RuntimeSession {
             client_address: client.address,
-            plane: TunnelDataPlane::new(
-                datagram.header.session_id,
-                usize::from(config.tun.mtu),
-                crypto,
-            ),
-        },
+            state: Mutex::new(SessionState {
+                peer,
+                plane: TunnelDataPlane::new(
+                    datagram.header.session_id,
+                    usize::from(config.tun.mtu),
+                    crypto,
+                ),
+            }),
+        }),
     );
     drop(guard);
 
@@ -185,17 +191,17 @@ fn handle_client_data(
     tun: &LinuxTun,
 ) {
     let packet = {
-        let Ok(mut guard) = sessions.lock() else {
+        let Some(session) = find_session(sessions, datagram.header.session_id) else {
             return;
         };
-        let Some(session) = guard.get_mut(&datagram.header.session_id) else {
+        let Ok(mut state) = session.state.lock() else {
             return;
         };
-        if session.peer != peer {
+        if state.peer != peer {
             return;
         }
         let encoded = datagram.encode();
-        let Ok(packet) = session.plane.decode_ip(&encoded) else {
+        let Ok(packet) = state.plane.decode_ip(&encoded) else {
             return;
         };
         let Ok(ip) = Ipv4Packet::parse(&packet) else {
@@ -216,22 +222,32 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
             let Ok(ip) = Ipv4Packet::parse(&packet[..length]) else {
                 continue;
             };
-            let encoded = {
-                let Ok(mut guard) = sessions.lock() else {
+            let session = {
+                let Ok(guard) = sessions.lock() else {
                     break;
                 };
-                let Some(session) = guard
-                    .values_mut()
+                guard
+                    .values()
                     .find(|session| session.client_address == ip.destination())
-                else {
+                    .cloned()
+            };
+            let Some(session) = session else {
+                continue;
+            };
+            let encoded = {
+                let Ok(mut state) = session.state.lock() else {
                     continue;
                 };
-                let Ok(datagram) = session.plane.encode_ip(ip.as_bytes()) else {
+                let Ok(datagram) = state.plane.encode_ip(ip.as_bytes()) else {
                     continue;
                 };
-                (datagram, session.peer)
+                (datagram, state.peer)
             };
             let _ = socket.send_to(&encoded.0, encoded.1);
         }
     });
+}
+
+fn find_session(sessions: &SessionMap, session_id: u64) -> Option<Arc<RuntimeSession>> {
+    sessions.lock().ok()?.get(&session_id).cloned()
 }
