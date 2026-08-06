@@ -40,7 +40,7 @@ There is deliberately no fixed ASCII product magic in the datagram. A universal
 clear-text marker would create an unnecessary filtering signature. The remaining
 header is still observable and is not claimed to resist traffic classification.
 
-The 24-byte outer header is routing metadata. It is not currently passed as AEAD
+The 20-byte outer header is routing metadata. It is not currently passed as AEAD
 associated data. Therefore authenticated message semantics must live inside the
 encrypted Noise payload; receivers must not make security decisions from outer
 `kind` or `flags` alone. Binding the final header design cryptographically is a
@@ -69,7 +69,7 @@ Requirements:
 
 - a sender never repeats a sequence under the same directional key;
 - sequence exhaustion terminates the session before wraparound;
-- receivers accept authenticated reordering within 128 sequence numbers;
+- receivers accept authenticated reordering within 1024 sequence numbers;
 - duplicates and packets older than the replay window are rejected;
 - failed authentication never advances the replay window;
 - a session is replaced before rekeying or counter exhaustion in the MVP.
@@ -82,3 +82,17 @@ Inner data framing and maximum tunnel MTU are not yet frozen.
 Noise messages are limited to 65,535 bytes including the authentication tag.
 Actual UDP datagrams will be much smaller and derived from the tunnel MTU.
 Implementations must reject oversized messages before allocation where possible.
+
+## Tunnel MTU and path overhead
+
+Every tunnelled IP packet costs 37 bytes inside the datagram (20 outer header,
+1 inner packet kind, 16 authentication tag) plus 28 bytes of outer IPv4 and UDP
+headers: 65 bytes in total.
+
+On the usual 1500-byte path the tunnel MTU must therefore not exceed 1435, and
+the default is 1420 to leave room for PPPoE and similar encapsulation. A larger
+value does not fail cleanly: small packets still work while large ones are
+fragmented, or silently dropped wherever fragments are filtered, so the tunnel
+appears merely slow or unstable. The server logs a warning at startup when its
+configured MTU exceeds the safe value, and the deployment ruleset clamps the
+TCP MSS of forwarded connections to the tunnel's route MTU.

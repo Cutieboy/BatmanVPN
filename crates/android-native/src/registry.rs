@@ -1,10 +1,9 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
-        Arc, Mutex, OnceLock,
+        atomic::{AtomicI64, Ordering},
+        Mutex, OnceLock,
     },
-    thread::JoinHandle,
 };
 
 use anyhow::{anyhow, Result};
@@ -13,22 +12,19 @@ use mousevpn_data_plane::TunnelDataPlane;
 use mousevpn_protocol::SessionParameters;
 use mousevpn_transport::UdpTransport;
 
+use crate::session::SpawnedSession;
+
 pub(crate) struct PendingSession {
     pub transport: UdpTransport,
     pub plane: TunnelDataPlane,
     pub config: ValidatedClientConfig,
     pub parameters: SessionParameters,
-}
-
-struct RunningSession {
-    stopping: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
-    worker: JoinHandle<()>,
+    pub protector: crate::socket_protector::SocketProtector,
 }
 
 enum Entry {
     Pending(Box<PendingSession>),
-    Running(RunningSession),
+    Running(SpawnedSession),
 }
 
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
@@ -65,24 +61,21 @@ pub(crate) fn take_pending(handle: i64) -> Result<PendingSession> {
     }
 }
 
-pub(crate) fn insert_running(
-    handle: i64,
-    stopping: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
-    worker: JoinHandle<()>,
-) -> Result<()> {
+pub(crate) fn insert_running(handle: i64, session: SpawnedSession) -> Result<()> {
     registry()
         .lock()
         .map_err(|_| anyhow!("session registry is poisoned"))?
-        .insert(
-            handle,
-            Entry::Running(RunningSession {
-                stopping,
-                alive,
-                worker,
-            }),
-        );
+        .insert(handle, Entry::Running(session));
     Ok(())
+}
+
+pub(crate) fn network_changed(handle: i64) {
+    let Ok(map) = registry().lock() else {
+        return;
+    };
+    if let Some(Entry::Running(session)) = map.get(&handle) {
+        session.reconnect_requested.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) fn status(handle: i64) -> &'static str {

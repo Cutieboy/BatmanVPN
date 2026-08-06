@@ -23,6 +23,12 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.85"
 
+# The packet path is small and hot: whole-program inlining across the protocol,
+# crypto and data-plane crates is worth the longer build.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

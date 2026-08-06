@@ -19,14 +19,32 @@ pub struct ServerConfig {
     pub clients: Vec<AuthorizedClientConfig>,
 }
 
+/// Tunnel MTU that still fits a 1500-byte path.
+///
+/// Every tunnelled packet costs 20 bytes of outer IP, 8 of UDP, 20 of protocol
+/// header, 1 of inner framing and 16 of authentication tag: 65 in total. A
+/// tunnel MTU above [`MAX_SAFE_TUN_MTU`] therefore produces outer datagrams
+/// that a 1500-byte path has to fragment, which costs throughput and breaks
+/// outright wherever fragments are filtered. The margin below the maximum
+/// leaves room for `PPPoE` and similar encapsulation.
+pub const DEFAULT_TUN_MTU: u16 = 1_420;
+
+/// Largest tunnel MTU that never fragments on a 1500-byte path.
+pub const MAX_SAFE_TUN_MTU: u16 = 1_435;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ServerTunConfig {
     #[serde(default = "default_tun_name")]
     pub name: String,
     pub address: Ipv4Addr,
     pub prefix_len: u8,
+    #[serde(default = "default_tun_mtu")]
     pub mtu: u16,
     pub dns: Ipv4Addr,
+}
+
+const fn default_tun_mtu() -> u16 {
+    DEFAULT_TUN_MTU
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

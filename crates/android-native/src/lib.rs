@@ -4,3 +4,4 @@ mod handshake;
 mod jni_api;
 mod registry;
 mod session;
+mod socket_protector;

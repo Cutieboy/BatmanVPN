@@ -12,5 +12,5 @@ pub use keys::{decode_public_key, decode_secret_key, encode_public_key, encode_s
 pub use load::load_toml;
 pub use server::{
     AuthorizedClientConfig, ServerConfig, ServerTunConfig, ValidatedAuthorizedClient,
-    ValidatedServerConfig,
+    ValidatedServerConfig, DEFAULT_TUN_MTU, MAX_SAFE_TUN_MTU,
 };

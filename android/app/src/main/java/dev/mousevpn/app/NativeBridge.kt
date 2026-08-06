@@ -13,6 +13,7 @@ object NativeBridge {
     ): String
 
     external fun start(handle: Long, tunFd: Int): Boolean
+    external fun networkChanged(handle: Long)
     external fun stop(handle: Long)
     external fun status(handle: Long): String
 }

@@ -9,9 +9,9 @@ use std::{
 };
 
 use mousevpn_config::ValidatedClientConfig;
-use mousevpn_data_plane::{DecodedPacket, PacketDevice, TunnelDataPlane};
+use mousevpn_data_plane::{Decoded, PacketDevice, TunnelReceiver, TunnelSender};
 use mousevpn_linux_platform::LinuxTun;
-use mousevpn_protocol::SessionParameters;
+use mousevpn_protocol::{Datagram, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
 use crate::{
@@ -34,7 +34,10 @@ pub(crate) struct PacketLoop<'a> {
     pub(crate) transport: UdpTransport,
     pub(crate) parameters: SessionParameters,
     pub(crate) tun: Arc<LinuxTun>,
-    pub(crate) plane: Arc<Mutex<TunnelDataPlane>>,
+    /// Owned outright: the receive direction shares no state with the sender,
+    /// so decryption needs no lock at all.
+    pub(crate) receiver: TunnelReceiver,
+    pub(crate) sender: Arc<Mutex<TunnelSender>>,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) reconnecting: Arc<AtomicBool>,
     pub(crate) worker: Receiver<Result<(), ClientError>>,
@@ -43,27 +46,36 @@ pub(crate) struct PacketLoop<'a> {
 impl PacketLoop<'_> {
     pub(crate) fn run(mut self) -> Result<(), ClientError> {
         let mut datagram = vec![0_u8; PACKET_BUFFER_LEN];
+        // Reused across packets: the receive path allocates nothing in steady state.
+        let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
+        let mut keepalive = Vec::with_capacity(128);
         let mut liveness = Liveness::new(Instant::now());
+
         while !self.stopping.load(Ordering::Relaxed) {
             check_worker(&self.worker)?;
             match self.receive(&mut datagram)? {
                 ReceiveEvent::Packet(length) => {
-                    let decoded = self
-                        .plane
-                        .lock()
-                        .map_err(|_| ClientError::WorkerStopped)?
-                        .decode(&datagram[..length]);
-                    if let Ok(packet) = decoded {
-                        liveness.packet_received(Instant::now());
-                        if let DecodedPacket::Ip(packet) = packet {
-                            self.tun.send(&packet)?;
+                    if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
+                        match self.receiver.decode_into(parsed, &mut plaintext) {
+                            Ok(Decoded::Ip(packet)) => {
+                                liveness.packet_received(Instant::now());
+                                // A failed TUN write costs one packet; the
+                                // tunnel itself stays up.
+                                if let Err(error) = self.tun.send(packet) {
+                                    if !is_recoverable(&error) {
+                                        return Err(error.into());
+                                    }
+                                }
+                            }
+                            Ok(Decoded::Keepalive) => liveness.packet_received(Instant::now()),
+                            Err(_) => {}
                         }
                     }
                 }
                 ReceiveEvent::Idle => {}
                 ReceiveEvent::PeerUnavailable => liveness.connection_lost(Instant::now()),
             }
-            self.maintain_liveness(&mut liveness)?;
+            self.maintain_liveness(&mut liveness, &mut keepalive)?;
         }
         Ok(())
     }
@@ -82,16 +94,21 @@ impl PacketLoop<'_> {
                 Ok(ReceiveEvent::Idle)
             }
             Err(error) if is_peer_unavailable(&error) => Ok(ReceiveEvent::PeerUnavailable),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(ReceiveEvent::Idle),
             Err(error) => Err(error.into()),
         }
     }
 
-    fn maintain_liveness(&mut self, liveness: &mut Liveness) -> Result<(), ClientError> {
+    fn maintain_liveness(
+        &mut self,
+        liveness: &mut Liveness,
+        keepalive: &mut Vec<u8>,
+    ) -> Result<(), ClientError> {
         let now = Instant::now();
         match liveness.action(now) {
             Action::None => Ok(()),
             Action::Keepalive => {
-                match send_keepalive(&mut self.transport, &self.plane) {
+                match self.send_keepalive(keepalive) {
                     Ok(()) => liveness.keepalive_sent(now),
                     Err(ClientError::Io(error)) if is_peer_unavailable(&error) => {
                         liveness.connection_lost(now);
@@ -102,6 +119,15 @@ impl PacketLoop<'_> {
             }
             Action::Reconnect => self.reconnect(liveness, now),
         }
+    }
+
+    fn send_keepalive(&mut self, buffer: &mut Vec<u8>) -> Result<(), ClientError> {
+        self.sender
+            .lock()
+            .map_err(|_| ClientError::WorkerStopped)?
+            .encode_keepalive_into(buffer)?;
+        self.transport.send(buffer)?;
+        Ok(())
     }
 
     fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) -> Result<(), ClientError> {
@@ -116,7 +142,9 @@ impl PacketLoop<'_> {
                     self.reconnecting.store(false, Ordering::Relaxed);
                     return Err(ClientError::SessionParametersChanged);
                 }
-                *self.plane.lock().map_err(|_| ClientError::WorkerStopped)? = replacement;
+                let (sender, receiver) = replacement.split();
+                self.receiver = receiver;
+                *self.sender.lock().map_err(|_| ClientError::WorkerStopped)? = sender;
                 liveness.reconnected(Instant::now());
                 eprintln!("MouseVPN reconnected");
             }
@@ -125,18 +153,6 @@ impl PacketLoop<'_> {
         self.reconnecting.store(false, Ordering::Relaxed);
         Ok(())
     }
-}
-
-fn send_keepalive(
-    transport: &mut impl DatagramTransport,
-    plane: &Mutex<TunnelDataPlane>,
-) -> Result<(), ClientError> {
-    let packet = plane
-        .lock()
-        .map_err(|_| ClientError::WorkerStopped)?
-        .encode_keepalive()?;
-    transport.send(&packet)?;
-    Ok(())
 }
 
 fn check_worker(receiver: &Receiver<Result<(), ClientError>>) -> Result<(), ClientError> {
@@ -161,4 +177,8 @@ fn is_peer_unavailable(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::NotConnected
     )
+}
+
+fn is_recoverable(error: &io::Error) -> bool {
+    is_timeout(error) || error.kind() == io::ErrorKind::Interrupted
 }

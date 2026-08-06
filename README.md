@@ -9,7 +9,8 @@ must not be presented as anonymous, unblockable or production-hardened software.
 
 See [ROADMAP.md](ROADMAP.md) for scope, milestones and acceptance criteria.
 The Russian installation and terminal-client guide is in
-[MANUAL.md](MANUAL.md).
+[MANUAL.md](MANUAL.md), and the Russian upgrade and rebuild instructions are in
+[docs/UPGRADE.md](docs/UPGRADE.md).
 The private in-tunnel management UI and API are documented in
 [docs/ADMIN_API.md](docs/ADMIN_API.md).
 The browser and Telegram SOCKS5 client is documented in

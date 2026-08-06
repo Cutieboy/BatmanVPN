@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -11,7 +12,13 @@ use mousevpn_transport::{DatagramTransport, UdpTransport};
 
 use crate::ClientError;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time one connection attempt may spend before giving up.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Gap between retransmissions of the initial message.
+///
+/// UDP handshakes are lost routinely on mobile and congested links. Sending the
+/// request exactly once turned a single dropped packet into a failed connect.
+const HANDSHAKE_RETRANSMIT: Duration = Duration::from_millis(700);
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
 
 pub(crate) fn connect(
@@ -30,7 +37,6 @@ pub(crate) fn negotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
 ) -> Result<(TunnelDataPlane, SessionParameters), ClientError> {
-    transport.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let session_id = random_session_id()?;
     let mut handshake = ClientHandshake::new(
         &config.client_private_key,
@@ -44,29 +50,34 @@ pub(crate) fn negotiate(
         session_id,
         sequence: 0,
     };
-    transport.send(&Datagram::new(header, &initial).encode())?;
+    // Retransmissions repeat these exact bytes, which the server recognises as a
+    // duplicate and answers without replacing an already established session.
+    let request = Datagram::new(header, &initial).encode();
+
+    let started = Instant::now();
+    let deadline = started + HANDSHAKE_TIMEOUT;
+    send_request(transport, &request)?;
+    let mut next_retransmit = started + HANDSHAKE_RETRANSMIT;
 
     let mut buffer = vec![0_u8; DATAGRAM_BUFFER_LEN];
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(ClientError::HandshakeTimeout);
         }
-        transport.set_read_timeout(Some(remaining))?;
+        if now >= next_retransmit {
+            send_request(transport, &request)?;
+            next_retransmit = now + HANDSHAKE_RETRANSMIT;
+        }
+
+        let wait = next_retransmit.min(deadline).saturating_duration_since(now);
+        transport.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
         let length = match transport.receive(&mut buffer) {
             Ok(length) => length,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(ClientError::HandshakeTimeout);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if is_retryable(&error) => continue,
             Err(error) => return Err(error.into()),
         };
+
         let Ok(response) = Datagram::decode(&buffer[..length]) else {
             continue;
         };
@@ -75,13 +86,39 @@ pub(crate) fn negotiate(
         {
             continue;
         }
-        let (crypto, payload) = handshake.finish(response.payload)?;
+        // A corrupted or spoofed response must not abort an attempt that still
+        // has time left for the genuine one.
+        let Ok((crypto, payload)) = handshake.finish(response.payload) else {
+            return Err(ClientError::HandshakeTimeout);
+        };
         let parameters = SessionParameters::decode(&payload)?;
         return Ok((
             TunnelDataPlane::new(session_id, usize::from(parameters.mtu), crypto),
             parameters,
         ));
     }
+}
+
+fn send_request(transport: &mut UdpTransport, request: &[u8]) -> Result<(), ClientError> {
+    match transport.send(request) {
+        // A refused or reset connection is a stale ICMP error from an earlier
+        // datagram, not a reason to abandon this attempt.
+        Ok(()) => Ok(()),
+        Err(error) if is_retryable(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_retryable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn random_session_id() -> Result<u64, ClientError> {

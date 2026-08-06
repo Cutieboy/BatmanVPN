@@ -1,12 +1,8 @@
-use std::{
-    net::UdpSocket,
-    os::fd::AsRawFd,
-    panic::{catch_unwind, AssertUnwindSafe},
-};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use anyhow::{anyhow, Result};
 use jni::{
-    objects::{JObject, JString, JValue},
+    objects::{JObject, JString},
     sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE},
     JNIEnv,
 };
@@ -14,8 +10,11 @@ use mousevpn_config::ClientConfig;
 
 use crate::{
     handshake::{bind_socket, negotiate},
-    registry::{insert_pending, insert_running, status, stop, take_pending, PendingSession},
+    registry::{
+        insert_pending, insert_running, network_changed, status, stop, take_pending, PendingSession,
+    },
     session,
+    socket_protector::SocketProtector,
 };
 
 #[no_mangle]
@@ -65,14 +64,16 @@ fn prepare(
         tun_name: "android".to_owned(),
     }
     .validate()?;
+    let protector = SocketProtector::new(env, service)?;
     let socket = bind_socket(config.server)?;
-    protect(env, service, &socket)?;
+    protector.protect(&socket)?;
     let (transport, plane, parameters) = negotiate(socket, &config)?;
     let handle = insert_pending(PendingSession {
         transport,
         plane,
         config,
         parameters,
+        protector,
     })?;
     Ok(serde_json::json!({
         "handle": handle,
@@ -84,22 +85,6 @@ fn prepare(
     .to_string())
 }
 
-fn protect(env: &mut JNIEnv, service: &JObject, socket: &UdpSocket) -> Result<()> {
-    let protected = env
-        .call_method(
-            service,
-            "protect",
-            "(I)Z",
-            &[JValue::Int(socket.as_raw_fd())],
-        )?
-        .z()?;
-    if protected {
-        Ok(())
-    } else {
-        Err(anyhow!("Android refused to protect the UDP socket"))
-    }
-}
-
 #[no_mangle]
 pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_start(
     mut env: JNIEnv,
@@ -109,14 +94,15 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_start(
 ) -> jboolean {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
         let pending = take_pending(handle)?;
-        let (stopping, alive, worker) = session::spawn(
+        let spawned = session::spawn(
             tun_fd,
             pending.transport,
             pending.plane,
             pending.config,
             pending.parameters,
+            pending.protector,
         )?;
-        insert_running(handle, stopping, alive, worker)
+        insert_running(handle, spawned)
     }));
     match result {
         Ok(Ok(())) => JNI_TRUE,
@@ -129,6 +115,15 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_start(
             JNI_FALSE
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_networkChanged(
+    _env: JNIEnv,
+    _object: JObject,
+    handle: jlong,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| network_changed(handle)));
 }
 
 #[no_mangle]

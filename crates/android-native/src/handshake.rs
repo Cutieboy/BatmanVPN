@@ -1,6 +1,7 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
+    sync::{atomic::AtomicBool, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -11,25 +12,47 @@ use mousevpn_data_plane::TunnelDataPlane;
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time one connection attempt may spend before giving up.
+const TIMEOUT: Duration = Duration::from_secs(10);
+/// Gap between retransmissions of the initial message.
+///
+/// Mobile links drop handshake datagrams routinely, and sending the request
+/// exactly once turned a single lost packet into a failed connect.
+const RETRANSMIT: Duration = Duration::from_millis(700);
 
 pub(crate) fn negotiate(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    negotiate_with_stop(socket, config, None)
+}
+
+pub(crate) fn negotiate_interruptible(
+    socket: UdpSocket,
+    config: &ValidatedClientConfig,
+    stopping: &AtomicBool,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    negotiate_with_stop(socket, config, Some(stopping))
+}
+
+fn negotiate_with_stop(
+    socket: UdpSocket,
+    config: &ValidatedClientConfig,
+    stopping: Option<&AtomicBool>,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
     socket
         .connect(config.server)
         .context("UDP connect failed")?;
     let mut transport = UdpTransport::from_socket(socket, config.server)?;
-    let (plane, parameters) = renegotiate(&mut transport, config)?;
+    let (plane, parameters) = renegotiate(&mut transport, config, stopping)?;
     Ok((transport, plane, parameters))
 }
 
-pub(crate) fn renegotiate(
+fn renegotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
+    stopping: Option<&AtomicBool>,
 ) -> Result<(TunnelDataPlane, SessionParameters)> {
-    transport.set_read_timeout(Some(TIMEOUT))?;
     let mut session_bytes = [0_u8; 8];
     getrandom::fill(&mut session_bytes).context("random generator failed")?;
     let session_id = u64::from_be_bytes(session_bytes);
@@ -39,38 +62,43 @@ pub(crate) fn renegotiate(
         &config.context,
     )?;
     let initial = handshake.write_initial(&[])?;
-    transport.send(
-        &Datagram::new(
-            Header {
-                kind: PacketKind::HandshakeInit,
-                flags: 0,
-                session_id,
-                sequence: 0,
-            },
-            &initial,
-        )
-        .encode(),
-    )?;
+    // Retransmissions repeat these exact bytes, which the server recognises as a
+    // duplicate and answers without replacing an already established session.
+    let request = Datagram::new(
+        Header {
+            kind: PacketKind::HandshakeInit,
+            flags: 0,
+            session_id,
+            sequence: 0,
+        },
+        &initial,
+    )
+    .encode();
+
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
+    send_request(transport, &request)?;
+    let mut next_retransmit = started + RETRANSMIT;
 
     let mut buffer = vec![0_u8; 65_535];
-    let deadline = Instant::now() + TIMEOUT;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if stopping.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(anyhow!("handshake cancelled"));
+        }
+        let now = Instant::now();
+        if now >= deadline {
             return Err(anyhow!("handshake timed out"));
         }
-        transport.set_read_timeout(Some(remaining))?;
+        if now >= next_retransmit {
+            send_request(transport, &request)?;
+            next_retransmit = now + RETRANSMIT;
+        }
+
+        let wait = next_retransmit.min(deadline).saturating_duration_since(now);
+        transport.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
         let length = match transport.receive(&mut buffer) {
             Ok(length) => length,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(anyhow!("handshake timed out"));
-            }
+            Err(error) if is_retryable(&error) => continue,
             Err(error) => return Err(error.into()),
         };
         let Ok(response) = Datagram::decode(&buffer[..length]) else {
@@ -88,6 +116,28 @@ pub(crate) fn renegotiate(
             parameters,
         ));
     }
+}
+
+fn send_request(transport: &mut UdpTransport, request: &[u8]) -> Result<()> {
+    match transport.send(request) {
+        // A refused or reset connection is a stale ICMP error from an earlier
+        // datagram, not a reason to abandon this attempt.
+        Ok(()) => Ok(()),
+        Err(error) if is_retryable(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_retryable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
 }
 
 pub(crate) fn bind_socket(server: SocketAddr) -> Result<UdpSocket> {

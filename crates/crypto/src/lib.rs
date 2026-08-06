@@ -11,8 +11,8 @@ pub use context::ProtocolContext;
 pub use error::CryptoError;
 pub use handshake::{ClientHandshake, ServerHandshake};
 pub use keys::{KeyPair, PublicKey, SecretKey, KEY_LEN};
-pub use replay::ReplayError;
-pub use session::SecureSession;
+pub use replay::{ReplayError, REPLAY_WINDOW_SIZE};
+pub use session::{ReceiveHalf, SecureSession, SendHalf, AUTH_TAG_LEN};
 
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 pub const MAX_NOISE_MESSAGE_LEN: usize = 65_535;

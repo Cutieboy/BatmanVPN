@@ -10,4 +10,15 @@ table inet mousevpn {
 
         oifname $mousevpn_wan ip saddr $mousevpn_net masquerade
     }
+
+    # Clamp the TCP handshake to what the tunnel can actually carry.
+    #
+    # Without this, a peer that never receives the "fragmentation needed" ICMP
+    # keeps sending full-size segments: small requests succeed, large responses
+    # stall, and the tunnel looks intermittently broken rather than misconfigured.
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+
+        tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+    }
 }
