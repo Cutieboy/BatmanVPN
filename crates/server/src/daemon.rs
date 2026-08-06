@@ -51,13 +51,16 @@ impl RuntimeSession {
     /// Clients behind NAT change source port on rebinding and change address
     /// entirely when roaming between networks. Without this the session stalls
     /// until the client's own idle timeout forces a fresh handshake.
-    fn adopt_peer(&self, peer: SocketAddr, name: &str) {
+    fn adopt_peer(&self, peer: SocketAddr) {
         if self.peer() == Some(peer) {
             return;
         }
         if let Ok(mut current) = self.peer.write() {
             if *current != peer {
-                eprintln!("session for {name} moved from {} to {peer}", *current);
+                eprintln!(
+                    "session for {} moved from {} to {peer}",
+                    self.client_address, *current
+                );
                 *current = peer;
             }
         }
@@ -215,7 +218,7 @@ fn handle_keepalive(
             return;
         }
     }
-    session.adopt_peer(peer, &session.client_address.to_string());
+    session.adopt_peer(peer);
     {
         let Ok(mut outbound) = session.outbound.lock() else {
             return;
@@ -334,7 +337,7 @@ fn handle_client_data(
     }
     let _ = tun.send(packet);
     drop(inbound);
-    session.adopt_peer(peer, &session.client_address.to_string());
+    session.adopt_peer(peer);
 }
 
 fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap) {
