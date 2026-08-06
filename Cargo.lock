@@ -867,6 +867,8 @@ dependencies = [
  "mousevpn-protocol",
  "mousevpn-transport",
  "signal-hook",
+ "socket2",
+ "tokio",
 ]
 
 [[package]]
@@ -898,6 +900,14 @@ dependencies = [
 [[package]]
 name = "mousevpn-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "mousevpn-proxy-client"
+version = "0.1.0"
+dependencies = [
+ "mousevpn-config",
+ "mousevpn-linux-client",
+]
 
 [[package]]
 name = "mousevpn-server"
@@ -1495,6 +1505,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

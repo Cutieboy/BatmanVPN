@@ -15,6 +15,8 @@ mousevpn-linux-platform = { path = "../linux-platform" }
 mousevpn-protocol = { path = "../protocol" }
 mousevpn-transport = { path = "../transport" }
 signal-hook = "0.3"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1.53", features = ["io-util", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

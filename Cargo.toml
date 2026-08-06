@@ -13,6 +13,7 @@ members = [
     "crates/android-native",
     "crates/profile-cli",
     "crates/device-cli",
+    "crates/proxy-client",
 ]
 resolver = "2"
 

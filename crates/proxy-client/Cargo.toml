@@ -1,0 +1,13 @@
+[package]
+name = "mousevpn-proxy-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mousevpn-config = { path = "../config" }
+mousevpn-linux-client = { path = "../linux-client" }
+
+[lints]
+workspace = true

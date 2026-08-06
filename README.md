@@ -12,6 +12,8 @@ The Russian installation and terminal-client guide is in
 [MANUAL.md](MANUAL.md).
 The private in-tunnel management UI and API are documented in
 [docs/ADMIN_API.md](docs/ADMIN_API.md).
+The browser and Telegram SOCKS5 client is documented in
+[docs/PROXY_CLIENT.md](docs/PROXY_CLIENT.md).
 Production readiness and draft network policy are tracked in
 [docs/PRODUCTION.md](docs/PRODUCTION.md).
 
@@ -22,6 +24,7 @@ Production readiness and draft network policy are tracked in
 - `transport`: UDP transport abstraction;
 - `data-plane`: encrypted IPv4 packet and keepalive processing;
 - `linux-client` / `linux-platform`: TUN, routing, DNS and kill switch;
+- `proxy-client`: loopback SOCKS5 client with isolated policy routing;
 - `server`: multi-device Linux TUN/NAT server;
 - `android-native`: Rust JNI adapter, keepalive and in-place reconnect;
 - `android`: Kotlin `VpnService`, profile manager and Android Keystore storage;
