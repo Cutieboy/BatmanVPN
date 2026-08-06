@@ -42,8 +42,8 @@ The command asks for a password twice and prints one opaque `MV1.…` token.
 - Multiple named server profiles, each with independent credentials, are kept in the encrypted catalog.
 - The imported profile is encrypted again with an Android Keystore key at rest.
 - The private client key is never displayed or written to logs.
-- IPv6 is routed into the VPN and dropped by the IPv4-only Rust core, preventing
-  direct IPv6 leaks.
+- The Android VPN advertises only IPv4. Android blocks the unconfigured IPv6
+  family instead of routing it into the IPv4-only Rust core.
 - The UDP socket is protected with `VpnService.protect()` before connecting.
 
 This is an experimental MVP. Always-on VPN, network migration, biometric profile

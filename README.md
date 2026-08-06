@@ -8,6 +8,8 @@ MouseVPN is an early MVP. It has not received an independent security audit and
 must not be presented as anonymous, unblockable or production-hardened software.
 
 See [ROADMAP.md](ROADMAP.md) for scope, milestones and acceptance criteria.
+The Russian installation and terminal-client guide is in
+[MANUAL.md](MANUAL.md).
 The temporary localhost management endpoints are documented in
 [docs/ADMIN_API.md](docs/ADMIN_API.md).
 Production readiness and draft network policy are tracked in
