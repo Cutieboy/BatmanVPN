@@ -4,7 +4,11 @@ use std::{
     time::Duration,
 };
 
+use socket2::SockRef;
+
 use crate::DatagramTransport;
+
+const SOCKET_BUFFER_LEN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -28,6 +32,9 @@ impl UdpTransport {
     /// Returns an I/O error when connect fails.
     pub fn from_socket(socket: UdpSocket, peer: SocketAddr) -> io::Result<Self> {
         socket.connect(peer)?;
+        let socket_ref = SockRef::from(&socket);
+        socket_ref.set_recv_buffer_size(SOCKET_BUFFER_LEN)?;
+        socket_ref.set_send_buffer_size(SOCKET_BUFFER_LEN)?;
         Ok(Self { socket })
     }
 

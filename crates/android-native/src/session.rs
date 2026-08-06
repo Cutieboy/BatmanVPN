@@ -87,7 +87,7 @@ fn run(
                     {
                         Ok(DecodedPacket::Ip(ip)) => {
                             last_received = Instant::now();
-                            write_all_nonblocking(&mut tun, &ip)?;
+                            write_packet_nonblocking(&mut tun, &ip)?;
                         }
                         Ok(DecodedPacket::Keepalive) => last_received = Instant::now(),
                         Err(_) => {}
@@ -198,17 +198,17 @@ fn is_peer_unavailable(error: &io::Error) -> bool {
     )
 }
 
-fn write_all_nonblocking(tun: &mut File, mut packet: &[u8]) -> Result<()> {
-    while !packet.is_empty() {
+fn write_packet_nonblocking(tun: &mut File, packet: &[u8]) -> Result<()> {
+    loop {
         match tun.write(packet) {
             Ok(0) => return Err(anyhow!("TUN write returned zero")),
-            Ok(length) => packet = &packet[length..],
+            Ok(length) if length == packet.len() => return Ok(()),
+            Ok(_) => return Err(anyhow!("partial TUN packet write")),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
+            // Keep draining UDP when Android's TUN queue is temporarily full. TCP and QUIC
+            // recover an isolated dropped packet; blocking here instead stalls every flow.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
 }

@@ -907,6 +907,9 @@ dependencies = [
 [[package]]
 name = "mousevpn-transport"
 version = "0.1.0"
+dependencies = [
+ "socket2",
+]
 
 [[package]]
 name = "netconfig-rs"
