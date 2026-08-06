@@ -24,7 +24,8 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 
-    pub fn internal() -> Self {
+    pub fn internal_with(error: impl std::fmt::Display) -> Self {
+        eprintln!("MouseVPN admin error: {error}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
 

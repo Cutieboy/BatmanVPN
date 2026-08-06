@@ -7,12 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "0.8.9"
-base64 = "0.23.1"
+mousevpn-config = { path = "../config" }
 mousevpn-crypto = { path = "../crypto" }
-mousevpn-server = { path = "../server" }
+mousevpn-profile-cli = { path = "../profile-cli" }
 serde = { version = "1.0.229", features = ["derive"] }
 subtle = "2.6"
+tempfile = "3.20"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread"] }
+toml = "0.8"
 zeroize = "1.8"
 
 [dev-dependencies]

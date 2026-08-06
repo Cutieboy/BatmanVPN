@@ -11,6 +11,8 @@ use crate::{decode_public_key, decode_secret_key, ConfigError};
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub public_endpoint: Option<SocketAddr>,
     pub server_public_key: String,
     pub server_private_key: String,
     pub tun: ServerTunConfig,
@@ -42,6 +44,7 @@ pub struct ValidatedAuthorizedClient {
 
 pub struct ValidatedServerConfig {
     pub listen: SocketAddr,
+    pub public_endpoint: Option<SocketAddr>,
     pub server_public_key: PublicKey,
     pub server_private_key: SecretKey,
     pub context: ProtocolContext,
@@ -97,6 +100,7 @@ impl ServerConfig {
 
         Ok(ValidatedServerConfig {
             listen: self.listen,
+            public_endpoint: self.public_endpoint,
             server_private_key,
             context: ProtocolContext::for_server(&server_public_key),
             server_public_key,

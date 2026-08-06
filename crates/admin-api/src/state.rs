@@ -1,20 +1,27 @@
-use std::sync::{Arc, Mutex};
+use std::{net::SocketAddr, sync::Arc};
 
-use mousevpn_server::ServerState;
+use crate::{AdminToken, SharedDeviceRegistry};
 
-use crate::AdminToken;
+#[derive(Clone)]
+pub struct AdminSettings {
+    pub public_endpoint: SocketAddr,
+    pub server_public_key: String,
+    pub tun_name: String,
+}
 
 #[derive(Clone)]
 pub(crate) struct ApiState {
-    pub server: Arc<Mutex<ServerState>>,
+    pub registry: SharedDeviceRegistry,
     pub token: Arc<[u8]>,
+    pub settings: Arc<AdminSettings>,
 }
 
 impl ApiState {
-    pub fn new(server: Arc<Mutex<ServerState>>, token: AdminToken) -> Self {
+    pub fn new(registry: SharedDeviceRegistry, token: AdminToken, settings: AdminSettings) -> Self {
         Self {
-            server,
+            registry,
             token: token.into_bytes().into(),
+            settings: Arc::new(settings),
         }
     }
 }

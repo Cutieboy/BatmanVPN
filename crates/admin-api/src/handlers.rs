@@ -1,99 +1,117 @@
 use axum::{
     extract::{Path, State},
-    http::{header::AUTHORIZATION, HeaderMap},
+    http::HeaderMap,
     Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use mousevpn_crypto::{PublicKey, KEY_LEN};
-use mousevpn_server::UserId;
+use mousevpn_config::encode_secret_key;
+use mousevpn_profile_cli::{encrypt_profile, PortableProfile};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::{
     error::ApiError,
-    models::{CreateUserRequest, DeviceResponse, RevokeResponse, UserResponse},
+    models::{
+        CreateDeviceRequest, DeviceSummary, HealthResponse, ProvisionDeviceResponse, RevokeResponse,
+    },
     state::ApiState,
 };
 
-pub(crate) async fn create_user(
+pub(crate) async fn health(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<CreateUserRequest>,
-) -> Result<Json<UserResponse>, ApiError> {
+) -> Result<Json<HealthResponse>, ApiError> {
     authenticate(&headers, &state)?;
-    let mut server = state.server.lock().map_err(|_| ApiError::internal())?;
-    let user = server
-        .create_user(request.name, request.max_sessions)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    Ok(Json(UserResponse {
-        id: user.id.0,
-        name: user.name,
-        max_sessions: user.max_sessions,
-    }))
+    Ok(Json(HealthResponse { status: "ok" }))
+}
+
+pub(crate) async fn list_devices(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeviceSummary>>, ApiError> {
+    authenticate(&headers, &state)?;
+    let devices = state
+        .registry
+        .list()
+        .map_err(ApiError::internal_with)?
+        .into_iter()
+        .map(DeviceSummary::from)
+        .collect();
+    Ok(Json(devices))
 }
 
 pub(crate) async fn provision_device(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(user_id): Path<u64>,
-) -> Result<Json<DeviceResponse>, ApiError> {
+    Json(mut request): Json<CreateDeviceRequest>,
+) -> Result<Json<ProvisionDeviceResponse>, ApiError> {
     authenticate(&headers, &state)?;
-    let mut server = state.server.lock().map_err(|_| ApiError::internal())?;
-    let device = server
-        .provision_device(UserId(user_id))
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let mut secret = device.secret_key.expose_for_provisioning();
-    let response = DeviceResponse {
-        public_key: URL_SAFE_NO_PAD.encode(device.public_key.as_bytes()),
-        secret_key: URL_SAFE_NO_PAD.encode(secret),
-    };
-    secret.zeroize();
-    Ok(Json(response))
-}
-
-pub(crate) async fn revoke_user(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(user_id): Path<u64>,
-) -> Result<Json<RevokeResponse>, ApiError> {
-    authenticate(&headers, &state)?;
-    let mut server = state.server.lock().map_err(|_| ApiError::internal())?;
-    let result = server.revoke_user(UserId(user_id));
-    if !result.revoked {
-        return Err(ApiError::not_found("user not found"));
+    if matches!(request.platform, crate::DevicePlatform::Android)
+        && request.profile_password.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "Android profile requires a password of at least 8 characters",
+        ));
     }
-    Ok(Json(RevokeResponse {
-        revoked: result.revoked,
-        closed_sessions: result.closed_sessions,
+    if request
+        .profile_password
+        .as_ref()
+        .is_some_and(|password| password.len() < 8)
+    {
+        return Err(ApiError::bad_request(
+            "profile password must contain at least 8 characters",
+        ));
+    }
+    let provisioned = state
+        .registry
+        .provision(&request.name, request.platform)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let client_private_key = encode_secret_key(&provisioned.private_key);
+    let client_config = format!(
+        "server = \"{}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"{}\"\n",
+        state.settings.public_endpoint,
+        state.settings.server_public_key,
+        client_private_key,
+        state.settings.tun_name,
+    );
+    let profile = PortableProfile::new(
+        &provisioned.record.name,
+        state.settings.public_endpoint.to_string(),
+        &state.settings.server_public_key,
+        &client_private_key,
+    );
+    let profile_token = if let Some(mut password) = request.profile_password.take() {
+        let result = encrypt_profile(&profile, password.as_bytes());
+        password.zeroize();
+        Some(result.map_err(ApiError::internal_with)?)
+    } else {
+        None
+    };
+    Ok(Json(ProvisionDeviceResponse {
+        device: DeviceSummary::from(provisioned.record),
+        client_config,
+        profile_token,
     }))
 }
 
 pub(crate) async fn revoke_device(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(encoded_key): Path<String>,
+    Path(public_key): Path<String>,
 ) -> Result<Json<RevokeResponse>, ApiError> {
     authenticate(&headers, &state)?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(encoded_key)
-        .map_err(|_| ApiError::bad_request("invalid public key encoding"))?;
-    let key_bytes: [u8; KEY_LEN] = decoded
-        .try_into()
-        .map_err(|_| ApiError::bad_request("invalid public key length"))?;
-    let mut server = state.server.lock().map_err(|_| ApiError::internal())?;
-    let result = server.revoke_device(&PublicKey::from_bytes(key_bytes));
-    if !result.revoked {
+    let revoked = state
+        .registry
+        .revoke(&public_key)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if !revoked {
         return Err(ApiError::not_found("device key not found"));
     }
-    Ok(Json(RevokeResponse {
-        revoked: result.revoked,
-        closed_sessions: result.closed_sessions,
-    }))
+    Ok(Json(RevokeResponse { revoked }))
 }
 
 fn authenticate(headers: &HeaderMap, state: &ApiState) -> Result<(), ApiError> {
     let candidate = headers
-        .get(AUTHORIZATION)
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;

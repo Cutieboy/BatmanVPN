@@ -23,7 +23,7 @@ pub fn generate_example_configs(
     let server_keys = KeyPair::generate()?;
     let client_keys = KeyPair::generate()?;
     let server_config = format!(
-        "listen = \"0.0.0.0:{}\"\nserver_public_key = \"{}\"\nserver_private_key = \"{}\"\n\n[tun]\nname = \"mousevpn0\"\naddress = \"10.77.0.1\"\nprefix_len = 24\nmtu = 1280\ndns = \"1.1.1.1\"\n\n[[clients]]\nname = \"owner\"\npublic_key = \"{}\"\naddress = \"10.77.0.2\"\n",
+        "listen = \"0.0.0.0:{}\"\npublic_endpoint = \"{server_endpoint}\"\nserver_public_key = \"{}\"\nserver_private_key = \"{}\"\n\n[tun]\nname = \"mousevpn0\"\naddress = \"10.77.0.1\"\nprefix_len = 24\nmtu = 1280\ndns = \"1.1.1.1\"\n\n[[clients]]\nname = \"owner\"\npublic_key = \"{}\"\naddress = \"10.77.0.2\"\n",
         server_endpoint.port(),
         encode_public_key(&server_keys.public),
         encode_secret_key(&server_keys.secret),

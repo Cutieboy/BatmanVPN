@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mousevpn-admin-api = { path = "../admin-api" }
 mousevpn-config = { path = "../config" }
 mousevpn-crypto = { path = "../crypto" }
 mousevpn-data-plane = { path = "../data-plane" }
