@@ -1,0 +1,13 @@
+[Unit]
+Description=MouseVPN forwarding and NAT
+After=network-online.target docker.service
+Before=mousevpn-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/mousevpn-network start
+ExecStop=/usr/local/libexec/mousevpn-network stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

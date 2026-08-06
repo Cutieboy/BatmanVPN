@@ -1,0 +1,35 @@
+[Unit]
+Description=MouseVPN server
+Requires=mousevpn-network.service
+After=network-online.target mousevpn-network.service
+Wants=network-online.target
+ConditionPathExists=/etc/mousevpn/server.toml
+
+[Service]
+Type=simple
+User=mousevpn
+Group=mousevpn
+ExecStart=/usr/local/bin/mousevpn-server --config /etc/mousevpn/server.toml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+DeviceAllow=/dev/net/tun rw
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+StateDirectory=mousevpn
+ReadWritePaths=/var/lib/mousevpn
+
+[Install]
+WantedBy=multi-user.target

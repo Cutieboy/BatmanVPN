@@ -1,0 +1,21 @@
+[package]
+name = "mousevpn-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mousevpn-config = { path = "../config" }
+mousevpn-crypto = { path = "../crypto" }
+mousevpn-data-plane = { path = "../data-plane" }
+mousevpn-linux-platform = { path = "../linux-platform" }
+mousevpn-protocol = { path = "../protocol" }
+mousevpn-transport = { path = "../transport" }
+socket2 = "0.6"
+
+[dev-dependencies]
+mousevpn-transport = { path = "../transport" }
+
+[lints]
+workspace = true

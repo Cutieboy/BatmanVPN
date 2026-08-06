@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MouseVPN</string>
+    <string name="title">MouseVPN 🐭</string>
+    <string name="server_hint">IP и порт, например 198.51.100.10:51820</string>
+    <string name="password_hint">Пароль переносного профиля</string>
+    <string name="paste">Вставить</string>
+    <string name="copy">Копировать</string>
+    <string name="connect">Подключить</string>
+    <string name="disconnect">Отключить</string>
+    <string name="profile_missing">Сначала вставьте зашифрованный профиль</string>
+    <string name="status_disconnected">Отключено</string>
+</resources>

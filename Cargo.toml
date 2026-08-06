@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/protocol",
+    "crates/crypto",
+    "crates/transport",
+    "crates/client-core",
+    "crates/config",
+    "crates/data-plane",
+    "crates/linux-client",
+    "crates/linux-platform",
+    "crates/server",
+    "crates/admin-api",
+    "crates/android-native",
+    "crates/profile-cli",
+    "crates/device-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

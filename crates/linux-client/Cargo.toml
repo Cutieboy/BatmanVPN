@@ -1,0 +1,20 @@
+[package]
+name = "mousevpn-linux-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+getrandom = "0.3"
+mousevpn-client-core = { path = "../client-core" }
+mousevpn-config = { path = "../config" }
+mousevpn-crypto = { path = "../crypto" }
+mousevpn-data-plane = { path = "../data-plane" }
+mousevpn-linux-platform = { path = "../linux-platform" }
+mousevpn-protocol = { path = "../protocol" }
+mousevpn-transport = { path = "../transport" }
+signal-hook = "0.3"
+
+[lints]
+workspace = true

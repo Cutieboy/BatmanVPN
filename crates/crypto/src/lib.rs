@@ -1,0 +1,18 @@
+#![doc = "Cryptographic session boundary for `MouseVPN`."]
+
+mod context;
+mod error;
+mod handshake;
+mod keys;
+mod replay;
+mod session;
+
+pub use context::ProtocolContext;
+pub use error::CryptoError;
+pub use handshake::{ClientHandshake, ServerHandshake};
+pub use keys::{KeyPair, PublicKey, SecretKey, KEY_LEN};
+pub use replay::ReplayError;
+pub use session::SecureSession;
+
+pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
+pub const MAX_NOISE_MESSAGE_LEN: usize = 65_535;

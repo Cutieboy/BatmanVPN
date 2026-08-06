@@ -1,0 +1,17 @@
+[package]
+name = "mousevpn-device-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mousevpn-device"
+path = "src/main.rs"
+
+[dependencies]
+mousevpn-config = { path = "../config" }
+mousevpn-crypto = { path = "../crypto" }
+
+[lints]
+workspace = true

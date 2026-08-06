@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+TUN_INTERFACE=mousevpn0
+WAN_INTERFACE=eth0
+VPN_NETWORK=10.77.0.0/24
+NFT_RULESET=/etc/mousevpn/mousevpn.nft
+
+add_forward_rule() {
+    if ! iptables -w -C DOCKER-USER "$@" 2>/dev/null; then
+        iptables -w -I DOCKER-USER 1 "$@"
+    fi
+}
+
+delete_forward_rule() {
+    while iptables -w -C DOCKER-USER "$@" 2>/dev/null; do
+        iptables -w -D DOCKER-USER "$@"
+    done
+}
+
+start_network() {
+    nft -f "$NFT_RULESET"
+    if command -v iptables >/dev/null 2>&1 \
+        && iptables -w -S DOCKER-USER >/dev/null 2>&1; then
+        add_forward_rule -i "$TUN_INTERFACE" -o "$WAN_INTERFACE" \
+            -s "$VPN_NETWORK" -j ACCEPT
+        add_forward_rule -i "$WAN_INTERFACE" -o "$TUN_INTERFACE" \
+            -d "$VPN_NETWORK" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
+}
+
+stop_network() {
+    if command -v iptables >/dev/null 2>&1 \
+        && iptables -w -S DOCKER-USER >/dev/null 2>&1; then
+        delete_forward_rule -i "$TUN_INTERFACE" -o "$WAN_INTERFACE" \
+            -s "$VPN_NETWORK" -j ACCEPT
+        delete_forward_rule -i "$WAN_INTERFACE" -o "$TUN_INTERFACE" \
+            -d "$VPN_NETWORK" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
+    if nft list table inet mousevpn >/dev/null 2>&1; then
+        nft delete table inet mousevpn
+    fi
+}
+
+case "${1:-}" in
+    start)
+        start_network
+        ;;
+    stop)
+        stop_network
+        ;;
+    *)
+        echo "usage: mousevpn-network start|stop" >&2
+        exit 2
+        ;;
+esac

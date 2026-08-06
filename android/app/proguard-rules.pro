@@ -1,0 +1,1 @@
+-keep class dev.mousevpn.app.NativeBridge { *; }

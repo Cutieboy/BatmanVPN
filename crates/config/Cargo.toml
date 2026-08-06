@@ -1,0 +1,16 @@
+[package]
+name = "mousevpn-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+mousevpn-crypto = { path = "../crypto" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+zeroize = "1.8"
+
+[lints]
+workspace = true

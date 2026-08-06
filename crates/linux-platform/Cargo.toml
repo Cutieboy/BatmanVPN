@@ -1,0 +1,14 @@
+[package]
+name = "mousevpn-linux-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mousevpn-data-plane = { path = "../data-plane" }
+route_manager = "0.2.13"
+tun-rs = "2.8.8"
+
+[lints]
+workspace = true

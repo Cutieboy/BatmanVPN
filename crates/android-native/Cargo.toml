@@ -1,0 +1,26 @@
+[package]
+name = "mousevpn-android-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "mousevpn_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+getrandom = "0.3"
+jni = "0.21"
+mousevpn-config = { path = "../config" }
+mousevpn-crypto = { path = "../crypto" }
+mousevpn-data-plane = { path = "../data-plane" }
+mousevpn-protocol = { path = "../protocol" }
+mousevpn-transport = { path = "../transport" }
+nix = { version = "0.30", features = ["fs"] }
+serde_json = "1.0"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

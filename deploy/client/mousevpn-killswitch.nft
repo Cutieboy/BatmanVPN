@@ -1,0 +1,18 @@
+#!/usr/sbin/nft -f
+
+# Draft only. Replace endpoint/interface values before loading.
+define mousevpn_server = 203.0.113.10
+define mousevpn_port = 51820
+define mousevpn_wan = "eth0"
+define mousevpn_tun = "mousevpn0"
+
+table inet mousevpn_client {
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        oifname "lo" accept
+        ct state established,related accept
+        oifname $mousevpn_tun accept
+        oifname $mousevpn_wan ip daddr $mousevpn_server udp dport $mousevpn_port accept
+    }
+}

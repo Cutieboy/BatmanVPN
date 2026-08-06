@@ -1,0 +1,16 @@
+[package]
+name = "mousevpn-data-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mousevpn-crypto = { path = "../crypto" }
+mousevpn-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+mousevpn-transport = { path = "../transport" }
+
+[lints]
+workspace = true

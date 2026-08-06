@@ -1,0 +1,15 @@
+/target/
+/android/.gradle/
+/android/.kotlin/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/local.properties
+.idea/
+.vscode/
+*.log
+*.swp
+*.apk
+*.aab
+*.jks
+*.keystore
+local.toml

@@ -1,0 +1,13 @@
+#!/usr/sbin/nft -f
+
+# Edit the public interface name before loading this ruleset.
+define mousevpn_wan = "eth0"
+define mousevpn_net = 10.77.0.0/24
+
+table inet mousevpn {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+
+        oifname $mousevpn_wan ip saddr $mousevpn_net masquerade
+    }
+}
