@@ -87,6 +87,13 @@
             android:text="Удалить выбранный" />
 
         <Button
+            android:id="@+id/excludedApps"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/exclusions_open" />
+
+        <Button
             android:id="@+id/connectButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

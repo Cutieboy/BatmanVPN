@@ -10,4 +10,18 @@
     <string name="disconnect">Отключить</string>
     <string name="profile_missing">Сначала вставьте зашифрованный профиль</string>
     <string name="status_disconnected">Отключено</string>
+
+    <string name="exclusions_open">Приложения в обход VPN</string>
+    <string name="exclusions_title">Приложения в обход VPN</string>
+    <string name="exclusions_hint">Отмеченные приложения будут ходить в интернет напрямую, минуя туннель. Изменения применятся при следующем подключении.</string>
+    <string name="exclusions_save">Сохранить</string>
+    <string name="exclusions_clear">Снять все отметки</string>
+    <string name="exclusions_icon_description">Значок приложения</string>
+    <string name="exclusions_saved_empty">Весь трафик идёт через VPN</string>
+    <plurals name="exclusions_saved">
+        <item quantity="one">%d приложение пойдёт напрямую</item>
+        <item quantity="few">%d приложения пойдут напрямую</item>
+        <item quantity="many">%d приложений пойдут напрямую</item>
+        <item quantity="other">%d приложения пойдут напрямую</item>
+    </plurals>
 </resources>

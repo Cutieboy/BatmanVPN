@@ -60,6 +60,9 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.copyProfile).setOnClickListener { copyProfile() }
         findViewById<Button>(R.id.saveProfile).setOnClickListener { saveCurrent() }
         findViewById<Button>(R.id.deleteProfile).setOnClickListener { deleteCurrent() }
+        findViewById<Button>(R.id.excludedApps).setOnClickListener {
+            startActivity(Intent(this, AppListActivity::class.java))
+        }
         findViewById<Button>(R.id.connectButton).setOnClickListener { requestConnection() }
         findViewById<Button>(R.id.disconnectButton).setOnClickListener {
             startService(Intent(this, MouseVpnService::class.java).setAction(MouseVpnService.ACTION_DISCONNECT))

@@ -55,20 +55,26 @@ class MouseVpnService : VpnService() {
                 ),
             )
             handle = prepared.getLong("handle")
-            descriptor = Builder()
+            val builder = Builder()
                 .setSession("MouseVPN")
                 .setMtu(prepared.getInt("mtu"))
                 .addAddress(prepared.getString("address"), prepared.getInt("prefix"))
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(prepared.getString("dns"))
                 .setBlocking(true)
-                .establish()
+            val bypassing = excludeApps(builder)
+            descriptor = builder.establish()
             requireNotNull(descriptor) { "Android не создал VPN-интерфейс" }
             val fd = descriptor.detachFd()
             descriptor = null
             check(NativeBridge.start(handle, fd)) { "Rust-ядро не запустило туннель" }
-            broadcast("Подключено: ${profile.endpoint}")
-            val notification = VpnNotification.create(this, "Подключено: ${profile.endpoint}")
+            val summary = if (bypassing == 0) {
+                "Подключено: ${profile.endpoint}"
+            } else {
+                "Подключено: ${profile.endpoint} (в обход: $bypassing)"
+            }
+            broadcast(summary)
+            val notification = VpnNotification.create(this, summary)
             getSystemService(android.app.NotificationManager::class.java)
                 .notify(VpnNotification.ID, notification)
             monitor(handle)
@@ -81,6 +87,27 @@ class MouseVpnService : VpnService() {
         } finally {
             descriptor?.close()
         }
+    }
+
+    /**
+     * Routes the chosen apps around the tunnel and returns how many were applied.
+     *
+     * A package that has since been uninstalled must never prevent the tunnel
+     * from coming up, so each entry is applied on its own and a failure only
+     * drops that one app.
+     *
+     * Failed entries are deliberately left in the store. An app can be missing
+     * for reasons that pass — an update in flight, a profile not yet unlocked —
+     * and silently discarding a choice the user made is worse than carrying an
+     * entry that costs one failed call per connection.
+     */
+    private fun excludeApps(builder: Builder): Int {
+        var applied = 0
+        ExcludedApps(this).packages().forEach { packageName ->
+            runCatching { builder.addDisallowedApplication(packageName) }
+                .onSuccess { applied++ }
+        }
+        return applied
     }
 
     private fun monitor(currentHandle: Long) {
