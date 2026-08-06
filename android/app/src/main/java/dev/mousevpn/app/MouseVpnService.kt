@@ -42,8 +42,6 @@ class MouseVpnService : VpnService() {
                 .addAddress(prepared.getString("address"), prepared.getInt("prefix"))
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(prepared.getString("dns"))
-                .addAddress("fd00::2", 128)
-                .addRoute("::", 0)
                 .setBlocking(true)
                 .establish()
             requireNotNull(descriptor) { "Android не создал VPN-интерфейс" }
