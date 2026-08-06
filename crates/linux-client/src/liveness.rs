@@ -1,8 +1,15 @@
 use std::time::{Duration, Instant};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// Silence after which the session is treated as dead.
+///
+/// Keepalives go out every 10 s, so 15 s means three missed replies rather than
+/// the six the old 30 s budget allowed. Half a minute of blackhole is very
+/// visible; a reconnect costs one round trip.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Delay before the first retry, doubling up to [`MAX_RECONNECT_BACKOFF`].
+const MIN_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
@@ -15,6 +22,7 @@ pub(crate) struct Liveness {
     peer_activity: Instant,
     heartbeat: Instant,
     retry: Option<Instant>,
+    backoff: Duration,
 }
 
 impl Liveness {
@@ -23,6 +31,7 @@ impl Liveness {
             peer_activity: now,
             heartbeat: now,
             retry: None,
+            backoff: MIN_RECONNECT_BACKOFF,
         }
     }
 
@@ -30,7 +39,7 @@ impl Liveness {
         if now.duration_since(self.peer_activity) >= SESSION_TIMEOUT
             && self
                 .retry
-                .is_none_or(|last| now.duration_since(last) >= RECONNECT_RETRY_INTERVAL)
+                .is_none_or(|last| now.duration_since(last) >= self.backoff)
         {
             Action::Reconnect
         } else if now.duration_since(self.heartbeat) >= KEEPALIVE_INTERVAL {
@@ -50,6 +59,7 @@ impl Liveness {
 
     pub(crate) fn reconnect_attempted(&mut self, now: Instant) {
         self.retry = Some(now);
+        self.backoff = (self.backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
 
     pub(crate) fn connection_lost(&mut self, now: Instant) {
@@ -61,12 +71,13 @@ impl Liveness {
         self.peer_activity = now;
         self.heartbeat = now;
         self.retry = None;
+        self.backoff = MIN_RECONNECT_BACKOFF;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Liveness};
+    use super::{Action, Liveness, MAX_RECONNECT_BACKOFF};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -80,7 +91,7 @@ mod tests {
         );
         state.keepalive_sent(start + Duration::from_secs(10));
         assert_eq!(
-            state.action(start + Duration::from_secs(30)),
+            state.action(start + Duration::from_secs(15)),
             Action::Reconnect
         );
     }
@@ -92,6 +103,51 @@ mod tests {
         state.connection_lost(start + Duration::from_secs(1));
         assert_eq!(
             state.action(start + Duration::from_secs(1)),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn retries_quickly_at_first_then_backs_off() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        state.reconnect_attempted(start);
+
+        // First retry is seconds away, not the old flat ten.
+        assert_eq!(state.action(start + Duration::from_secs(1)), Action::None);
+        assert_eq!(
+            state.action(start + Duration::from_secs(2)),
+            Action::Reconnect
+        );
+
+        let mut now = start;
+        for _ in 0..10 {
+            now += Duration::from_secs(60);
+            state.reconnect_attempted(now);
+        }
+        assert_eq!(state.action(now + MAX_RECONNECT_BACKOFF), Action::Reconnect);
+        // Still inside the capped backoff: due keepalives may fire, a reconnect
+        // may not.
+        assert_ne!(
+            state.action(now + MAX_RECONNECT_BACKOFF.saturating_sub(Duration::from_secs(1))),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn a_successful_reconnect_resets_the_backoff() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        for step in 0..5 {
+            state.reconnect_attempted(start + Duration::from_secs(step * 60));
+        }
+        state.reconnected(start + Duration::from_secs(600));
+        state.connection_lost(start + Duration::from_secs(601));
+        state.reconnect_attempted(start + Duration::from_secs(601));
+        assert_eq!(
+            state.action(start + Duration::from_secs(603)),
             Action::Reconnect
         );
     }

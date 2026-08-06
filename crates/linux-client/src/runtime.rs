@@ -77,7 +77,10 @@ fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientErro
         tx_queue_len: DEFAULT_TX_QUEUE_LEN,
     })?);
     let tun_name = tun.name()?;
-    let plane = Arc::new(Mutex::new(plane));
+    // The two directions share no mutable state; only reconnect swaps the
+    // sender, so the send path is uncontended and the receive path is lock-free.
+    let (sender, receiver) = plane.split();
+    let sender = Arc::new(Mutex::new(sender));
     let stopping = Arc::new(AtomicBool::new(false));
     let reconnecting = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&stopping))?;
@@ -111,14 +114,14 @@ fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientErro
     };
 
     let outgoing_tun = Arc::clone(&tun);
-    let outgoing_plane = Arc::clone(&plane);
+    let outgoing_sender = Arc::clone(&sender);
     let outgoing_stopping = Arc::clone(&stopping);
     let outgoing_reconnecting = Arc::clone(&reconnecting);
     let (worker_sender, worker_receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let result = outgoing::run(
             &outgoing_tun,
-            &outgoing_plane,
+            &outgoing_sender,
             &mut outgoing,
             &outgoing_stopping,
             &outgoing_reconnecting,
@@ -137,7 +140,8 @@ fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientErro
         transport: incoming,
         parameters,
         tun,
-        plane,
+        receiver,
+        sender,
         stopping,
         reconnecting,
         worker: worker_receiver,

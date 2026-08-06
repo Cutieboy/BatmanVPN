@@ -12,15 +12,22 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use mousevpn_config::ValidatedClientConfig;
-use mousevpn_data_plane::{DecodedPacket, TunnelDataPlane};
+use mousevpn_data_plane::{Decoded, TunnelDataPlane, TunnelSender};
+use mousevpn_protocol::Datagram;
 use mousevpn_protocol::SessionParameters;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 const POLL: Duration = Duration::from_millis(250);
 const KEEPALIVE: Duration = Duration::from_secs(10);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
-const RECONNECT_RETRY: Duration = Duration::from_secs(5);
+/// Silence after which the session is treated as dead.
+///
+/// Keepalives go out every 10 s. The old 90 s budget meant a phone that changed
+/// network kept a dead tunnel for a minute and a half before even trying.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Delay before the first retry, doubling up to [`MAX_RECONNECT_RETRY`].
+const MIN_RECONNECT_RETRY: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_RETRY: Duration = Duration::from_secs(16);
 
 pub(crate) fn spawn(
     tun_fd: RawFd,
@@ -56,8 +63,11 @@ fn run(
     transport.set_read_timeout(Some(POLL))?;
     let mut sending_transport = transport.try_clone()?;
     let sending_tun = tun.try_clone()?;
-    let plane = Arc::new(Mutex::new(plane));
-    let outgoing_plane = Arc::clone(&plane);
+    // The two directions share no mutable state; only reconnect swaps the
+    // sender, so the send path is uncontended and the receive path is lock-free.
+    let (sender, mut receiver) = plane.split();
+    let sender = Arc::new(Mutex::new(sender));
+    let outgoing_sender = Arc::clone(&sender);
     let outgoing_stopping = Arc::new(AtomicBool::new(false));
     let outgoing_flag = Arc::clone(&outgoing_stopping);
     let reconnecting = Arc::new(AtomicBool::new(false));
@@ -66,7 +76,7 @@ fn run(
         send_outgoing(
             sending_tun,
             &mut sending_transport,
-            &outgoing_plane,
+            &outgoing_sender,
             &outgoing_flag,
             &outgoing_reconnecting,
         )
@@ -74,23 +84,26 @@ fn run(
 
     let receive_result = (|| -> Result<()> {
         let mut packet = vec![0_u8; 65_535];
+        // Reused across packets: the receive path allocates nothing in steady state.
+        let mut plaintext = Vec::with_capacity(65_535);
+        let mut keepalive = Vec::with_capacity(128);
         let mut last_sent = Instant::now();
         let mut last_received = Instant::now();
         let mut next_reconnect = Instant::now();
+        let mut reconnect_backoff = MIN_RECONNECT_RETRY;
         while !stopping.load(Ordering::Relaxed) {
             match transport.receive(&mut packet) {
                 Ok(length) => {
-                    match plane
-                        .lock()
-                        .map_err(|_| anyhow!("crypto lock poisoned"))?
-                        .decode(&packet[..length])
-                    {
-                        Ok(DecodedPacket::Ip(ip)) => {
+                    let decoded = Datagram::decode(&packet[..length])
+                        .ok()
+                        .map(|datagram| receiver.decode_into(datagram, &mut plaintext));
+                    match decoded {
+                        Some(Ok(Decoded::Ip(ip))) => {
                             last_received = Instant::now();
-                            write_packet_nonblocking(&mut tun, &ip)?;
+                            write_packet_nonblocking(&mut tun, ip)?;
                         }
-                        Ok(DecodedPacket::Keepalive) => last_received = Instant::now(),
-                        Err(_) => {}
+                        Some(Ok(Decoded::Keepalive)) => last_received = Instant::now(),
+                        Some(Err(_)) | None => {}
                     }
                 }
                 Err(error)
@@ -108,15 +121,7 @@ fn run(
                 Err(error) => return Err(error.into()),
             }
             if last_sent.elapsed() >= KEEPALIVE {
-                let keepalive = plane
-                    .lock()
-                    .map_err(|_| anyhow!("crypto lock poisoned"))?
-                    .encode_keepalive()?;
-                match transport.send(&keepalive) {
-                    Ok(()) => {}
-                    Err(error) if is_peer_unavailable(&error) => {}
-                    Err(error) => return Err(error.into()),
-                }
+                send_keepalive(&mut transport, &sender, &mut keepalive)?;
                 last_sent = Instant::now();
             }
             let now = Instant::now();
@@ -128,11 +133,18 @@ fn run(
                     Ok((replacement, replacement_parameters))
                         if replacement_parameters == parameters =>
                     {
-                        *plane.lock().map_err(|_| anyhow!("crypto lock poisoned"))? = replacement;
+                        let (replacement_sender, replacement_receiver) = replacement.split();
+                        receiver = replacement_receiver;
+                        *sender.lock().map_err(|_| anyhow!("crypto lock poisoned"))? =
+                            replacement_sender;
                         last_received = Instant::now();
                         last_sent = last_received;
+                        reconnect_backoff = MIN_RECONNECT_RETRY;
                     }
-                    Ok(_) | Err(_) => next_reconnect = Instant::now() + RECONNECT_RETRY,
+                    Ok(_) | Err(_) => {
+                        next_reconnect = Instant::now() + reconnect_backoff;
+                        reconnect_backoff = (reconnect_backoff * 2).min(MAX_RECONNECT_RETRY);
+                    }
                 }
                 reconnecting.store(false, Ordering::Relaxed);
             }
@@ -151,11 +163,13 @@ fn run(
 fn send_outgoing(
     mut tun: File,
     transport: &mut UdpTransport,
-    plane: &Mutex<TunnelDataPlane>,
+    sender: &Mutex<TunnelSender>,
     stopping: &AtomicBool,
     reconnecting: &AtomicBool,
 ) -> Result<()> {
     let mut packet = vec![0_u8; 65_535];
+    // Reused for every datagram: the send path allocates nothing in steady state.
+    let mut datagram = Vec::with_capacity(65_535);
     while !stopping.load(Ordering::Relaxed) {
         while reconnecting.load(Ordering::Relaxed) && !stopping.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(10));
@@ -164,10 +178,15 @@ fn send_outgoing(
             Ok(0) => return Ok(()),
             Ok(length) => {
                 if packet[0] >> 4 != 6 {
-                    let datagram = plane
+                    let encoded = sender
                         .lock()
                         .map_err(|_| anyhow!("crypto lock poisoned"))?
-                        .encode_ip(&packet[..length])?;
+                        .encode_ip_into(&packet[..length], &mut datagram);
+                    // One unencodable packet is a packet to drop, not a reason
+                    // to tear the tunnel down.
+                    if encoded.is_err() {
+                        continue;
+                    }
                     match transport.send(&datagram) {
                         Ok(()) => {}
                         Err(error) if is_peer_unavailable(&error) => {}
@@ -187,6 +206,23 @@ fn send_outgoing(
         }
     }
     Ok(())
+}
+
+fn send_keepalive(
+    transport: &mut UdpTransport,
+    sender: &Mutex<TunnelSender>,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    sender
+        .lock()
+        .map_err(|_| anyhow!("crypto lock poisoned"))?
+        .encode_keepalive_into(buffer)?;
+    match transport.send(buffer) {
+        Ok(()) => Ok(()),
+        // The peer is unreachable right now; the reconnect path owns recovery.
+        Err(error) if is_peer_unavailable(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn is_peer_unavailable(error: &io::Error) -> bool {

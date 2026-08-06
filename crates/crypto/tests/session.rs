@@ -1,5 +1,6 @@
 use mousevpn_crypto::{
     ClientHandshake, CryptoError, KeyPair, ProtocolContext, ReplayError, ServerHandshake,
+    REPLAY_WINDOW_SIZE,
 };
 
 fn establish() -> (
@@ -101,9 +102,13 @@ fn accepts_reordering_and_rejects_replays() {
 fn rejects_packets_older_than_window() {
     let (client, mut server) = establish();
     let old = client.encrypt(0, b"old").expect("encrypt old");
-    let newest = client.encrypt(128, b"new").expect("encrypt newest");
+    let newest = client
+        .encrypt(REPLAY_WINDOW_SIZE, b"new")
+        .expect("encrypt newest");
 
-    server.decrypt(128, &newest).expect("decrypt newest");
+    server
+        .decrypt(REPLAY_WINDOW_SIZE, &newest)
+        .expect("decrypt newest");
     assert!(matches!(
         server.decrypt(0, &old),
         Err(CryptoError::Replay(ReplayError::TooOld))
