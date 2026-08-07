@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -55,9 +56,11 @@ class MouseVpnService : VpnService() {
                 ),
             )
             handle = prepared.getLong("handle")
+            val serverMtu = prepared.getInt("mtu")
+            val mtu = tunnelMtu(serverMtu)
             val builder = Builder()
                 .setSession("MouseVPN")
-                .setMtu(prepared.getInt("mtu"))
+                .setMtu(mtu)
                 .addAddress(prepared.getString("address"), prepared.getInt("prefix"))
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(prepared.getString("dns"))
@@ -68,10 +71,12 @@ class MouseVpnService : VpnService() {
             val fd = descriptor.detachFd()
             descriptor = null
             check(NativeBridge.start(handle, fd)) { "Rust-ядро не запустило туннель" }
-            val summary = if (bypassing == 0) {
-                "Подключено: ${profile.endpoint}"
-            } else {
-                "Подключено: ${profile.endpoint} (в обход: $bypassing)"
+            val summary = buildString {
+                append("Подключено: ${profile.endpoint}")
+                if (bypassing > 0) append(" (в обход: $bypassing)")
+                // Only worth showing when it differs from what the server asked
+                // for, because then it is the answer to "why is this slow here".
+                if (mtu != serverMtu) append(" (MTU $mtu)")
             }
             broadcast(summary)
             val notification = VpnNotification.create(this, summary)
@@ -87,6 +92,43 @@ class MouseVpnService : VpnService() {
         } finally {
             descriptor?.close()
         }
+    }
+
+    /**
+     * Lowers the tunnel MTU to what the current network can actually carry.
+     *
+     * The server picks one MTU for everybody, and it has to assume the usual
+     * 1500-byte path. Mobile networks routinely carry less because of the
+     * operator's own encapsulation, and a tunnel datagram that no longer fits
+     * gets fragmented — often into fragments that carrier NAT then drops. The
+     * result is not a clean failure: small requests succeed while anything
+     * large stalls, so heavy apps break while light ones look fine.
+     *
+     * This can only reduce the value, never raise it above what the server
+     * negotiated, and it is skipped entirely when Android does not report the
+     * underlying MTU.
+     */
+    private fun tunnelMtu(serverMtu: Int): Int {
+        val underlying = underlyingMtu() ?: return serverMtu
+        val fits = underlying - OUTER_OVERHEAD
+        return serverMtu.coerceAtMost(fits).coerceAtLeast(MINIMUM_MTU)
+    }
+
+    /**
+     * MTU of the network carrying the tunnel, or null when it is unknown.
+     *
+     * Read before `establish`, so the active network is still the underlying
+     * one rather than the VPN itself.
+     *
+     * Android only exposes the link MTU from API 29; on anything older the
+     * tunnel keeps the value the server negotiated.
+     */
+    private fun underlyingMtu(): Int? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        val manager = getSystemService(ConnectivityManager::class.java)
+        val network = manager.activeNetwork ?: return null
+        val mtu = manager.getLinkProperties(network)?.mtu ?: return null
+        return mtu.takeIf { it >= MINIMUM_MTU }
     }
 
     /**
@@ -169,6 +211,15 @@ class MouseVpnService : VpnService() {
     }
 
     companion object {
+        /**
+         * Bytes wrapped around every tunnelled packet: 20 outer IPv4, 8 UDP,
+         * 20 protocol header, 1 inner packet kind and a 16-byte AEAD tag.
+         */
+        private const val OUTER_OVERHEAD = 65
+
+        /** Floor for the tunnel MTU; every path is expected to carry this. */
+        private const val MINIMUM_MTU = 1_280
+
         const val ACTION_CONNECT = "dev.mousevpn.app.CONNECT"
         const val ACTION_DISCONNECT = "dev.mousevpn.app.DISCONNECT"
         const val ACTION_STATUS = "dev.mousevpn.app.STATUS"
