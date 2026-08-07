@@ -24,6 +24,11 @@ impl FirewallGuard {
         let rules = format!(
             "table inet {TABLE_NAME} {{\n  chain output {{\n    type filter hook output priority -50; policy drop;\n    oifname \"lo\" accept\n    oifname \"{tun_name}\" accept\n    ip daddr {server} udp dport {port} accept\n  }}\n}}\n"
         );
+        // A SIGKILL cannot run `Drop`, so only our isolated table may survive
+        // an otherwise dead client. Removing it before the atomic recreation
+        // makes the next connection self-healing without touching any other
+        // firewall table or policy.
+        remove_runtime_table()?;
         run_nft_script(&rules)?;
         Ok(Self)
     }
@@ -31,10 +36,17 @@ impl FirewallGuard {
 
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
-        let _ = Command::new("nft")
-            .args(["delete", "table", "inet", TABLE_NAME])
-            .status();
+        let _ = remove_runtime_table();
     }
+}
+
+fn remove_runtime_table() -> io::Result<()> {
+    let _status = Command::new("nft")
+        .args(["delete", "table", "inet", TABLE_NAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(())
 }
 
 fn valid_interface_name(name: &str) -> bool {

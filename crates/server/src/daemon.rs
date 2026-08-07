@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs, io,
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread,
@@ -415,9 +415,12 @@ fn start_admin_if_configured(
         .unwrap_or_else(|_| format!("{}:9797", config.tun.address))
         .parse::<SocketAddr>()
         .map_err(|error| ServerDaemonError::Configuration(error.to_string()))?;
-    if !listen.ip().is_loopback() && listen.ip() != config.tun.address {
+    let allow_public = env::var("MOUSEVPN_ADMIN_ALLOW_PUBLIC")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if !admin_listener_allowed(listen.ip(), config.tun.address, allow_public) {
         return Err(ServerDaemonError::Configuration(
-            "admin listener must use the tunnel address or loopback".to_owned(),
+            "admin listener must use the tunnel address or loopback unless MOUSEVPN_ADMIN_ALLOW_PUBLIC=1"
+                .to_owned(),
         ));
     }
     let public_endpoint = config
@@ -444,6 +447,10 @@ fn start_admin_if_configured(
     };
     mousevpn_admin_api::spawn(listen, registry.clone(), token, settings)?;
     Ok(())
+}
+
+fn admin_listener_allowed(listen: IpAddr, tunnel: Ipv4Addr, allow_public: bool) -> bool {
+    listen.is_loopback() || listen == IpAddr::V4(tunnel) || allow_public
 }
 
 fn load_admin_token() -> Result<Option<String>, ServerDaemonError> {
@@ -498,5 +505,33 @@ impl Sessions {
                 .retain(|_, existing| !Arc::ptr_eq(existing, &previous));
         }
         self.by_id.insert(session_id, session);
+    }
+}
+
+#[cfg(test)]
+mod admin_listener_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::admin_listener_allowed;
+
+    #[test]
+    fn public_admin_listener_requires_explicit_opt_in() {
+        let tunnel = Ipv4Addr::new(10, 77, 0, 1);
+        assert!(admin_listener_allowed(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tunnel,
+            false
+        ));
+        assert!(admin_listener_allowed(IpAddr::V4(tunnel), tunnel, false));
+        assert!(!admin_listener_allowed(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            tunnel,
+            false
+        ));
+        assert!(admin_listener_allowed(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            tunnel,
+            true
+        ));
     }
 }

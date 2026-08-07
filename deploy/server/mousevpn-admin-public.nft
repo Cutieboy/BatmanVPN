@@ -1,0 +1,11 @@
+#!/usr/sbin/nft -f
+
+# Connection-rate guard for hosts that do not use UFW or firewalld.
+table inet mousevpn_admin_public {
+    chain input {
+        type filter hook input priority -5; policy accept;
+
+        tcp dport 9797 ct state new limit rate 12/minute burst 20 packets accept
+        tcp dport 9797 ct state new counter drop
+    }
+}

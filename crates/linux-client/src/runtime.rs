@@ -46,7 +46,20 @@ enum NetworkGuard {
 ///
 /// Returns an error when handshake, TUN creation, UDP or packet processing fails.
 pub fn run(config: &ValidatedClientConfig) -> Result<(), ClientError> {
-    run_mode(config, Mode::FullTunnel)
+    run_mode(config, Mode::FullTunnel, Arc::new(AtomicBool::new(false)))
+}
+
+/// Connects like [`run`], while allowing an embedding application to request
+/// graceful shutdown through the supplied flag.
+///
+/// # Errors
+///
+/// Returns an error when handshake, TUN creation, UDP or packet processing fails.
+pub fn run_with_stop(
+    config: &ValidatedClientConfig,
+    stopping: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    run_mode(config, Mode::FullTunnel, stopping)
 }
 
 /// Runs a loopback SOCKS5 proxy whose outbound sockets alone use `MouseVPN`.
@@ -61,27 +74,38 @@ pub fn run_proxy(config: &ValidatedClientConfig, listen: SocketAddrV4) -> Result
             "proxy listener must use 127.0.0.0/8 and a nonzero port",
         )));
     }
-    run_mode(config, Mode::Proxy(listen))
+    run_mode(
+        config,
+        Mode::Proxy(listen),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
-fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientError> {
-    ensure_no_competing_full_tunnel()?;
+fn run_mode(
+    config: &ValidatedClientConfig,
+    mode: Mode,
+    stopping: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    ensure_no_competing_full_tunnel()
+        .map_err(|error| context("checking existing VPN routes", &error))?;
     let (incoming, plane, parameters) = connect(config)?;
     incoming.set_read_timeout(Some(POLL_INTERVAL))?;
     let mut outgoing = incoming.try_clone()?;
-    let tun = Arc::new(LinuxTun::create(&LinuxTunConfig {
-        name: config.tun_name.clone(),
-        address: parameters.client_address,
-        prefix_len: parameters.prefix_len,
-        mtu: parameters.mtu,
-        tx_queue_len: DEFAULT_TX_QUEUE_LEN,
-    })?);
+    let tun = Arc::new(
+        LinuxTun::create(&LinuxTunConfig {
+            name: config.tun_name.clone(),
+            address: parameters.client_address,
+            prefix_len: parameters.prefix_len,
+            mtu: parameters.mtu,
+            tx_queue_len: DEFAULT_TX_QUEUE_LEN,
+        })
+        .map_err(|error| context("creating the MouseVPN tunnel", &error))?,
+    );
     let tun_name = tun.name()?;
     // The two directions share no mutable state; only reconnect swaps the
     // sender, so the send path is uncontended and the receive path is lock-free.
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
-    let stopping = Arc::new(AtomicBool::new(false));
     let reconnecting = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&stopping))?;
     flag::register(SIGTERM, Arc::clone(&stopping))?;
@@ -97,9 +121,12 @@ fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientErro
                 }
             };
             NetworkGuard::Full {
-                _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)?,
-                _routes: RouteGuard::install(server_ip, &tun_name)?,
-                _dns: DnsGuard::install(&tun_name, parameters.dns)?,
+                _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)
+                    .map_err(|error| context("installing the MouseVPN firewall", &error))?,
+                _routes: RouteGuard::install(server_ip, &tun_name)
+                    .map_err(|error| context("installing VPN routes", &error))?,
+                _dns: DnsGuard::install(&tun_name, parameters.dns)
+                    .map_err(|error| context("configuring VPN DNS", &error))?,
             }
         }
         Mode::Proxy(listen) => NetworkGuard::Proxy {
@@ -147,4 +174,8 @@ fn run_mode(config: &ValidatedClientConfig, mode: Mode) -> Result<(), ClientErro
         worker: worker_receiver,
     }
     .run()
+}
+
+fn context(operation: &str, error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{operation}: {error}"))
 }

@@ -49,3 +49,33 @@ The persistent public device registry lives at
 `/var/lib/mousevpn/devices.toml`. Updates are atomically replaced on disk.
 Revocation flips an atomic authorization flag held by active sessions, so no
 registry lock, Base64 decoding, or disk access occurs on the packet hot path.
+
+## Opt-in public endpoint
+
+For fleets where every VPN node is administered directly by its public IP,
+install `deploy/server/mousevpn-admin-public.conf` as a systemd drop-in and
+open TCP/9797 with connection limiting:
+
+```sh
+sudo install -d /etc/systemd/system/mousevpn-server.service.d
+sudo install -m 0644 deploy/server/mousevpn-admin-public.conf \
+  /etc/systemd/system/mousevpn-server.service.d/admin-public.conf
+sudo ufw limit 9797/tcp comment 'MouseVPN admin API'
+sudo systemctl daemon-reload
+sudo systemctl restart mousevpn-server
+```
+
+On a host without UFW/firewalld, also install the provided nftables limiter:
+
+```sh
+sudo install -m 0644 deploy/server/mousevpn-admin-public.nft \
+  /etc/mousevpn/mousevpn-admin-public.nft
+sudo install -m 0644 deploy/server/mousevpn-admin-public-nft.conf \
+  /etc/systemd/system/mousevpn-server.service.d/admin-public-nft.conf
+```
+
+Each node must use its own random 32-byte `admin.token`. The current endpoint
+is plain HTTP: the token prevents unauthorized API calls, but does not encrypt
+responses containing newly generated private client material. Treat this mode
+as an explicit operational tradeoff and prefer a pinned-TLS management client
+before deploying it over untrusted networks.

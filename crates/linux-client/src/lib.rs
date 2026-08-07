@@ -12,4 +12,4 @@ mod socks;
 
 pub use error::ClientError;
 pub use probe::probe;
-pub use runtime::{run, run_proxy};
+pub use runtime::{run, run_proxy, run_with_stop};

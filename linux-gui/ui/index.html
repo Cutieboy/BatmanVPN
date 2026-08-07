@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MouseVPN</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <img src="logo.png" alt="" />
+          <div>
+            <h1>MouseVPN</h1>
+            <span>Linux Client</span>
+          </div>
+        </header>
+
+        <div class="profiles-heading">
+          <span>Профили</span>
+          <button id="addProfileSmall" class="icon-button" aria-label="Добавить профиль">+</button>
+        </div>
+        <div id="profiles" class="profiles" aria-live="polite"></div>
+        <button id="addProfile" class="add-profile-button">
+          <span>+</span>
+          Добавить конфигурацию
+        </button>
+
+        <footer class="sidebar-footer">
+          <span class="security-mark">✓</span>
+          <div>
+            <strong>Ключи хранятся локально</strong>
+            <span>Доступ только для вашего пользователя</span>
+          </div>
+        </footer>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <span class="eyebrow">ТЕКУЩИЙ ПРОФИЛЬ</span>
+            <h2 id="activeProfileName">Нет конфигураций</h2>
+            <p id="activeEndpoint">Добавьте первый профиль</p>
+          </div>
+          <div id="connectionBadge" class="connection-badge disconnected">
+            <span></span>
+            Отключено
+          </div>
+        </header>
+
+        <section class="connection-panel">
+          <button id="powerButton" class="power-button" aria-label="Включить VPN" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10" />
+            </svg>
+          </button>
+          <h3 id="statusTitle">VPN выключен</h3>
+          <p id="statusMessage">Выберите профиль и нажмите, чтобы подключиться</p>
+          <div id="connectedServer" class="connected-server hidden">
+            <span>ТЕКУЩЕЕ СОЕДИНЕНИЕ</span>
+            <strong id="connectedServerName">—</strong>
+            <small id="connectedServerEndpoint">—</small>
+          </div>
+        </section>
+
+        <section class="stats-card">
+          <div class="stat">
+            <span class="stat-icon">◈</span>
+            <div><span>Сервер</span><strong id="serverValue">—</strong></div>
+          </div>
+          <div class="divider"></div>
+          <div class="stat">
+            <span class="stat-icon">↕</span>
+            <div><span>Трафик</span><strong>—</strong></div>
+          </div>
+          <div class="divider"></div>
+          <div class="stat">
+            <span class="stat-icon">◷</span>
+            <div><span>Время</span><strong id="timeValue">—</strong></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="profileModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle">
+      <form id="profileForm" class="modal-card">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">НОВЫЙ ПРОФИЛЬ</span>
+            <h2 id="profileModalTitle">Добавить конфигурацию</h2>
+          </div>
+          <button type="button" class="close-button" data-close-modal aria-label="Закрыть">×</button>
+        </div>
+        <p class="modal-description">Введите зашифрованную строку, полученную от администратора, и пароль к ней.</p>
+
+        <label for="profileToken">Ключ конфигурации</label>
+        <textarea id="profileToken" rows="7" placeholder="MV1.…" spellcheck="false" required></textarea>
+        <span class="field-help">Одна длинная зашифрованная строка, начинающаяся с MV1.</span>
+
+        <label for="profilePassword">Пароль</label>
+        <div class="password-field">
+          <input id="profilePassword" type="password" minlength="8" placeholder="Не менее 8 символов" required />
+          <button id="togglePassword" type="button" aria-label="Показать пароль">Показать</button>
+        </div>
+        <p id="formError" class="form-error hidden"></p>
+
+        <div class="security-note"><span>⌾</span> Ключ расшифровывается только на этом компьютере</div>
+        <button id="saveProfile" class="primary-button" type="submit" disabled>Добавить профиль</button>
+      </form>
+    </div>
+
+    <div id="deleteModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+      <div class="modal-card small-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow danger-text">УДАЛЕНИЕ</span>
+            <h2 id="deleteModalTitle">Удалить профиль?</h2>
+          </div>
+        </div>
+        <p id="deleteMessage" class="modal-description"></p>
+        <div class="dialog-actions">
+          <button id="cancelDelete" class="secondary-button" type="button">Отмена</button>
+          <button id="confirmDelete" class="danger-button" type="button">Удалить</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

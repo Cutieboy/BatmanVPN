@@ -14,6 +14,7 @@ members = [
     "crates/profile-cli",
     "crates/device-cli",
     "crates/proxy-client",
+    "linux-gui/src-tauri",
 ]
 resolver = "2"
 

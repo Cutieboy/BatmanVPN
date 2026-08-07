@@ -1,0 +1,4 @@
+target
+.git
+linux-gui/dist/*
+!linux-gui/dist/.gitignore
