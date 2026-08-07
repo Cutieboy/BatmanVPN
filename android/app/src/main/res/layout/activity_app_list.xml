@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/appListRoot"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:paddingStart="16dp"
+    android:paddingTop="16dp"
+    android:paddingEnd="16dp"
+    android:paddingBottom="16dp">
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="@string/exclusions_title"
+        android:textColor="@color/text_primary"
         android:textSize="20sp"
         android:textStyle="bold" />
 
@@ -17,6 +22,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
         android:text="@string/exclusions_hint"
+        android:textColor="@color/text_secondary"
         android:textSize="14sp" />
 
     <ListView
@@ -29,14 +35,23 @@
     <Button
         android:id="@+id/saveExclusions"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/exclusions_save" />
+        android:layout_height="56dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_primary_button"
+        android:text="@string/exclusions_save"
+        android:textAllCaps="false"
+        android:textColor="@color/on_accent"
+        android:textSize="16sp"
+        android:textStyle="bold" />
 
     <Button
         android:id="@+id/clearExclusions"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="52dp"
         android:layout_marginTop="8dp"
-        android:text="@string/exclusions_clear" />
+        android:background="@drawable/bg_secondary_button"
+        android:text="@string/exclusions_clear"
+        android:textAllCaps="false"
+        android:textColor="@color/text_secondary"
+        android:textSize="15sp" />
 </LinearLayout>

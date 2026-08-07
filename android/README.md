@@ -27,7 +27,7 @@ MVP releases use the local Android debug certificate so they can update the
 development installation. Create and protect a dedicated release keystore
 before any public distribution.
 
-Create an encrypted copy/paste profile from an existing desktop client config:
+Create an encrypted profile key from an existing desktop client config:
 
 ```sh
 cargo run --release -p mousevpn-profile-cli -- \
@@ -35,6 +35,8 @@ cargo run --release -p mousevpn-profile-cli -- \
 ```
 
 The command asks for a password twice and prints one opaque `MV1.…` token.
+In the Android app, tap `+`, enter that token in the configuration-key field,
+and enter its password. The app does not read or write the clipboard itself.
 
 ## Security model
 

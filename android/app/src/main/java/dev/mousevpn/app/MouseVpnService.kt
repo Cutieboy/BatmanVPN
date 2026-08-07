@@ -8,6 +8,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -71,6 +72,7 @@ class MouseVpnService : VpnService() {
             val fd = descriptor.detachFd()
             descriptor = null
             check(NativeBridge.start(handle, fd)) { "Rust-ядро не запустило туннель" }
+            connectedSinceElapsedRealtime = SystemClock.elapsedRealtime()
             val summary = buildString {
                 append("Подключено: ${profile.endpoint}")
                 if (bypassing > 0) append(" (в обход: $bypassing)")
@@ -86,6 +88,7 @@ class MouseVpnService : VpnService() {
         } catch (error: Exception) {
             if (handle != 0L) NativeBridge.stop(handle)
             handle = 0L
+            connectedSinceElapsedRealtime = 0L
             broadcast("Ошибка: ${error.message ?: error.javaClass.simpleName}")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -157,6 +160,7 @@ class MouseVpnService : VpnService() {
             if (NativeBridge.status(currentHandle) != "running") {
                 NativeBridge.stop(currentHandle)
                 handle = 0L
+                connectedSinceElapsedRealtime = 0L
                 broadcast("Соединение потеряно")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -173,6 +177,7 @@ class MouseVpnService : VpnService() {
     private fun disconnect() {
         val current = handle
         handle = 0L
+        connectedSinceElapsedRealtime = 0L
         if (current != 0L) NativeBridge.stop(current)
         task?.cancel(true)
         task = null
@@ -182,6 +187,7 @@ class MouseVpnService : VpnService() {
     }
 
     private fun broadcast(status: String) {
+        currentStatus = status
         sendBroadcast(
             Intent(ACTION_STATUS)
                 .setPackage(packageName)
@@ -202,6 +208,7 @@ class MouseVpnService : VpnService() {
     override fun onDestroy() {
         val current = handle
         handle = 0L
+        connectedSinceElapsedRealtime = 0L
         if (current != 0L) NativeBridge.stop(current)
         runCatching {
             getSystemService(ConnectivityManager::class.java)
@@ -211,6 +218,14 @@ class MouseVpnService : VpnService() {
     }
 
     companion object {
+        @Volatile
+        var currentStatus: String = "Отключено"
+            private set
+
+        @Volatile
+        var connectedSinceElapsedRealtime: Long = 0L
+            private set
+
         /**
          * Bytes wrapped around every tunnelled packet: 20 outer IPv4, 8 UDP,
          * 20 protocol header, 1 inner packet kind and a 16-byte AEAD tag.

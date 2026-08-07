@@ -31,6 +31,7 @@ class AppListActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_app_list)
+        findViewById<View>(R.id.appListRoot).applySystemBarPadding(16, 16, 16, 16)
         store = ExcludedApps(this)
         excluded.addAll(store.packages())
 

@@ -20,9 +20,11 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@drawable/mousevpn_logo"
         android:label="MouseVPN"
+        android:roundIcon="@drawable/mousevpn_logo"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -36,6 +38,11 @@
             android:name=".AppListActivity"
             android:exported="false"
             android:label="@string/exclusions_title" />
+
+        <activity
+            android:name=".AddProfileActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".MouseVpnService"
