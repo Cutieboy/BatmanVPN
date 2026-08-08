@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub(crate) const UDP_POLL: Duration = Duration::from_millis(250);
-const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
 
 #[allow(clippy::too_many_arguments)]
@@ -49,6 +49,14 @@ pub(crate) fn run(
         Arc::clone(&reconnect_requested),
         result_tx,
     );
+    let _policy_worker = PeriodicWorker::spawn(POLICY_REFRESH_INTERVAL, {
+        let refresher = network.refresher();
+        move || {
+            if let Err(error) = refresher.refresh() {
+                eprintln!("MOUSEVPN_POLICY_WARNING={error}");
+            }
+        }
+    })?;
 
     eprintln!("MOUSEVPN_STATE=connected");
     IncomingLoop {
@@ -63,7 +71,6 @@ pub(crate) fn run(
         reconnect_requested,
         worker: result_rx,
         network,
-        last_policy_refresh: Instant::now(),
     }
     .run()
 }
@@ -80,7 +87,6 @@ struct IncomingLoop<'a> {
     reconnect_requested: Arc<AtomicBool>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a NetworkGuard,
-    last_policy_refresh: Instant,
 }
 
 impl IncomingLoop<'_> {
@@ -116,12 +122,6 @@ impl IncomingLoop<'_> {
             }
             if self.reconnect_requested.swap(false, Ordering::AcqRel) {
                 liveness.connection_lost(Instant::now());
-            }
-            if self.last_policy_refresh.elapsed() >= POLICY_REFRESH_INTERVAL {
-                if let Err(error) = self.network.refresh() {
-                    eprintln!("MOUSEVPN_POLICY_WARNING={error}");
-                }
-                self.last_policy_refresh = Instant::now();
             }
             self.maintain_liveness(&mut liveness, &mut keepalive)?;
         }
@@ -197,6 +197,46 @@ impl IncomingLoop<'_> {
     }
 }
 
+struct PeriodicWorker {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PeriodicWorker {
+    fn spawn(
+        interval: Duration,
+        mut task: impl FnMut() + Send + 'static,
+    ) -> Result<Self, ClientError> {
+        let (stop, receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("mousevpn-network-policy".to_owned())
+            .spawn(move || loop {
+                match receiver.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => task(),
+                }
+            })
+            .map_err(|error| {
+                ClientError::Platform(format!(
+                    "failed to start Windows network policy worker: {error}"
+                ))
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for PeriodicWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_outgoing(
     session: Arc<Session>,
@@ -266,4 +306,28 @@ fn is_peer_unavailable(error: &std::io::Error) -> bool {
 
 fn poisoned_sender() -> ClientError {
     ClientError::Platform("packet sender lock was poisoned".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeriodicWorker;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn policy_worker_stops_without_waiting_for_its_interval() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let task_ran = Arc::clone(&ran);
+        let worker = PeriodicWorker::spawn(Duration::from_secs(60), move || {
+            task_ran.store(true, Ordering::Release);
+        })
+        .expect("policy worker");
+        drop(worker);
+        assert!(!ran.load(Ordering::Acquire));
+    }
 }

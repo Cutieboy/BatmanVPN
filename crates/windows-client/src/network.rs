@@ -6,6 +6,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use fs2::FileExt;
@@ -59,6 +60,13 @@ struct RecoveryState {
 pub(crate) struct NetworkGuard {
     state: RecoveryState,
     state_path: PathBuf,
+    refresh_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NetworkRefresher {
+    server_ip: Ipv4Addr,
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl NetworkGuard {
@@ -105,13 +113,44 @@ impl NetworkGuard {
             }
             return Err(error);
         }
-        Ok(Self { state, state_path })
+        Ok(Self {
+            state,
+            state_path,
+            refresh_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub(crate) fn refresh(&self) -> Result<(), ClientError> {
-        let server_ip = self.state.server_ip;
-        let prefixes = blocked_ipv4_prefixes(server_ip).join("','");
-        let script = format!(
+        NetworkRefresher {
+            server_ip: self.state.server_ip,
+            refresh_lock: Arc::clone(&self.refresh_lock),
+        }
+        .refresh()
+    }
+
+    pub(crate) fn refresher(&self) -> NetworkRefresher {
+        NetworkRefresher {
+            server_ip: self.state.server_ip,
+            refresh_lock: Arc::clone(&self.refresh_lock),
+        }
+    }
+}
+
+impl NetworkRefresher {
+    pub(crate) fn refresh(&self) -> Result<(), ClientError> {
+        let _guard = self.refresh_lock.lock().map_err(|_| {
+            ClientError::Platform("Windows network policy refresh lock was poisoned".to_owned())
+        })?;
+        run_powershell(
+            &refresh_script(self.server_ip),
+            "refresh the Windows network policy",
+        )
+    }
+}
+
+fn refresh_script(server_ip: Ipv4Addr) -> String {
+    let prefixes = blocked_ipv4_prefixes(server_ip).join("','");
+    format!(
             "$ErrorActionPreference='Stop'; \
              $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
              $blocked=@('{prefixes}'); \
@@ -131,11 +170,13 @@ impl NetworkGuard {
              $up=@(Get-NetAdapter | Where-Object {{$_.Status -eq 'Up'}}).ifIndex; \
              $default=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {{$_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -ne $vpn.ifIndex -and $up -contains $_.InterfaceIndex}} | Sort-Object RouteMetric | Select-Object -First 1; \
              if (-not $default) {{ throw 'No active physical IPv4 default route found' }}; \
-             Get-NetRoute -DestinationPrefix '{server_ip}/32' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {ROUTE_METRIC} -and $_.Protocol -eq 'NetMgmt'}} | Remove-NetRoute -Confirm:$false; \
-             New-NetRoute -DestinationPrefix '{server_ip}/32' -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null"
-        );
-        run_powershell(&script, "refresh the Windows network policy")
-    }
+             $serverRoutes=@(Get-NetRoute -DestinationPrefix '{server_ip}/32' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {ROUTE_METRIC} -and $_.Protocol -eq 'NetMgmt'}}); \
+             $routeMatches=@($serverRoutes | Where-Object {{$_.InterfaceIndex -eq $default.InterfaceIndex -and $_.NextHop -eq $default.NextHop}}); \
+             if ($serverRoutes.Count -ne 1 -or $routeMatches.Count -ne 1) {{ \
+               if ($serverRoutes.Count -gt 0) {{$serverRoutes | Remove-NetRoute -Confirm:$false -ErrorAction Stop}}; \
+               New-NetRoute -DestinationPrefix '{server_ip}/32' -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null \
+             }}"
+        )
 }
 
 impl Drop for NetworkGuard {
@@ -326,7 +367,7 @@ fn run_powershell_output(script: &str, operation: &str) -> Result<String, Client
 
 #[cfg(test)]
 mod tests {
-    use super::blocked_ipv4_prefixes;
+    use super::{blocked_ipv4_prefixes, refresh_script};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -348,6 +389,13 @@ mod tests {
             assert_eq!(prefixes.len(), 32);
             assert!(prefixes.iter().all(|prefix| !contains(prefix, server)));
         }
+    }
+
+    #[test]
+    fn refresh_only_replaces_a_stale_server_route() {
+        let script = refresh_script(Ipv4Addr::new(203, 0, 113, 10));
+        assert!(script.contains("$serverRoutes.Count -ne 1 -or $routeMatches.Count -ne 1"));
+        assert!(script.contains("if ($serverRoutes.Count -gt 0)"));
     }
 
     fn contains_any(prefixes: &[String], address: Ipv4Addr) -> bool {

@@ -22,11 +22,12 @@ protocol implementation.
 - provides a non-Windows diagnostic stub so the workspace remains testable on
   Linux and the executable UI can be smoke-tested with Wine.
 
-The Windows networking backend is still an early MVP. Firewall policy is
-refreshed every five seconds to cover newly appearing adapters, but a custom
-Windows Filtering Platform driver would be required to eliminate that small
-hot-plug race completely. Do not treat the client as leak-safe until the real
-Windows test matrix in `WINDOWS-TESTING.md` passes.
+The Windows networking backend is still an early MVP. Existing adapters are
+protected when the tunnel starts; a background policy worker rechecks every 30
+seconds and reconnects refresh the physical server route immediately. A custom
+Windows Filtering Platform driver would be required to eliminate the remaining
+new-adapter hot-plug race completely. Do not treat the client as leak-safe until
+the real Windows test matrix in `WINDOWS-TESTING.md` passes.
 
 ## Development requirements
 
