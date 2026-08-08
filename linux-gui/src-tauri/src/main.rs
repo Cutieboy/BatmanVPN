@@ -17,6 +17,7 @@ use tauri::{Manager, State, WindowEvent};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+mod helper_log;
 mod helper_runtime;
 
 #[derive(Clone, Serialize)]
@@ -192,7 +193,8 @@ fn connect_profile(id: String, state: State<'_, AppState>) -> Result<ConnectionS
     };
     *lock(&state.snapshot)? = snapshot.clone();
     let shared_snapshot = Arc::clone(&state.snapshot);
-    thread::spawn(move || read_helper_status(stderr, &shared_snapshot));
+    let log = helper_log::HelperLog::open().ok();
+    thread::spawn(move || read_helper_status(stderr, &shared_snapshot, log));
     *child_slot = Some(child);
     Ok(snapshot)
 }
@@ -266,18 +268,49 @@ fn connection_status(state: State<'_, AppState>) -> Result<ConnectionSnapshot, S
     Ok(lock(&state.snapshot)?.clone())
 }
 
-fn read_helper_status(stderr: impl std::io::Read, snapshot: &Arc<Mutex<ConnectionSnapshot>>) {
+fn read_helper_status(
+    stderr: impl std::io::Read,
+    snapshot: &Arc<Mutex<ConnectionSnapshot>>,
+    mut log: Option<helper_log::HelperLog>,
+) {
+    let log_path = log.as_ref().map(|log| log.path().display().to_string());
+    if let Some(log) = log.as_mut() {
+        log.write("MOUSEVPN_STATE=helper_started");
+    }
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        if let Some(log) = log.as_mut() {
+            log.write(&line);
+        }
         let Ok(mut current) = snapshot.lock() else {
             return;
         };
-        if line == "MOUSEVPN_STATE=connected" || line.contains("MouseVPN connected") {
+        if matches!(
+            line.as_str(),
+            "MOUSEVPN_STATE=connected" | "MOUSEVPN_STATE=reconnected"
+        ) || line.contains("MouseVPN connected")
+        {
             "connected".clone_into(&mut current.state);
-            "Защищённое соединение установлено".clone_into(&mut current.message);
+            if line == "MOUSEVPN_STATE=reconnected" {
+                "Соединение восстановлено".clone_into(&mut current.message);
+            } else {
+                "Защищённое соединение установлено".clone_into(&mut current.message);
+            }
+        } else if line == "MOUSEVPN_STATE=reconnecting" {
+            "connecting".clone_into(&mut current.state);
+            "Сеть изменилась, переподключаемся…".clone_into(&mut current.message);
+        } else if let Some(message) = line.strip_prefix("MOUSEVPN_RECONNECT_ERROR=") {
+            "connecting".clone_into(&mut current.state);
+            current.message = format!("Ждём восстановления сети: {message}");
         } else if let Some(message) = line.strip_prefix("MOUSEVPN_ERROR=") {
             "error".clone_into(&mut current.state);
-            message.clone_into(&mut current.message);
+            current.message = log_path.as_ref().map_or_else(
+                || message.to_owned(),
+                |path| format!("{message}\nЖурнал: {path}"),
+            );
         }
+    }
+    if let Some(log) = log.as_mut() {
+        log.write("MOUSEVPN_STATE=helper_stderr_closed");
     }
 }
 

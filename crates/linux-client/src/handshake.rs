@@ -1,5 +1,4 @@
 use std::{
-    io,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -10,7 +9,7 @@ use mousevpn_data_plane::TunnelDataPlane;
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
-use crate::ClientError;
+use crate::{error::is_retryable_network, ClientError};
 
 /// Total time one connection attempt may spend before giving up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,7 +73,7 @@ pub(crate) fn negotiate(
         transport.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
         let length = match transport.receive(&mut buffer) {
             Ok(length) => length,
-            Err(error) if is_retryable(&error) => continue,
+            Err(error) if is_retryable_network(&error) => continue,
             Err(error) => return Err(error.into()),
         };
 
@@ -104,21 +103,9 @@ fn send_request(transport: &mut UdpTransport, request: &[u8]) -> Result<(), Clie
         // A refused or reset connection is a stale ICMP error from an earlier
         // datagram, not a reason to abandon this attempt.
         Ok(()) => Ok(()),
-        Err(error) if is_retryable(&error) => Ok(()),
+        Err(error) if is_retryable_network(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn is_retryable(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-    )
 }
 
 fn random_session_id() -> Result<u64, ClientError> {

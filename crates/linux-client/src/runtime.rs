@@ -31,7 +31,7 @@ enum Mode {
 enum NetworkGuard {
     Full {
         _firewall: FirewallGuard,
-        _routes: RouteGuard,
+        routes: RouteGuard,
         _dns: DnsGuard,
     },
     Proxy {
@@ -109,7 +109,7 @@ fn run_mode(
     let reconnecting = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&stopping))?;
     flag::register(SIGTERM, Arc::clone(&stopping))?;
-    let _network = match mode {
+    let mut network = match mode {
         Mode::FullTunnel => {
             let server_ip = match config.server.ip() {
                 std::net::IpAddr::V4(address) => address,
@@ -123,7 +123,7 @@ fn run_mode(
             NetworkGuard::Full {
                 _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)
                     .map_err(|error| context("installing the MouseVPN firewall", &error))?,
-                _routes: RouteGuard::install(server_ip, &tun_name)
+                routes: RouteGuard::install(server_ip, &tun_name)
                     .map_err(|error| context("installing VPN routes", &error))?,
                 _dns: DnsGuard::install(&tun_name, parameters.dns)
                     .map_err(|error| context("configuring VPN DNS", &error))?,
@@ -156,12 +156,19 @@ fn run_mode(
         let _ = worker_sender.send(result);
     });
     match mode {
-        Mode::FullTunnel => eprintln!("MouseVPN connected; press Ctrl+C to disconnect safely"),
+        Mode::FullTunnel => {
+            eprintln!("MOUSEVPN_STATE=connected");
+            eprintln!("MouseVPN connected; press Ctrl+C to disconnect safely");
+        }
         Mode::Proxy(listen) => {
             eprintln!("MouseVPN SOCKS5 proxy listening on {listen}; press Ctrl+C to stop");
         }
     }
 
+    let routes = match &mut network {
+        NetworkGuard::Full { routes, .. } => Some(routes),
+        NetworkGuard::Proxy { .. } => None,
+    };
     PacketLoop {
         config,
         transport: incoming,
@@ -172,6 +179,7 @@ fn run_mode(
         stopping,
         reconnecting,
         worker: worker_receiver,
+        routes,
     }
     .run()
 }

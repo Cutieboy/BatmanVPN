@@ -12,6 +12,11 @@ Desktop client built with Tauri 2 and the existing MouseVPN Rust runtime.
 - connects through a short-lived privileged helper started by PolicyKit;
 - disconnects gracefully so the runtime removes its routes, DNS settings and
   isolated nftables table;
+- treats temporary Wi-Fi and gateway failures as reconnectable conditions and
+  refreshes the server host route without removing TUN, DNS or firewall state;
+- shows reconnect progress in the GUI and keeps a rotated helper log under
+  `$XDG_DATA_HOME/MouseVPN/logs` (normally
+  `~/.local/share/MouseVPN/logs`);
 - keeps running in the system tray when the main window is closed, with tray
   actions to reopen, disconnect or quit;
 - publishes the tray through the freedesktop/KDE StatusNotifier D-Bus protocol,

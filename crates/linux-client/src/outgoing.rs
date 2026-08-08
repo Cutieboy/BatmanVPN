@@ -1,5 +1,4 @@
 use std::{
-    io,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -11,7 +10,7 @@ use mousevpn_data_plane::{PacketDevice, TunnelSender};
 use mousevpn_linux_platform::LinuxTun;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
-use crate::ClientError;
+use crate::{error::is_retryable_network, ClientError};
 
 const PACKET_BUFFER_LEN: usize = 65_535;
 const PAUSE_POLL: Duration = Duration::from_millis(5);
@@ -34,7 +33,7 @@ pub(crate) fn run(
     while !stopping.load(Ordering::Relaxed) {
         let length = match tun.receive(&mut packet) {
             Ok(length) => length,
-            Err(error) if is_retryable(&error) => continue,
+            Err(error) if is_retryable_network(&error) => continue,
             Err(error) => return Err(error.into()),
         };
         if is_ipv6(&packet[..length]) {
@@ -57,7 +56,7 @@ pub(crate) fn run(
             Ok(()) => {}
             // The peer is unreachable right now; the receive loop owns liveness
             // and will reconnect.
-            Err(error) if is_retryable(&error) => {}
+            Err(error) if is_retryable_network(&error) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -85,18 +84,6 @@ impl Drops {
             self.last_report = Some(now);
         }
     }
-}
-
-fn is_retryable(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-    )
 }
 
 fn is_ipv6(packet: &[u8]) -> bool {

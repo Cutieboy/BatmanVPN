@@ -4,6 +4,29 @@ use mousevpn_crypto::CryptoError;
 use mousevpn_data_plane::DataPlaneError;
 use mousevpn_protocol::{DecodeError, SessionParametersError};
 
+pub(crate) fn is_peer_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+pub(crate) fn is_retryable_network(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    ) || is_peer_unavailable(error)
+}
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
@@ -72,5 +95,32 @@ impl From<DataPlaneError> for ClientError {
 impl From<getrandom::Error> for ClientError {
     fn from(error: getrandom::Error) -> Self {
         Self::Random(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::{is_peer_unavailable, is_retryable_network};
+
+    #[test]
+    fn network_flaps_are_retryable() {
+        for kind in [
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::NotConnected,
+        ] {
+            let error = Error::from(kind);
+            assert!(is_peer_unavailable(&error));
+            assert!(is_retryable_network(&error));
+        }
+    }
+
+    #[test]
+    fn permanent_local_errors_remain_fatal() {
+        let error = Error::from(ErrorKind::PermissionDenied);
+        assert!(!is_retryable_network(&error));
     }
 }

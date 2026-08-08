@@ -10,11 +10,12 @@ use std::{
 
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, PacketDevice, TunnelReceiver, TunnelSender};
-use mousevpn_linux_platform::LinuxTun;
+use mousevpn_linux_platform::{LinuxTun, RouteGuard};
 use mousevpn_protocol::{Datagram, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
 use crate::{
+    error::is_peer_unavailable,
     handshake::negotiate,
     liveness::{Action, Liveness},
     ClientError,
@@ -41,6 +42,7 @@ pub(crate) struct PacketLoop<'a> {
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) reconnecting: Arc<AtomicBool>,
     pub(crate) worker: Receiver<Result<(), ClientError>>,
+    pub(crate) routes: Option<&'a mut RouteGuard>,
 }
 
 impl PacketLoop<'_> {
@@ -133,7 +135,15 @@ impl PacketLoop<'_> {
     fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) -> Result<(), ClientError> {
         liveness.reconnect_attempted(now);
         self.reconnecting.store(true, Ordering::Relaxed);
+        eprintln!("MOUSEVPN_STATE=reconnecting");
         eprintln!("MouseVPN session timed out; reconnecting");
+        if let Some(routes) = self.routes.as_deref_mut() {
+            if let Err(error) = routes.refresh_server_route() {
+                self.reconnecting.store(false, Ordering::Relaxed);
+                eprintln!("MOUSEVPN_RECONNECT_ERROR=refreshing server route: {error}");
+                return Ok(());
+            }
+        }
         let result = negotiate(&mut self.transport, self.config);
         self.transport.set_read_timeout(Some(POLL_INTERVAL))?;
         match result {
@@ -146,9 +156,10 @@ impl PacketLoop<'_> {
                 self.receiver = receiver;
                 *self.sender.lock().map_err(|_| ClientError::WorkerStopped)? = sender;
                 liveness.reconnected(Instant::now());
+                eprintln!("MOUSEVPN_STATE=reconnected");
                 eprintln!("MouseVPN reconnected");
             }
-            Err(error) => eprintln!("MouseVPN reconnect failed: {error}"),
+            Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),
         }
         self.reconnecting.store(false, Ordering::Relaxed);
         Ok(())
@@ -167,15 +178,6 @@ fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
-}
-
-fn is_peer_unavailable(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
     )
 }
 

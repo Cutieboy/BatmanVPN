@@ -7,7 +7,9 @@ use route_manager::{Route, RouteManager};
 
 pub struct RouteGuard {
     manager: RouteManager,
-    added: Vec<Route>,
+    server_ip: Ipv4Addr,
+    server_route: Option<Route>,
+    tunnel_routes: Vec<Route>,
 }
 
 /// Refuses the common split-default layout used by an existing full-tunnel VPN.
@@ -36,25 +38,7 @@ impl RouteGuard {
         let mut manager = RouteManager::new()?;
         let routes = manager.list()?;
         reject_full_tunnel(&routes)?;
-        let default = routes
-            .into_iter()
-            .filter(|route| {
-                route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED) && route.prefix() == 0
-            })
-            .min_by_key(|route| route.metric().unwrap_or(u32::MAX))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "IPv4 default route not found")
-            })?;
-
-        let mut server_route = Route::new(IpAddr::V4(server), 32);
-        if let Some(gateway) = default.gateway() {
-            server_route = server_route.with_gateway(gateway);
-        }
-        if let Some(index) = default.if_index() {
-            server_route = server_route.with_if_index(index);
-        } else if let Some(name) = default.if_name() {
-            server_route = server_route.with_if_name(name.clone());
-        }
+        let server_route = server_route(server, &routes)?;
         let first_half =
             Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1).with_if_name(tun_name.to_owned());
         let second_half = Route::new(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1)
@@ -62,19 +46,70 @@ impl RouteGuard {
 
         let mut guard = Self {
             manager,
-            added: Vec::new(),
+            server_ip: server,
+            server_route: None,
+            tunnel_routes: Vec::new(),
         };
-        guard.add(server_route)?;
-        guard.add(first_half)?;
-        guard.add(second_half)?;
+        guard.manager.add(&server_route)?;
+        guard.server_route = Some(server_route);
+        guard.add_tunnel_route(first_half)?;
+        guard.add_tunnel_route(second_half)?;
         Ok(guard)
     }
 
-    fn add(&mut self, route: Route) -> io::Result<()> {
-        self.manager.add(&route)?;
-        self.added.push(route);
+    /// Replaces the server host route when the physical default gateway changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when routes cannot be inspected or replaced.
+    pub fn refresh_server_route(&mut self) -> io::Result<()> {
+        let routes = self.manager.list()?;
+        let replacement = server_route(self.server_ip, &routes)?;
+        if self.server_route.as_ref() == Some(&replacement) {
+            return Ok(());
+        }
+
+        let previous = self.server_route.take();
+        if let Some(route) = previous.as_ref() {
+            self.manager.delete(route)?;
+        }
+        if let Err(error) = self.manager.add(&replacement) {
+            if let Some(route) = previous {
+                if self.manager.add(&route).is_ok() {
+                    self.server_route = Some(route);
+                }
+            }
+            return Err(error);
+        }
+        self.server_route = Some(replacement);
         Ok(())
     }
+
+    fn add_tunnel_route(&mut self, route: Route) -> io::Result<()> {
+        self.manager.add(&route)?;
+        self.tunnel_routes.push(route);
+        Ok(())
+    }
+}
+
+fn server_route(server: Ipv4Addr, routes: &[Route]) -> io::Result<Route> {
+    let default = routes
+        .iter()
+        .filter(|route| {
+            route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED) && route.prefix() == 0
+        })
+        .min_by_key(|route| route.metric().unwrap_or(u32::MAX))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IPv4 default route not found"))?;
+    let mut route = Route::new(IpAddr::V4(server), 32);
+    if let Some(gateway) = default.gateway() {
+        route = route.with_gateway(gateway);
+    }
+    if let Some(index) = default.if_index() {
+        route = route.with_if_index(index);
+    } else if let Some(name) = default.if_name() {
+        route = route.with_if_name(name.clone());
+    }
+    Ok(route)
 }
 
 fn reject_full_tunnel(routes: &[Route]) -> io::Result<()> {
@@ -102,7 +137,10 @@ fn has_full_tunnel(routes: &[Route]) -> bool {
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        for route in self.added.iter().rev() {
+        for route in self.tunnel_routes.iter().rev() {
+            let _ = self.manager.delete(route);
+        }
+        if let Some(route) = self.server_route.as_ref() {
             let _ = self.manager.delete(route);
         }
     }
@@ -114,7 +152,7 @@ mod tests {
 
     use route_manager::Route;
 
-    use super::has_full_tunnel;
+    use super::{has_full_tunnel, server_route};
 
     #[test]
     fn detects_split_default_routes() {
@@ -123,5 +161,23 @@ mod tests {
 
         assert!(!has_full_tunnel(&[normal]));
         assert!(has_full_tunnel(&[split]));
+    }
+
+    #[test]
+    fn server_route_follows_the_best_physical_default() {
+        let slower = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+            .with_if_index(2)
+            .with_metric(600);
+        let faster = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .with_if_index(3)
+            .with_metric(100);
+        let route = server_route(Ipv4Addr::new(203, 0, 113, 7), &[slower, faster]).unwrap();
+        assert_eq!(
+            route.gateway(),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        assert_eq!(route.if_index(), Some(3));
     }
 }
