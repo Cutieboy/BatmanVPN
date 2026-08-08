@@ -1,6 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::Receiver,
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -21,14 +22,19 @@ const PAUSE_POLL: Duration = Duration::from_millis(5);
 /// flood the journal.
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
+pub(crate) struct ReconnectControl {
+    pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) requested: Arc<AtomicU64>,
+    pub(crate) generation: Arc<AtomicU64>,
+    pub(crate) transport_replacements: Receiver<UdpTransport>,
+}
+
 pub(crate) fn run(
     tun: &LinuxTun,
     sender: &Mutex<TunnelSender>,
     transport: &mut UdpTransport,
     stopping: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
-    reconnect_requested: &Arc<AtomicU64>,
-    session_generation: &Arc<AtomicU64>,
+    reconnect: &ReconnectControl,
 ) -> Result<(), ClientError> {
     let mut packet = vec![0_u8; PACKET_BUFFER_LEN];
     // Reused for every datagram: the send path allocates nothing in steady state.
@@ -44,8 +50,14 @@ pub(crate) fn run(
         if is_ipv6(&packet[..length]) {
             continue;
         }
-        while paused.load(Ordering::Relaxed) && !stopping.load(Ordering::Relaxed) {
+        while reconnect.paused.load(Ordering::Relaxed) && !stopping.load(Ordering::Relaxed) {
             std::thread::sleep(PAUSE_POLL);
+        }
+        // A connected UDP socket can retain its pre-suspend source address and
+        // route.  Reconnect creates a fresh socket and hands its clone to this
+        // direction before unpausing packet delivery.
+        while let Ok(replacement) = reconnect.transport_replacements.try_recv() {
+            *transport = replacement;
         }
 
         {
@@ -65,8 +77,8 @@ pub(crate) fn run(
             // and swallowing it here left the receive loop waiting out the full
             // session timeout instead of reconnecting.
             Err(error) if is_peer_unavailable(&error) => {
-                let generation = session_generation.load(Ordering::Relaxed);
-                reconnect_requested.store(generation, Ordering::Relaxed);
+                let generation = reconnect.generation.load(Ordering::Relaxed);
+                reconnect.requested.store(generation, Ordering::Relaxed);
             }
             Err(error) if is_retryable_network(&error) => {}
             Err(error) => return Err(error.into()),

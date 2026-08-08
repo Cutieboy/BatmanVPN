@@ -67,12 +67,23 @@ impl RouteGuard {
     pub fn refresh_server_route(&mut self) -> io::Result<()> {
         let routes = self.manager.list()?;
         let replacement = server_route(self.server_ip, &routes)?;
-        if self.server_route.as_ref() == Some(&replacement) {
+        // A route tied to a physical link can disappear from the kernel while
+        // the machine sleeps.  The cached guard value surviving is not proof
+        // that the route itself survived, even when NetworkManager restores
+        // the same gateway and interface after resume.
+        if routes
+            .iter()
+            .any(|route| same_server_path(route, &replacement))
+        {
+            self.server_route = Some(replacement);
             return Ok(());
         }
 
         let previous = self.server_route.take();
-        if let Some(route) = previous.as_ref() {
+        if let Some(route) = previous
+            .as_ref()
+            .filter(|previous| routes.iter().any(|route| same_server_path(route, previous)))
+        {
             self.manager.delete(route)?;
         }
         if let Err(error) = self.manager.add(&replacement) {
@@ -133,6 +144,15 @@ fn is_owned_server_route(route: &Route, server: Ipv4Addr) -> bool {
         && route.metric() == Some(SERVER_ROUTE_METRIC)
 }
 
+fn same_server_path(left: &Route, right: &Route) -> bool {
+    left.destination() == right.destination()
+        && left.prefix() == right.prefix()
+        && left.gateway() == right.gateway()
+        && left.if_index() == right.if_index()
+        && left.if_name() == right.if_name()
+        && left.metric() == right.metric()
+}
+
 fn reject_full_tunnel(routes: &[Route]) -> io::Result<()> {
     if has_full_tunnel(routes) {
         Err(io::Error::new(
@@ -173,7 +193,7 @@ mod tests {
 
     use route_manager::Route;
 
-    use super::{has_full_tunnel, is_owned_server_route, server_route};
+    use super::{has_full_tunnel, is_owned_server_route, same_server_path, server_route};
 
     #[test]
     fn detects_split_default_routes() {
@@ -209,5 +229,22 @@ mod tests {
         let user = Route::new(IpAddr::V4(server), 32).with_metric(100);
         assert!(is_owned_server_route(&owned, server));
         assert!(!is_owned_server_route(&user, server));
+    }
+
+    #[test]
+    fn cached_route_must_match_an_installed_server_path() {
+        let server = Ipv4Addr::new(203, 0, 113, 7);
+        let installed = Route::new(IpAddr::V4(server), 32)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+            .with_if_index(2)
+            .with_metric(4_242);
+        let same = installed.clone();
+        let changed_gateway = Route::new(IpAddr::V4(server), 32)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .with_if_index(3)
+            .with_metric(4_242);
+
+        assert!(same_server_path(&installed, &same));
+        assert!(!same_server_path(&installed, &changed_gateway));
     }
 }

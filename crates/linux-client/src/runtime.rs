@@ -20,7 +20,7 @@ use signal_hook::{
 
 use crate::{
     handshake::connect,
-    outgoing,
+    outgoing::{self, ReconnectControl},
     packet_loop::{PacketLoop, POLL_INTERVAL},
     proxy::ProxyServerGuard,
     ClientError,
@@ -145,15 +145,20 @@ fn run_mode(
     let outgoing_requested = Arc::clone(&reconnect_requested);
     let outgoing_generation = Arc::clone(&session_generation);
     let (worker_sender, worker_receiver) = mpsc::sync_channel(1);
+    let (transport_sender, transport_receiver) = mpsc::channel();
     thread::spawn(move || {
+        let reconnect = ReconnectControl {
+            paused: outgoing_reconnecting,
+            requested: outgoing_requested,
+            generation: outgoing_generation,
+            transport_replacements: transport_receiver,
+        };
         let result = outgoing::run(
             &outgoing_tun,
             &outgoing_sender,
             &mut outgoing,
             &outgoing_stopping,
-            &outgoing_reconnecting,
-            &outgoing_requested,
-            &outgoing_generation,
+            &reconnect,
         );
         let _ = worker_sender.send(result);
     });
@@ -183,6 +188,7 @@ fn run_mode(
         reconnect_requested,
         session_generation,
         worker: worker_receiver,
+        outgoing_transport: transport_sender,
         routes,
         dns,
     }

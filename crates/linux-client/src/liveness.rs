@@ -69,6 +69,14 @@ impl Liveness {
         self.backoff = (self.backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
 
+    /// Polls quickly while the physical network has no default route yet.
+    /// Resume commonly reports link-up before `NetworkManager` has restored the
+    /// gateway, and that short state should not grow the handshake backoff.
+    pub(crate) fn network_unavailable(&mut self, now: Instant) {
+        self.retry = Some(now);
+        self.backoff = MIN_RECONNECT_BACKOFF;
+    }
+
     /// Reports that the peer is unreachable, which makes the first attempt due
     /// immediately. Repeated reports before the peer answers again are ignored,
     /// so a stream of ICMP errors cannot bypass the backoff.
@@ -210,6 +218,22 @@ mod tests {
         state.reconnect_attempted(start + Duration::from_secs(601));
         assert_eq!(
             state.action(start + Duration::from_secs(603)),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn missing_physical_route_is_polled_quickly() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        state.network_unavailable(start);
+        assert_eq!(
+            state.action(start + Duration::from_millis(999)),
+            Action::None
+        );
+        assert_eq!(
+            state.action(start + Duration::from_secs(1)),
             Action::Reconnect
         );
     }

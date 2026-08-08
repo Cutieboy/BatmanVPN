@@ -2,7 +2,7 @@ use std::{
     io,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, TryRecvError},
+        mpsc::{Receiver, Sender, TryRecvError},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use mousevpn_transport::{DatagramTransport, UdpTransport};
 
 use crate::{
     error::is_peer_unavailable,
-    handshake::negotiate,
+    handshake::connect,
     liveness::{Action, Liveness},
     ClientError,
 };
@@ -48,6 +48,7 @@ pub(crate) struct PacketLoop<'a> {
     /// Identifies the data-plane generation that an outgoing error belongs to.
     pub(crate) session_generation: Arc<AtomicU64>,
     pub(crate) worker: Receiver<Result<(), ClientError>>,
+    pub(crate) outgoing_transport: Sender<UdpTransport>,
     pub(crate) routes: Option<&'a mut RouteGuard>,
     pub(crate) dns: Option<&'a mut DnsGuard>,
 }
@@ -141,7 +142,10 @@ impl PacketLoop<'_> {
                 }
                 Ok(())
             }
-            Action::Reconnect => self.reconnect(liveness, now),
+            Action::Reconnect => {
+                self.reconnect(liveness, now);
+                Ok(())
+            }
         }
     }
 
@@ -154,31 +158,21 @@ impl PacketLoop<'_> {
         Ok(())
     }
 
-    fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) -> Result<(), ClientError> {
-        liveness.reconnect_attempted(now);
+    fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) {
         self.reconnecting.store(true, Ordering::Relaxed);
         eprintln!("MOUSEVPN_STATE=reconnecting");
         eprintln!("MouseVPN session timed out; reconnecting");
         if let Some(routes) = self.routes.as_deref_mut() {
             if let Err(error) = routes.refresh_server_route() {
+                liveness.network_unavailable(now);
                 self.reconnecting.store(false, Ordering::Relaxed);
                 eprintln!("MOUSEVPN_RECONNECT_ERROR=refreshing server route: {error}");
-                return Ok(());
+                return;
             }
         }
-        let result = negotiate(&mut self.transport, self.config);
-        self.transport.set_read_timeout(Some(POLL_INTERVAL))?;
-        match result {
-            Ok((replacement, parameters)) => {
-                self.apply_session_parameters(parameters)?;
-                let (sender, receiver) = replacement.split();
-                self.receiver = receiver;
-                *self.sender.lock().map_err(|_| ClientError::WorkerStopped)? = sender;
-                // Advance the data-plane generation before clearing requests.
-                // An old send() completing after this point retains its old
-                // generation and cannot tear down the replacement session.
-                self.session_generation.fetch_add(1, Ordering::Relaxed);
-                self.reconnect_requested.store(0, Ordering::Relaxed);
+        liveness.reconnect_attempted(now);
+        match self.establish_replacement() {
+            Ok(()) => {
                 liveness.reconnected(Instant::now());
                 eprintln!("MOUSEVPN_STATE=reconnected");
                 eprintln!("MouseVPN reconnected");
@@ -186,6 +180,28 @@ impl PacketLoop<'_> {
             Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),
         }
         self.reconnecting.store(false, Ordering::Relaxed);
+    }
+
+    fn establish_replacement(&mut self) -> Result<(), ClientError> {
+        // Do not reuse the connected socket across suspend or a gateway
+        // change. Linux may keep its old source address and cached route even
+        // after the server host route has been repaired.
+        let (replacement_transport, replacement, parameters) = connect(self.config)?;
+        replacement_transport.set_read_timeout(Some(POLL_INTERVAL))?;
+        let outgoing_transport = replacement_transport.try_clone()?;
+        self.apply_session_parameters(parameters)?;
+        let (sender, receiver) = replacement.split();
+        self.receiver = receiver;
+        *self.sender.lock().map_err(|_| ClientError::WorkerStopped)? = sender;
+        self.outgoing_transport
+            .send(outgoing_transport)
+            .map_err(|_| ClientError::WorkerStopped)?;
+        self.transport = replacement_transport;
+        // Advance the data-plane generation before clearing requests. An old
+        // send() completing after this point retains its old generation and
+        // cannot tear down the replacement session.
+        self.session_generation.fetch_add(1, Ordering::Relaxed);
+        self.reconnect_requested.store(0, Ordering::Relaxed);
         Ok(())
     }
 
