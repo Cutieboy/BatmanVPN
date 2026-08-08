@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -10,7 +10,10 @@ use mousevpn_data_plane::{PacketDevice, TunnelSender};
 use mousevpn_linux_platform::LinuxTun;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
-use crate::{error::is_retryable_network, ClientError};
+use crate::{
+    error::{is_peer_unavailable, is_retryable_network},
+    ClientError,
+};
 
 const PACKET_BUFFER_LEN: usize = 65_535;
 const PAUSE_POLL: Duration = Duration::from_millis(5);
@@ -24,6 +27,8 @@ pub(crate) fn run(
     transport: &mut UdpTransport,
     stopping: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    reconnect_requested: &Arc<AtomicU64>,
+    session_generation: &Arc<AtomicU64>,
 ) -> Result<(), ClientError> {
     let mut packet = vec![0_u8; PACKET_BUFFER_LEN];
     // Reused for every datagram: the send path allocates nothing in steady state.
@@ -54,8 +59,15 @@ pub(crate) fn run(
         }
         match transport.send(&datagram) {
             Ok(()) => {}
-            // The peer is unreachable right now; the receive loop owns liveness
-            // and will reconnect.
+            // The receive loop owns liveness, but both directions share one
+            // kernel socket, so the peer's ICMP error is delivered to whichever
+            // syscall runs first. Under load that is almost always this send,
+            // and swallowing it here left the receive loop waiting out the full
+            // session timeout instead of reconnecting.
+            Err(error) if is_peer_unavailable(&error) => {
+                let generation = session_generation.load(Ordering::Relaxed);
+                reconnect_requested.store(generation, Ordering::Relaxed);
+            }
             Err(error) if is_retryable_network(&error) => {}
             Err(error) => return Err(error.into()),
         }

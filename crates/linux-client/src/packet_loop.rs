@@ -1,7 +1,7 @@
 use std::{
     io,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, TryRecvError},
         Arc, Mutex,
     },
@@ -10,7 +10,7 @@ use std::{
 
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, PacketDevice, TunnelReceiver, TunnelSender};
-use mousevpn_linux_platform::{LinuxTun, RouteGuard};
+use mousevpn_linux_platform::{DnsGuard, LinuxTun, RouteGuard};
 use mousevpn_protocol::{Datagram, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 
@@ -23,6 +23,7 @@ use crate::{
 
 const PACKET_BUFFER_LEN: usize = 65_535;
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 enum ReceiveEvent {
     Packet(usize),
@@ -41,8 +42,14 @@ pub(crate) struct PacketLoop<'a> {
     pub(crate) sender: Arc<Mutex<TunnelSender>>,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) reconnecting: Arc<AtomicBool>,
+    /// Raised by the send thread when it consumes the peer's ICMP error, which
+    /// the receive path would otherwise never observe.
+    pub(crate) reconnect_requested: Arc<AtomicU64>,
+    /// Identifies the data-plane generation that an outgoing error belongs to.
+    pub(crate) session_generation: Arc<AtomicU64>,
     pub(crate) worker: Receiver<Result<(), ClientError>>,
     pub(crate) routes: Option<&'a mut RouteGuard>,
+    pub(crate) dns: Option<&'a mut DnsGuard>,
 }
 
 impl PacketLoop<'_> {
@@ -52,9 +59,10 @@ impl PacketLoop<'_> {
         let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
         let mut keepalive = Vec::with_capacity(128);
         let mut liveness = Liveness::new(Instant::now());
+        let mut next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
 
         while !self.stopping.load(Ordering::Relaxed) {
-            check_worker(&self.worker)?;
+            check_worker(&self.worker, &self.stopping)?;
             match self.receive(&mut datagram)? {
                 ReceiveEvent::Packet(length) => {
                     if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
@@ -77,6 +85,20 @@ impl PacketLoop<'_> {
                 ReceiveEvent::Idle => {}
                 ReceiveEvent::PeerUnavailable => liveness.connection_lost(Instant::now()),
             }
+            if self.stopping.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if take_reconnect_request(&self.reconnect_requested, &self.session_generation) {
+                liveness.connection_lost(Instant::now());
+            }
+            if Instant::now() >= next_route_refresh {
+                if let Some(routes) = self.routes.as_deref_mut() {
+                    if let Err(error) = routes.refresh_server_route() {
+                        eprintln!("MOUSEVPN_POLICY_WARNING=refreshing server route: {error}");
+                    }
+                }
+                next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
+            }
             self.maintain_liveness(&mut liveness, &mut keepalive)?;
         }
         Ok(())
@@ -92,7 +114,7 @@ impl PacketLoop<'_> {
                 Ok(ReceiveEvent::Idle)
             }
             Err(error) if is_timeout(&error) => {
-                check_worker(&self.worker)?;
+                check_worker(&self.worker, &self.stopping)?;
                 Ok(ReceiveEvent::Idle)
             }
             Err(error) if is_peer_unavailable(&error) => Ok(ReceiveEvent::PeerUnavailable),
@@ -148,13 +170,15 @@ impl PacketLoop<'_> {
         self.transport.set_read_timeout(Some(POLL_INTERVAL))?;
         match result {
             Ok((replacement, parameters)) => {
-                if parameters != self.parameters {
-                    self.reconnecting.store(false, Ordering::Relaxed);
-                    return Err(ClientError::SessionParametersChanged);
-                }
+                self.apply_session_parameters(parameters)?;
                 let (sender, receiver) = replacement.split();
                 self.receiver = receiver;
                 *self.sender.lock().map_err(|_| ClientError::WorkerStopped)? = sender;
+                // Advance the data-plane generation before clearing requests.
+                // An old send() completing after this point retains its old
+                // generation and cannot tear down the replacement session.
+                self.session_generation.fetch_add(1, Ordering::Relaxed);
+                self.reconnect_requested.store(0, Ordering::Relaxed);
                 liveness.reconnected(Instant::now());
                 eprintln!("MOUSEVPN_STATE=reconnected");
                 eprintln!("MouseVPN reconnected");
@@ -164,14 +188,58 @@ impl PacketLoop<'_> {
         self.reconnecting.store(false, Ordering::Relaxed);
         Ok(())
     }
+
+    fn apply_session_parameters(
+        &mut self,
+        parameters: SessionParameters,
+    ) -> Result<(), ClientError> {
+        if parameters == self.parameters {
+            return Ok(());
+        }
+        let Some(dns) = self.dns.as_deref_mut() else {
+            return Err(ClientError::SessionParametersChanged);
+        };
+        let previous = self.parameters;
+        self.tun.reconfigure(
+            parameters.client_address,
+            parameters.prefix_len,
+            parameters.mtu,
+        )?;
+        if let Err(error) = dns.update(parameters.dns) {
+            let rollback =
+                self.tun
+                    .reconfigure(previous.client_address, previous.prefix_len, previous.mtu);
+            return match rollback {
+                Ok(()) => Err(error.into()),
+                Err(rollback) => Err(io::Error::other(format!(
+                    "updating tunnel DNS failed: {error}; TUN rollback failed: {rollback}"
+                ))
+                .into()),
+            };
+        }
+        self.parameters = parameters;
+        eprintln!("MOUSEVPN_STATE=parameters_updated");
+        Ok(())
+    }
 }
 
-fn check_worker(receiver: &Receiver<Result<(), ClientError>>) -> Result<(), ClientError> {
+fn check_worker(
+    receiver: &Receiver<Result<(), ClientError>>,
+    stopping: &AtomicBool,
+) -> Result<(), ClientError> {
     match receiver.try_recv() {
         Ok(Err(error)) => Err(error),
+        // A worker that finished because we asked it to is not a failure: the
+        // main loop exits on the same flag one iteration later.
+        Ok(Ok(())) | Err(TryRecvError::Disconnected) if stopping.load(Ordering::Relaxed) => Ok(()),
         Ok(Ok(())) | Err(TryRecvError::Disconnected) => Err(ClientError::WorkerStopped),
         Err(TryRecvError::Empty) => Ok(()),
     }
+}
+
+fn take_reconnect_request(requested: &AtomicU64, generation: &AtomicU64) -> bool {
+    let requested = requested.swap(0, Ordering::Relaxed);
+    requested != 0 && requested == generation.load(Ordering::Relaxed)
 }
 
 fn is_timeout(error: &io::Error) -> bool {
@@ -183,4 +251,48 @@ fn is_timeout(error: &io::Error) -> bool {
 
 fn is_recoverable(error: &io::Error) -> bool {
     is_timeout(error) || error.kind() == io::ErrorKind::Interrupted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    };
+
+    use super::{check_worker, take_reconnect_request};
+    use crate::ClientError;
+
+    #[test]
+    fn a_clean_worker_exit_is_normal_during_shutdown() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(())).unwrap();
+        assert!(check_worker(&receiver, &AtomicBool::new(true)).is_ok());
+    }
+
+    #[test]
+    fn an_unexpected_clean_worker_exit_is_an_error() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(())).unwrap();
+        assert!(matches!(
+            check_worker(&receiver, &AtomicBool::new(false)),
+            Err(ClientError::WorkerStopped)
+        ));
+    }
+
+    #[test]
+    fn ignores_a_reconnect_request_from_an_old_session() {
+        let requested = AtomicU64::new(3);
+        let generation = AtomicU64::new(4);
+        assert!(!take_reconnect_request(&requested, &generation));
+        assert_eq!(requested.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn accepts_a_reconnect_request_from_the_current_session() {
+        assert!(take_reconnect_request(
+            &AtomicU64::new(4),
+            &AtomicU64::new(4)
+        ));
+    }
 }

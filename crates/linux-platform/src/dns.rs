@@ -2,6 +2,7 @@ use std::{io, net::Ipv4Addr, process::Command};
 
 pub struct DnsGuard {
     interface: String,
+    server: Ipv4Addr,
 }
 
 impl DnsGuard {
@@ -22,6 +23,7 @@ impl DnsGuard {
 
         let guard = Self {
             interface: interface.to_owned(),
+            server: dns,
         };
         Self::run(&["dns", interface, &dns.to_string()])?;
         if let Err(error) = Self::run(&["domain", interface, "~."]) {
@@ -33,6 +35,20 @@ impl DnsGuard {
             return Err(error);
         }
         Ok(guard)
+    }
+
+    /// Replaces the link-specific DNS server without changing route domains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `resolvectl` rejects the new server.
+    pub fn update(&mut self, dns: Ipv4Addr) -> io::Result<()> {
+        if self.server == dns {
+            return Ok(());
+        }
+        Self::run(&["dns", &self.interface, &dns.to_string()])?;
+        self.server = dns;
+        Ok(())
     }
 
     fn run(arguments: &[&str]) -> io::Result<()> {

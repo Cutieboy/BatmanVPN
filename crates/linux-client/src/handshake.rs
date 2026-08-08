@@ -36,6 +36,20 @@ pub(crate) fn negotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
 ) -> Result<(TunnelDataPlane, SessionParameters), ClientError> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        match negotiate_attempt(transport, config, deadline) {
+            Err(ClientError::InvalidHandshakeResponse) if Instant::now() < deadline => {}
+            result => return result,
+        }
+    }
+}
+
+fn negotiate_attempt(
+    transport: &mut UdpTransport,
+    config: &ValidatedClientConfig,
+    deadline: Instant,
+) -> Result<(TunnelDataPlane, SessionParameters), ClientError> {
     let session_id = random_session_id()?;
     let mut handshake = ClientHandshake::new(
         &config.client_private_key,
@@ -54,7 +68,9 @@ pub(crate) fn negotiate(
     let request = Datagram::new(header, &initial).encode();
 
     let started = Instant::now();
-    let deadline = started + HANDSHAKE_TIMEOUT;
+    if started >= deadline {
+        return Err(ClientError::HandshakeTimeout);
+    }
     send_request(transport, &request)?;
     let mut next_retransmit = started + HANDSHAKE_RETRANSMIT;
 
@@ -85,11 +101,12 @@ pub(crate) fn negotiate(
         {
             continue;
         }
-        // A corrupted or spoofed response must not abort an attempt that still
-        // has time left for the genuine one.
-        let Ok((crypto, payload)) = handshake.finish(response.payload) else {
-            return Err(ClientError::HandshakeTimeout);
-        };
+        // `finish` consumes the Noise state even when authentication fails.
+        // Ask the outer loop for a fresh session ID and Noise state while the
+        // original total timeout still has budget left.
+        let (crypto, payload) = handshake
+            .finish(response.payload)
+            .map_err(|_| ClientError::InvalidHandshakeResponse)?;
         let parameters = SessionParameters::decode(&payload)?;
         return Ok((
             TunnelDataPlane::new(session_id, usize::from(parameters.mtu), crypto),

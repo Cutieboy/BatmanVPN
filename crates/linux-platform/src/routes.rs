@@ -5,6 +5,8 @@ use std::{
 
 use route_manager::{Route, RouteManager};
 
+const SERVER_ROUTE_METRIC: u32 = 4_242;
+
 pub struct RouteGuard {
     manager: RouteManager,
     server_ip: Ipv4Addr,
@@ -100,7 +102,7 @@ fn server_route(server: Ipv4Addr, routes: &[Route]) -> io::Result<Route> {
         })
         .min_by_key(|route| route.metric().unwrap_or(u32::MAX))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IPv4 default route not found"))?;
-    let mut route = Route::new(IpAddr::V4(server), 32);
+    let mut route = Route::new(IpAddr::V4(server), 32).with_metric(SERVER_ROUTE_METRIC);
     if let Some(gateway) = default.gateway() {
         route = route.with_gateway(gateway);
     }
@@ -110,6 +112,25 @@ fn server_route(server: Ipv4Addr, routes: &[Route]) -> io::Result<Route> {
         route = route.with_if_name(name.clone());
     }
     Ok(route)
+}
+
+pub(crate) fn remove_stale_server_routes(server: Ipv4Addr) -> io::Result<()> {
+    let mut manager = RouteManager::new()?;
+    let stale = manager
+        .list()?
+        .into_iter()
+        .filter(|route| is_owned_server_route(route, server))
+        .collect::<Vec<_>>();
+    for route in stale {
+        manager.delete(&route)?;
+    }
+    Ok(())
+}
+
+fn is_owned_server_route(route: &Route, server: Ipv4Addr) -> bool {
+    route.destination() == IpAddr::V4(server)
+        && route.prefix() == 32
+        && route.metric() == Some(SERVER_ROUTE_METRIC)
 }
 
 fn reject_full_tunnel(routes: &[Route]) -> io::Result<()> {
@@ -152,7 +173,7 @@ mod tests {
 
     use route_manager::Route;
 
-    use super::{has_full_tunnel, server_route};
+    use super::{has_full_tunnel, is_owned_server_route, server_route};
 
     #[test]
     fn detects_split_default_routes() {
@@ -179,5 +200,14 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
         );
         assert_eq!(route.if_index(), Some(3));
+    }
+
+    #[test]
+    fn crash_repair_only_owns_the_marked_server_route() {
+        let server = Ipv4Addr::new(203, 0, 113, 7);
+        let owned = Route::new(IpAddr::V4(server), 32).with_metric(4_242);
+        let user = Route::new(IpAddr::V4(server), 32).with_metric(100);
+        assert!(is_owned_server_route(&owned, server));
+        assert!(!is_owned_server_route(&user, server));
     }
 }

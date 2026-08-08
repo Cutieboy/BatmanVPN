@@ -513,6 +513,39 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 fn main() {
     let arguments: Vec<String> = std::env::args().collect();
+    if let [_, watchdog, parent_flag, parent, started_flag, started, server_flag, server] =
+        arguments.as_slice()
+    {
+        if watchdog == "--network-watchdog"
+            && parent_flag == "--parent"
+            && started_flag == "--started"
+            && server_flag == "--server"
+        {
+            let result = parent
+                .parse()
+                .map_err(|_| "Неверный PID watchdog".to_owned())
+                .and_then(|parent| {
+                    started
+                        .parse()
+                        .map_err(|_| "Неверное время старта watchdog".to_owned())
+                        .map(|started| (parent, started))
+                })
+                .and_then(|(parent, started)| {
+                    server
+                        .parse()
+                        .map_err(|_| "Неверный адрес сервера watchdog".to_owned())
+                        .map(|server| (parent, started, server))
+                })
+                .and_then(|(parent, started, server)| {
+                    helper_runtime::run_watchdog(parent, started, server)
+                });
+            if let Err(error) = result {
+                eprintln!("MOUSEVPN_ERROR={error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     let helper_path = match arguments.as_slice() {
         [_, helper, config, path] if helper == "--helper" && config == "--config" => Some(path),
         _ => None,

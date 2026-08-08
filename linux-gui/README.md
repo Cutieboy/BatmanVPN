@@ -14,6 +14,17 @@ Desktop client built with Tauri 2 and the existing MouseVPN Rust runtime.
   isolated nftables table;
 - treats temporary Wi-Fi and gateway failures as reconnectable conditions and
   refreshes the server host route without removing TUN, DNS or firewall state;
+- refreshes the physical server route periodically, retries a corrupt handshake
+  within the original timeout and safely applies changed tunnel IP, MTU or DNS
+  parameters during reconnect;
+- rejects global IPv6 instead of dropping it, so dual-stack applications fail
+  over to IPv4 at once rather than stalling on a connect timeout, while
+  link-local and link-scoped multicast IPv6 stay available for neighbour
+  discovery;
+- keeps IPv4 DHCP renewal working while connected, so a lease expiring mid
+  session no longer takes the tunnel down with it;
+- starts a privileged watchdog that removes only MouseVPN's nftables table and
+  marked server route if the tunnel helper is killed before Rust cleanup runs;
 - shows reconnect progress in the GUI and keeps a rotated helper log under
   `$XDG_DATA_HOME/MouseVPN/logs` (normally
   `~/.local/share/MouseVPN/logs`);

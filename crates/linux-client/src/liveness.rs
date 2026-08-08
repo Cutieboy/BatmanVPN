@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Silence after which the session is treated as dead.
 ///
-/// Keepalives go out every 10 s, so 15 s means three missed replies rather than
-/// the six the old 30 s budget allowed. Half a minute of blackhole is very
-/// visible; a reconnect costs one round trip.
-const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Keepalives go out every 10 s, so 20 s means two missed replies. The earlier
+/// 15 s budget tripped on a single late reply and reconnected a link that was
+/// merely slow.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Delay before the first retry, doubling up to [`MAX_RECONNECT_BACKOFF`].
 const MIN_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(16);
@@ -23,6 +23,9 @@ pub(crate) struct Liveness {
     heartbeat: Instant,
     retry: Option<Instant>,
     backoff: Duration,
+    /// Set once the peer is known to be gone, cleared by the next packet from
+    /// it. Without it every repeated loss notification restarts the backoff.
+    lost: bool,
 }
 
 impl Liveness {
@@ -32,6 +35,7 @@ impl Liveness {
             heartbeat: now,
             retry: None,
             backoff: MIN_RECONNECT_BACKOFF,
+            lost: false,
         }
     }
 
@@ -55,6 +59,9 @@ impl Liveness {
 
     pub(crate) fn packet_received(&mut self, now: Instant) {
         self.peer_activity = now;
+        self.retry = None;
+        self.backoff = MIN_RECONNECT_BACKOFF;
+        self.lost = false;
     }
 
     pub(crate) fn reconnect_attempted(&mut self, now: Instant) {
@@ -62,9 +69,16 @@ impl Liveness {
         self.backoff = (self.backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
 
+    /// Reports that the peer is unreachable, which makes the first attempt due
+    /// immediately. Repeated reports before the peer answers again are ignored,
+    /// so a stream of ICMP errors cannot bypass the backoff.
     pub(crate) fn connection_lost(&mut self, now: Instant) {
+        if self.lost {
+            return;
+        }
         self.peer_activity = now.checked_sub(SESSION_TIMEOUT).unwrap_or(now);
         self.retry = None;
+        self.lost = true;
     }
 
     pub(crate) fn reconnected(&mut self, now: Instant) {
@@ -72,6 +86,7 @@ impl Liveness {
         self.heartbeat = now;
         self.retry = None;
         self.backoff = MIN_RECONNECT_BACKOFF;
+        self.lost = false;
     }
 }
 
@@ -91,7 +106,7 @@ mod tests {
         );
         state.keepalive_sent(start + Duration::from_secs(10));
         assert_eq!(
-            state.action(start + Duration::from_secs(15)),
+            state.action(start + Duration::from_secs(20)),
             Action::Reconnect
         );
     }
@@ -144,6 +159,53 @@ mod tests {
             state.reconnect_attempted(start + Duration::from_secs(step * 60));
         }
         state.reconnected(start + Duration::from_secs(600));
+        state.connection_lost(start + Duration::from_secs(601));
+        state.reconnect_attempted(start + Duration::from_secs(601));
+        assert_eq!(
+            state.action(start + Duration::from_secs(603)),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn repeated_loss_notifications_do_not_bypass_backoff() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        state.reconnect_attempted(start);
+        // A second burst of ICMP errors must not make the retry due again.
+        state.connection_lost(start + Duration::from_millis(500));
+        assert_eq!(state.action(start + Duration::from_secs(1)), Action::None);
+        assert_eq!(
+            state.action(start + Duration::from_secs(2)),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn a_packet_from_the_peer_rearms_loss_reporting() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        state.reconnect_attempted(start);
+        state.packet_received(start + Duration::from_secs(1));
+        // The peer went away again: the next loss is due at once, not in 2 s.
+        state.connection_lost(start + Duration::from_secs(2));
+        assert_eq!(
+            state.action(start + Duration::from_secs(2)),
+            Action::Reconnect
+        );
+    }
+
+    #[test]
+    fn a_packet_from_the_peer_resets_the_retry_backoff() {
+        let start = Instant::now();
+        let mut state = Liveness::new(start);
+        state.connection_lost(start);
+        for step in 0..5 {
+            state.reconnect_attempted(start + Duration::from_secs(step * 60));
+        }
+        state.packet_received(start + Duration::from_secs(600));
         state.connection_lost(start + Duration::from_secs(601));
         state.reconnect_attempted(start + Duration::from_secs(601));
         assert_eq!(

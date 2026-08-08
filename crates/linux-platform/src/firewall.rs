@@ -21,9 +21,7 @@ impl FirewallGuard {
                 "invalid TUN interface name",
             ));
         }
-        let rules = format!(
-            "table inet {TABLE_NAME} {{\n  chain output {{\n    type filter hook output priority -50; policy drop;\n    oifname \"lo\" accept\n    oifname \"{tun_name}\" accept\n    ip daddr {server} udp dport {port} accept\n  }}\n}}\n"
-        );
+        let rules = render_rules(server, port, tun_name);
         // A SIGKILL cannot run `Drop`, so only our isolated table may survive
         // an otherwise dead client. Removing it before the atomic recreation
         // makes the next connection self-healing without touching any other
@@ -40,7 +38,35 @@ impl Drop for FirewallGuard {
     }
 }
 
-fn remove_runtime_table() -> io::Result<()> {
+/// Renders the fail-closed output policy.
+///
+/// The tunnel carries IPv4 only, so global IPv6 must not leave the box. It is
+/// rejected rather than dropped: a dropped SYN leaves every dual-stack client
+/// hanging on its connect timeout, which reads as "the VPN is slow". Link-local
+/// and multicast IPv6 stay allowed so neighbour discovery keeps working and the
+/// network manager does not tear the physical link down under us.
+///
+/// IPv4 DHCP renewal is unicast UDP from a normal socket, so the output hook
+/// sees it. Dropping it silently expired the lease on long sessions and killed
+/// the tunnel from underneath.
+fn render_rules(server: Ipv4Addr, port: u16, tun_name: &str) -> String {
+    format!(
+        "table inet {TABLE_NAME} {{\n\
+         \x20 chain output {{\n\
+         \x20   type filter hook output priority -50; policy drop;\n\
+         \x20   oifname \"lo\" accept\n\
+         \x20   oifname \"{tun_name}\" accept\n\
+         \x20   ip daddr {server} udp dport {port} accept\n\
+         \x20   meta nfproto ipv4 udp sport 68 udp dport 67 accept\n\
+         \x20   ip6 daddr fe80::/10 accept\n\
+         \x20   ip6 daddr ff02::/16 accept\n\
+         \x20   meta nfproto ipv6 reject with icmpx type no-route\n\
+         \x20 }}\n\
+         }}\n"
+    )
+}
+
+pub(crate) fn remove_runtime_table() -> io::Result<()> {
     let _status = Command::new("nft")
         .args(["delete", "table", "inet", TABLE_NAME])
         .stdout(Stdio::null())
@@ -82,7 +108,28 @@ fn run_nft_script(rules: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_interface_name;
+    use std::net::Ipv4Addr;
+
+    use super::{render_rules, valid_interface_name};
+
+    #[test]
+    fn rejects_global_ipv6_but_keeps_discovery_and_dhcp() {
+        let rules = render_rules(Ipv4Addr::new(203, 0, 113, 7), 51_820, "mousevpn0");
+        assert!(rules.contains("meta nfproto ipv6 reject with icmpx type no-route"));
+        assert!(rules.contains("ip6 daddr fe80::/10 accept"));
+        assert!(rules.contains("ip6 daddr ff02::/16 accept"));
+        assert!(!rules.contains("ip6 daddr ff00::/8 accept"));
+        assert!(rules.contains("meta nfproto ipv4 udp sport 68 udp dport 67 accept"));
+        // The reject must not shadow loopback or the tunnel itself.
+        let reject = rules.find("nfproto ipv6 reject").expect("reject rule");
+        assert!(rules.find("oifname \"lo\" accept").expect("lo rule") < reject);
+        assert!(
+            rules
+                .find("ip daddr 203.0.113.7 udp dport 51820 accept")
+                .expect("server rule")
+                < reject
+        );
+    }
 
     #[test]
     fn validates_interface_names_before_rendering_rules() {

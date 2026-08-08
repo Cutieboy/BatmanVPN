@@ -1,13 +1,17 @@
 use std::{
     net::SocketAddrV4,
-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        mpsc, Arc, Mutex,
+    },
     thread,
 };
 
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_linux_platform::{
-    ensure_no_competing_full_tunnel, DnsGuard, FirewallGuard, LinuxTun, LinuxTunConfig,
-    ProxyRouteGuard, RouteGuard, DEFAULT_TX_QUEUE_LEN, PROXY_MARK,
+    ensure_no_competing_full_tunnel, repair_stale_network as repair_platform_state, DnsGuard,
+    FirewallGuard, LinuxTun, LinuxTunConfig, ProxyRouteGuard, RouteGuard, DEFAULT_TX_QUEUE_LEN,
+    PROXY_MARK,
 };
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
@@ -32,7 +36,7 @@ enum NetworkGuard {
     Full {
         _firewall: FirewallGuard,
         routes: RouteGuard,
-        _dns: DnsGuard,
+        dns: DnsGuard,
     },
     Proxy {
         _routes: ProxyRouteGuard,
@@ -88,6 +92,9 @@ fn run_mode(
 ) -> Result<(), ClientError> {
     ensure_no_competing_full_tunnel()
         .map_err(|error| context("checking existing VPN routes", &error))?;
+    let server_ip = ipv4_server(config)?;
+    repair_platform_state(server_ip)
+        .map_err(|error| context("repairing stale MouseVPN network state", &error))?;
     let (incoming, plane, parameters) = connect(config)?;
     incoming.set_read_timeout(Some(POLL_INTERVAL))?;
     let mut outgoing = incoming.try_clone()?;
@@ -107,28 +114,19 @@ fn run_mode(
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
     let reconnecting = Arc::new(AtomicBool::new(false));
+    let reconnect_requested = Arc::new(AtomicU64::new(0));
+    let session_generation = Arc::new(AtomicU64::new(1));
     flag::register(SIGINT, Arc::clone(&stopping))?;
     flag::register(SIGTERM, Arc::clone(&stopping))?;
     let mut network = match mode {
-        Mode::FullTunnel => {
-            let server_ip = match config.server.ip() {
-                std::net::IpAddr::V4(address) => address,
-                std::net::IpAddr::V6(_) => {
-                    return Err(ClientError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "IPv6 server endpoints are not supported by the MVP route manager",
-                    )));
-                }
-            };
-            NetworkGuard::Full {
-                _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)
-                    .map_err(|error| context("installing the MouseVPN firewall", &error))?,
-                routes: RouteGuard::install(server_ip, &tun_name)
-                    .map_err(|error| context("installing VPN routes", &error))?,
-                _dns: DnsGuard::install(&tun_name, parameters.dns)
-                    .map_err(|error| context("configuring VPN DNS", &error))?,
-            }
-        }
+        Mode::FullTunnel => NetworkGuard::Full {
+            _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)
+                .map_err(|error| context("installing the MouseVPN firewall", &error))?,
+            routes: RouteGuard::install(server_ip, &tun_name)
+                .map_err(|error| context("installing VPN routes", &error))?,
+            dns: DnsGuard::install(&tun_name, parameters.dns)
+                .map_err(|error| context("configuring VPN DNS", &error))?,
+        },
         Mode::Proxy(listen) => NetworkGuard::Proxy {
             _routes: ProxyRouteGuard::install(&tun_name)?,
             _server: ProxyServerGuard::start(
@@ -144,6 +142,8 @@ fn run_mode(
     let outgoing_sender = Arc::clone(&sender);
     let outgoing_stopping = Arc::clone(&stopping);
     let outgoing_reconnecting = Arc::clone(&reconnecting);
+    let outgoing_requested = Arc::clone(&reconnect_requested);
+    let outgoing_generation = Arc::clone(&session_generation);
     let (worker_sender, worker_receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let result = outgoing::run(
@@ -152,6 +152,8 @@ fn run_mode(
             &mut outgoing,
             &outgoing_stopping,
             &outgoing_reconnecting,
+            &outgoing_requested,
+            &outgoing_generation,
         );
         let _ = worker_sender.send(result);
     });
@@ -165,9 +167,9 @@ fn run_mode(
         }
     }
 
-    let routes = match &mut network {
-        NetworkGuard::Full { routes, .. } => Some(routes),
-        NetworkGuard::Proxy { .. } => None,
+    let (routes, dns) = match &mut network {
+        NetworkGuard::Full { routes, dns, .. } => (Some(routes), Some(dns)),
+        NetworkGuard::Proxy { .. } => (None, None),
     };
     PacketLoop {
         config,
@@ -178,12 +180,35 @@ fn run_mode(
         sender,
         stopping,
         reconnecting,
+        reconnect_requested,
+        session_generation,
         worker: worker_receiver,
         routes,
+        dns,
     }
     .run()
 }
 
+/// Removes crash leftovers for a known server without touching unrelated
+/// routes or firewall tables.
+///
+/// # Errors
+///
+/// Returns an error when the owned network state cannot be removed.
+pub fn repair_stale_network(server: std::net::Ipv4Addr) -> Result<(), ClientError> {
+    repair_platform_state(server).map_err(Into::into)
+}
+
 fn context(operation: &str, error: &std::io::Error) -> std::io::Error {
     std::io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
+fn ipv4_server(config: &ValidatedClientConfig) -> Result<std::net::Ipv4Addr, ClientError> {
+    match config.server.ip() {
+        std::net::IpAddr::V4(address) => Ok(address),
+        std::net::IpAddr::V6(_) => Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IPv6 server endpoints are not supported by the MVP route manager",
+        ))),
+    }
 }
