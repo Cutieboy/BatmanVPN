@@ -8,7 +8,7 @@ use std::{
 };
 
 use mousevpn_config::ValidatedClientConfig;
-use mousevpn_data_plane::{Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
+use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::{Datagram, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
 use wintun::Session;
@@ -31,7 +31,7 @@ pub(crate) fn run(
     outgoing: UdpTransport,
     plane: TunnelDataPlane,
     parameters: SessionParameters,
-    session: Arc<Session>,
+    session: &Arc<Session>,
     stopping: &Arc<AtomicBool>,
     network: &NetworkGuard,
 ) -> Result<(), ClientError> {
@@ -40,8 +40,8 @@ pub(crate) fn run(
     let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    spawn_outgoing(
-        Arc::clone(&session),
+    let outgoing_worker = spawn_outgoing(
+        Arc::clone(session),
         outgoing,
         Arc::clone(&sender),
         Arc::clone(stopping),
@@ -59,20 +59,26 @@ pub(crate) fn run(
     })?;
 
     eprintln!("MOUSEVPN_STATE=connected");
-    IncomingLoop {
+    let result = IncomingLoop {
         config,
         transport: incoming,
         parameters,
         receiver,
         sender,
-        session,
+        session: Arc::clone(session),
         stopping,
         reconnecting,
         reconnect_requested,
         worker: result_rx,
         network,
+        wintun_send_drops: 0,
     }
-    .run()
+    .run();
+    let _ = session.shutdown();
+    if outgoing_worker.join().is_err() {
+        eprintln!("MOUSEVPN_RUNTIME_WARNING=Wintun packet worker panicked");
+    }
+    result
 }
 
 struct IncomingLoop<'a> {
@@ -87,6 +93,7 @@ struct IncomingLoop<'a> {
     reconnect_requested: Arc<AtomicBool>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a NetworkGuard,
+    wintun_send_drops: u64,
 }
 
 impl IncomingLoop<'_> {
@@ -105,7 +112,13 @@ impl IncomingLoop<'_> {
                     match decoded {
                         Some(Ok(Decoded::Ip(packet))) => {
                             liveness.packet_received(Instant::now());
-                            send_to_windows(&self.session, packet)?;
+                            if send_to_windows(&self.session, packet)? == PacketDisposition::Dropped
+                            {
+                                note_packet_drop(
+                                    &mut self.wintun_send_drops,
+                                    "Wintun send ring is temporarily full",
+                                );
+                            }
                         }
                         Some(Ok(Decoded::Keepalive)) => {
                             liveness.packet_received(Instant::now());
@@ -246,9 +259,10 @@ fn spawn_outgoing(
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
     result_tx: mpsc::SyncSender<Result<(), ClientError>>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut encrypted = Vec::new();
+        let mut dropped_packets = 0_u64;
         let result = (|| {
             while !stopping.load(Ordering::Acquire) {
                 let packet = session.receive_blocking().map_err(|error| {
@@ -260,11 +274,28 @@ fn spawn_outgoing(
                     continue;
                 }
                 let mut locked = sender.lock().map_err(|_| poisoned_sender())?;
-                locked.encode_ip_into(packet.bytes(), &mut encrypted)?;
+                match locked.encode_ip_into(packet.bytes(), &mut encrypted) {
+                    Ok(()) => {}
+                    Err(DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_)) => {
+                        note_packet_drop(
+                            &mut dropped_packets,
+                            "Windows supplied an invalid or oversized IPv4 packet",
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                drop(locked);
                 match transport.send(&encrypted) {
                     Ok(()) => {}
                     Err(error) if is_peer_unavailable(&error) => {
                         reconnect_requested.store(true, Ordering::Release);
+                    }
+                    Err(error) if is_transient_io(&error) => {
+                        note_packet_drop(
+                            &mut dropped_packets,
+                            "UDP send queue is temporarily unavailable",
+                        );
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -272,18 +303,33 @@ fn spawn_outgoing(
             Ok(())
         })();
         let _ = result_tx.send(result);
-    });
+    })
 }
 
-fn send_to_windows(session: &Arc<Session>, packet: &[u8]) -> Result<(), ClientError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketDisposition {
+    Sent,
+    Dropped,
+}
+
+fn send_to_windows(
+    session: &Arc<Session>,
+    packet: &[u8],
+) -> Result<PacketDisposition, ClientError> {
     let length = u16::try_from(packet.len())
         .map_err(|_| ClientError::Platform("received IP packet is too large".to_owned()))?;
-    let mut destination = session
-        .allocate_send_packet(length)
-        .map_err(|error| ClientError::Platform(format!("Wintun send queue failed: {error}")))?;
+    let mut destination = match session.allocate_send_packet(length) {
+        Ok(packet) => packet,
+        Err(error) if is_wintun_send_queue_full(&error) => return Ok(PacketDisposition::Dropped),
+        Err(error) => {
+            return Err(ClientError::Platform(format!(
+                "Wintun send queue failed: {error}"
+            )));
+        }
+    };
     destination.bytes_mut().copy_from_slice(packet);
     session.send_packet(destination);
-    Ok(())
+    Ok(PacketDisposition::Sent)
 }
 
 fn is_timeout(error: &std::io::Error) -> bool {
@@ -304,13 +350,37 @@ fn is_peer_unavailable(error: &std::io::Error) -> bool {
     )
 }
 
+fn is_transient_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn is_wintun_send_queue_full(error: &wintun::Error) -> bool {
+    const ERROR_BUFFER_OVERFLOW: i32 = 111;
+    matches!(
+        error,
+        wintun::Error::Io(error) if error.raw_os_error() == Some(ERROR_BUFFER_OVERFLOW)
+    )
+}
+
+fn note_packet_drop(counter: &mut u64, reason: &str) {
+    *counter = counter.saturating_add(1);
+    if counter.is_power_of_two() {
+        eprintln!("MOUSEVPN_PACKET_WARNING={reason}; dropped packets={counter}");
+    }
+}
+
 fn poisoned_sender() -> ClientError {
     ClientError::Platform("packet sender lock was poisoned".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PeriodicWorker;
+    use super::{is_wintun_send_queue_full, note_packet_drop, PeriodicWorker};
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -329,5 +399,20 @@ mod tests {
         .expect("policy worker");
         drop(worker);
         assert!(!ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn recognizes_a_full_wintun_send_ring_as_transient() {
+        let full = wintun::Error::Io(std::io::Error::from_raw_os_error(111));
+        let other = wintun::Error::Io(std::io::Error::from_raw_os_error(6));
+        assert!(is_wintun_send_queue_full(&full));
+        assert!(!is_wintun_send_queue_full(&other));
+    }
+
+    #[test]
+    fn packet_drop_counter_saturates() {
+        let mut counter = u64::MAX;
+        note_packet_drop(&mut counter, "test");
+        assert_eq!(counter, u64::MAX);
     }
 }

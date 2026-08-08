@@ -9,15 +9,25 @@ protocol implementation.
 - performs the MouseVPN UDP/Noise handshake;
 - creates a layer-3 adapter through `wintun.dll`;
 - configures an IPv4 full tunnel and tunnel DNS with PowerShell;
+- gives the tunnel interface metric `1` so its DNS path wins over lower-priority
+  virtual adapters without modifying those third-party adapters;
+- marks the dedicated tunnel as a Public network for Store/UWP network
+  isolation compatibility;
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving
   the kill switch active;
+- preserves a fail-closed network policy and restarts the complete Wintun
+  runtime after an unexpected fatal packet-path error;
 - keeps running in the Windows notification area when its main window is
   closed, with show, connect/disconnect and quit actions;
 - starts the tunnel helper and Windows networking commands without visible
   console windows;
+- keeps a rotated helper diagnostic log under
+  `%LOCALAPPDATA%\\MouseVPN\\logs` without profile secrets;
+- reports known third-party NDIS bindings from WireSock/WinpkFilter without
+  modifying them;
 - restores firewall rules, routes, the tunnel address and DNS on disconnect;
 - provides a non-Windows diagnostic stub so the workspace remains testable on
   Linux and the executable UI can be smoke-tested with Wine.

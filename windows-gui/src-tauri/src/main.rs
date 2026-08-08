@@ -19,6 +19,7 @@ use tauri::{Manager, State};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod helper_log;
 mod profiles;
 mod tray;
 
@@ -138,7 +139,8 @@ pub(crate) fn connect_profile_inner(
     *lock(&state.snapshot)? = snapshot.clone();
     *lock(&state.last_profile_id)? = Some(id);
     let shared_snapshot = Arc::clone(&state.snapshot);
-    thread::spawn(move || read_helper_status(stderr, &shared_snapshot));
+    let log = helper_log::HelperLog::open().ok();
+    thread::spawn(move || read_helper_status(stderr, &shared_snapshot, log));
     *child_slot = Some(child);
     Ok(snapshot)
 }
@@ -243,8 +245,19 @@ pub(crate) fn shutdown_for_exit(state: &AppState) {
     let _ = mousevpn_windows_client::repair_network();
 }
 
-fn read_helper_status(stderr: impl std::io::Read, snapshot: &Arc<Mutex<ConnectionSnapshot>>) {
+fn read_helper_status(
+    stderr: impl std::io::Read,
+    snapshot: &Arc<Mutex<ConnectionSnapshot>>,
+    mut log: Option<helper_log::HelperLog>,
+) {
+    let log_path = log.as_ref().map(|log| log.path().display().to_string());
+    if let Some(log) = log.as_mut() {
+        log.write("MOUSEVPN_STATE=helper_started");
+    }
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        if let Some(log) = log.as_mut() {
+            log.write(&line);
+        }
         let Ok(mut current) = snapshot.lock() else {
             return;
         };
@@ -257,10 +270,25 @@ fn read_helper_status(stderr: impl std::io::Read, snapshot: &Arc<Mutex<Connectio
         } else if line == "MOUSEVPN_STATE=reconnected" {
             "connected".clone_into(&mut current.state);
             "Соединение восстановлено".clone_into(&mut current.message);
+        } else if matches!(
+            line.as_str(),
+            "MOUSEVPN_STATE=restarting" | "MOUSEVPN_STATE=failed_closed"
+        ) {
+            "connecting".clone_into(&mut current.state);
+            "Перезапускаем сетевой туннель без утечки трафика…".clone_into(&mut current.message);
+        } else if let Some(message) = line.strip_prefix("MOUSEVPN_RUNTIME_WARNING=") {
+            "connecting".clone_into(&mut current.state);
+            current.message = format!("Восстанавливаем VPN: {message}");
         } else if let Some(message) = line.strip_prefix("MOUSEVPN_ERROR=") {
             "error".clone_into(&mut current.state);
-            message.clone_into(&mut current.message);
+            current.message = log_path.as_ref().map_or_else(
+                || message.to_owned(),
+                |path| format!("{message}\nЖурнал: {path}"),
+            );
         }
+    }
+    if let Some(log) = log.as_mut() {
+        log.write("MOUSEVPN_STATE=helper_stderr_closed");
     }
 }
 
@@ -274,8 +302,34 @@ fn run_helper(path: &Path) -> Result<(), String> {
         let _ = std::io::stdin().read_line(&mut line);
         stdin_stopping.store(true, Ordering::Release);
     });
+    let mut backoff = std::time::Duration::from_secs(1);
     eprintln!("MOUSEVPN_STATE=connecting");
-    mousevpn_windows_client::run_with_stop(&config, &stopping).map_err(display_error)
+    loop {
+        match mousevpn_windows_client::run_with_stop(&config, &stopping) {
+            Ok(()) => return Ok(()),
+            Err(_) if stopping.load(Ordering::Acquire) => return Ok(()),
+            Err(error) => {
+                eprintln!("MOUSEVPN_RUNTIME_WARNING={error}");
+                eprintln!("MOUSEVPN_STATE=restarting");
+                if wait_for_stop(&stopping, backoff) {
+                    return Ok(());
+                }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(16));
+            }
+        }
+    }
+}
+
+fn wait_for_stop(stopping: &AtomicBool, duration: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    while !stopping.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+    }
+    true
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {

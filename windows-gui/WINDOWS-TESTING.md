@@ -33,7 +33,8 @@ Run the automated, non-destructive checks while connected:
 ```
 
 The script checks the Wintun adapter, both `/1` routes, firewall rules, tunnel
-DNS and direct IPv6 reachability.
+DNS, interface priority, three consecutive Microsoft Store CDN resolutions,
+network category, known conflicting NDIS bindings and direct IPv6 reachability.
 
 ## 3. Reconnect
 
@@ -64,3 +65,7 @@ Send the console output from `test-windows.ps1`, the Windows version from
 `winver`, and whether the connection used Wi-Fi, Ethernet or both. Do not send
 an `MV1` profile, password, private key, or the recovery journal from
 `%LOCALAPPDATA%\MouseVPN\runtime`.
+
+If the helper exits unexpectedly, also send
+`%LOCALAPPDATA%\MouseVPN\logs\helper.log`. It contains state, warning and error
+messages but does not record profile contents or keys.

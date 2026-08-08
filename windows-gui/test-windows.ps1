@@ -62,12 +62,38 @@ try {
     Assert-Condition ($report.routeCount -eq 2) "Expected two MouseVPN /1 routes."
     Assert-Condition ($report.firewallRuleCount -ge 2) "Kill-switch firewall rules are missing."
     Assert-Condition ($report.dnsServers.Count -ge 1) "Tunnel DNS is not configured."
+    Assert-Condition ($report.interfaceMetric -eq 1) "MouseVPN interface metric is not 1."
     Assert-Condition $report.stateJournal "Crash-recovery journal is missing."
+    if ($report.networkCategory -ne "Public") {
+        Write-Warning "MouseVPN network category is '$($report.networkCategory)', not Public; Store/UWP apps may fail network isolation checks."
+    }
+    if ($report.incompatibleBindings.Count -gt 0) {
+        Write-Warning "Known third-party NDIS bindings are active on MouseVPN: $($report.incompatibleBindings -join ', ')"
+    }
+    $vgateDns = @($report.otherDnsAdapters | Where-Object { $_.interfaceAlias -eq "vgate0" })
+    if ($vgateDns.Count -gt 0) {
+        Write-Warning "O+Connect vgate0 also advertises DNS. MouseVPN leaves this third-party adapter unchanged."
+    }
 
     Clear-DnsClientCache
     $dns = Resolve-DnsName -Name "example.com" -DnsOnly -ErrorAction Stop
     Assert-Condition ($dns.Count -gt 0) "DNS lookup through the tunnel failed."
     Write-Host "DNS lookup succeeded."
+
+    $storeDnsSuccess = 0
+    1..3 | ForEach-Object {
+        $attempt = $_
+        try {
+            $answer = Resolve-DnsName -Name "cdn.storeedgefd.dsx.mp.microsoft.com" `
+                -DnsOnly -ErrorAction Stop
+            if ($answer.Count -gt 0) { $storeDnsSuccess++ }
+        } catch {
+            Write-Warning "Microsoft Store CDN DNS attempt $attempt failed: $($_.Exception.Message)"
+        }
+    }
+    Assert-Condition ($storeDnsSuccess -eq 3) `
+        "Microsoft Store CDN DNS did not succeed on all three attempts."
+    Write-Host "Microsoft Store CDN DNS succeeded 3/3 times."
 
     $ipv6Escaped = Test-NetConnection -ComputerName "2606:4700:4700::1111" -Port 443 `
         -InformationLevel Quiet -WarningAction SilentlyContinue

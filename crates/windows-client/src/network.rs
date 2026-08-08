@@ -96,8 +96,12 @@ impl NetworkGuard {
              $default=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {{$_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -ne $vpn.ifIndex -and $up -contains $_.InterfaceIndex}} | Sort-Object RouteMetric | Select-Object -First 1; \
              if (-not $default) {{ throw 'No active physical IPv4 default route found' }}; \
              Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false; \
-             Set-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 5; \
+             Set-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1; \
              New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} | Out-Null; \
+             try {{ \
+               $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
+               if ($profile -and $profile.NetworkCategory -ne 'Public') {{Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction Stop}} \
+             }} catch {{Write-Warning ('Could not mark MouseVPN as a Public network: '+$_.Exception.Message)}}; \
              Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}'; \
              New-NetRoute -DestinationPrefix '{server_ip}/32' -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null; \
              New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $vpn.ifIndex -NextHop '0.0.0.0' -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null; \
@@ -153,6 +157,10 @@ fn refresh_script(server_ip: Ipv4Addr) -> String {
     format!(
             "$ErrorActionPreference='Stop'; \
              $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
+             try {{ \
+               $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
+               if ($profile -and $profile.NetworkCategory -ne 'Public') {{Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction Stop}} \
+             }} catch {{Write-Warning ('Could not mark MouseVPN as a Public network: '+$_.Exception.Message)}}; \
              $blocked=@('{prefixes}'); \
              $physical=Get-NetAdapter | Where-Object {{$_.Name -ne '{ADAPTER_NAME}' -and $_.InterfaceDescription -notmatch 'Loopback'}}; \
              foreach ($adapter in $physical) {{ \
@@ -217,12 +225,19 @@ pub(crate) fn repair() -> Result<(), ClientError> {
 pub(crate) fn report() -> Result<String, ClientError> {
     let script = format!(
         "$vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
-         $routes=@(); $dns=@(); \
+         $routes=@(); $dns=@(); $category=$null; $metric=$null; $bindings=@(); $otherDns=@(); \
          if ($vpn) {{ \
            $routes=@(Get-NetRoute -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue | Where-Object {{$_.DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1'}} | Select-Object DestinationPrefix,InterfaceIndex,RouteMetric); \
-           $dns=@((Get-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses) \
+           $dns=@((Get-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
+           $metric=(Get-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric; \
+           $category=(Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue).NetworkCategory; \
+           $bindings=@(Get-NetAdapterBinding -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue | Where-Object {{$_.Enabled -and $_.ComponentID -in 'nt_ndisrd','nt_ndiswgc'}} | Select-Object -ExpandProperty ComponentID); \
+           $otherDns=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{$_.ifIndex -ne $vpn.ifIndex -and $_.Status -eq 'Up'}} | ForEach-Object {{ \
+             $adapter=$_; $ip=Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue; $servers=@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
+             if ($servers.Count -gt 0) {{[pscustomobject]@{{interfaceAlias=$adapter.Name; interfaceMetric=$ip.InterfaceMetric; dnsServers=$servers}}}} \
+           }}) \
          }}; \
-         [ordered]@{{ adapterUp=[bool]($vpn -and $vpn.Status -eq 'Up'); routeCount=$routes.Count; firewallRuleCount=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -Enabled True -ErrorAction SilentlyContinue).Count; dnsServers=$dns; stateJournal=Test-Path '{}'; ipv6DefaultRoutes=@(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue).Count }} | ConvertTo-Json -Compress",
+         [ordered]@{{ adapterUp=[bool]($vpn -and $vpn.Status -eq 'Up'); routeCount=$routes.Count; firewallRuleCount=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -Enabled True -ErrorAction SilentlyContinue).Count; dnsServers=$dns; interfaceMetric=$metric; networkCategory=$category; incompatibleBindings=$bindings; otherDnsAdapters=$otherDns; stateJournal=Test-Path '{}'; ipv6DefaultRoutes=@(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue).Count }} | ConvertTo-Json -Depth 4 -Compress",
         powershell_path(&state_path()?)
     );
     run_powershell_output(&script, "collect the Windows network report")
