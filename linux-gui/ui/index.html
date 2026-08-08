@@ -26,6 +26,13 @@
           <span>+</span>
           Добавить конфигурацию
         </button>
+        <button id="appExclusions" class="app-exclusions-button hidden" type="button">
+          <span>⊘</span>
+          <span class="button-copy">
+            <strong>Раздельное туннелирование</strong>
+            <small id="appExclusionsCount">Все приложения через VPN</small>
+          </span>
+        </button>
 
         <footer class="sidebar-footer">
           <span class="security-mark">✓</span>
@@ -123,6 +130,36 @@
           <button id="cancelDelete" class="secondary-button" type="button">Отмена</button>
           <button id="confirmDelete" class="danger-button" type="button">Удалить</button>
         </div>
+      </div>
+    </div>
+
+    <div id="appExclusionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="appExclusionsModalTitle">
+      <div class="modal-card exclusions-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">РАЗДЕЛЬНОЕ ТУННЕЛИРОВАНИЕ</span>
+            <h2 id="appExclusionsModalTitle">Чёрный и белый список</h2>
+          </div>
+          <button id="closeAppExclusions" type="button" class="close-button" aria-label="Закрыть">×</button>
+        </div>
+        <div class="routing-modes" role="radiogroup" aria-label="Режим туннелирования">
+          <label class="routing-mode">
+            <input id="routingExclude" type="radio" name="routingMode" value="exclude" />
+            <span><strong>Исключить из VPN</strong><small>Выбранные идут напрямую</small></span>
+          </label>
+          <label class="routing-mode">
+            <input id="routingInclude" type="radio" name="routingMode" value="include" />
+            <span><strong>Только через VPN</strong><small>Лишь выбранные идут в туннель</small></span>
+          </label>
+        </div>
+        <p id="appRoutingHint" class="modal-description"></p>
+        <div class="app-routing-tools">
+          <input id="appRoutingSearch" type="search" placeholder="Поиск по названию или пути…" aria-label="Поиск приложений" />
+          <button id="clearRoutedApps" class="secondary-button compact-button" type="button">Снять все</button>
+        </div>
+        <div id="appExclusionsList" class="exclusions-list"></div>
+        <p id="appExclusionsError" class="form-error hidden"></p>
+        <button id="addAppExclusion" class="primary-button" type="button">+  Выбрать .exe</button>
       </div>
     </div>
 

@@ -14,6 +14,8 @@ protocol implementation.
 - marks the dedicated tunnel as a Public network for Store/UWP network
   isolation compatibility;
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
+- supports application denylist and allowlist routing, with searchable saved
+  executable paths, through a small WFP bind/connect redirection driver;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving
@@ -34,16 +36,17 @@ protocol implementation.
 
 The Windows networking backend is still an early MVP. Existing adapters are
 protected when the tunnel starts; a background policy worker rechecks every 30
-seconds and reconnects refresh the physical server route immediately. A custom
-Windows Filtering Platform driver would be required to eliminate the remaining
-new-adapter hot-plug race completely. Do not treat the client as leak-safe until
-the real Windows test matrix in `WINDOWS-TESTING.md` passes.
+seconds and reconnects refresh the physical server route and WFP policy.
+Application routing requires a properly signed `MouseVpnSplitTunnel.sys`; see
+`../windows-driver/README.md`. Do not treat the client as leak-safe until the
+real Windows test matrix in `WINDOWS-TESTING.md` passes.
 
 ## Development requirements
 
 - Windows 10 or 11 x64;
 - Rust 1.85 or newer with the MSVC target;
 - Visual Studio Build Tools with the Desktop C++ workload;
+- Windows SDK/WDK and a release-signing setup for the split-tunnel driver;
 - WebView2 Runtime;
 - the official signed x64 Wintun library is embedded into the application;
 - an Administrator terminal for tunnel tests.

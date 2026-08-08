@@ -19,6 +19,7 @@ use tauri::{Manager, State};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod app_exclusions;
 mod helper_log;
 mod profiles;
 mod tray;
@@ -92,6 +93,38 @@ fn delete_profile(id: String, state: State<'_, AppState>) -> Result<(), String> 
         return Err("Сначала отключите активный профиль".to_owned());
     }
     profiles::remove(&id)
+}
+
+#[tauri::command]
+fn get_app_routing() -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::get()
+}
+
+#[tauri::command]
+fn choose_executable() -> Result<Option<String>, String> {
+    app_exclusions::choose_executable()
+}
+
+#[tauri::command]
+fn add_routed_app(path: String) -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::add(path)
+}
+
+#[tauri::command]
+fn remove_routed_app(path: String) -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::remove(path)
+}
+
+#[tauri::command]
+fn set_app_routing_mode(
+    mode: mousevpn_windows_client::AppRoutingMode,
+) -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::set_mode(mode)
+}
+
+#[tauri::command]
+fn clear_routed_apps() -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::clear()
 }
 
 #[tauri::command]
@@ -295,6 +328,8 @@ fn read_helper_status(
 fn run_helper(path: &Path) -> Result<(), String> {
     let config: ClientConfig = load_toml(path).map_err(display_error)?;
     let config = config.validate().map_err(display_error)?;
+    let (mode, apps) = app_exclusions::policy()?;
+    let app_routing = mousevpn_windows_client::AppRoutingPolicy { mode, apps };
     let stopping = Arc::new(AtomicBool::new(false));
     let stdin_stopping = Arc::clone(&stopping);
     thread::spawn(move || {
@@ -305,7 +340,7 @@ fn run_helper(path: &Path) -> Result<(), String> {
     let mut backoff = std::time::Duration::from_secs(1);
     eprintln!("MOUSEVPN_STATE=connecting");
     loop {
-        match mousevpn_windows_client::run_with_stop(&config, &stopping) {
+        match mousevpn_windows_client::run_with_stop(&config, &stopping, &app_routing) {
             Ok(()) => return Ok(()),
             Err(_) if stopping.load(Ordering::Acquire) => return Ok(()),
             Err(error) => {
@@ -363,6 +398,12 @@ fn run_gui() {
             list_profiles,
             import_profile,
             delete_profile,
+            get_app_routing,
+            choose_executable,
+            add_routed_app,
+            remove_routed_app,
+            set_app_routing_mode,
+            clear_routed_apps,
             connect_profile,
             disconnect,
             connection_status,

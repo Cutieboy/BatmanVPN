@@ -66,7 +66,7 @@ class MouseVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(prepared.getString("dns"))
                 .setBlocking(true)
-            val bypassing = excludeApps(builder)
+            val appPolicy = applyAppPolicy(builder)
             descriptor = builder.establish()
             requireNotNull(descriptor) { "Android не создал VPN-интерфейс" }
             val fd = descriptor.detachFd()
@@ -75,7 +75,12 @@ class MouseVpnService : VpnService() {
             connectedSinceElapsedRealtime = SystemClock.elapsedRealtime()
             val summary = buildString {
                 append("Подключено: ${profile.endpoint}")
-                if (bypassing > 0) append(" (в обход: $bypassing)")
+                if (appPolicy.second > 0) {
+                    append(
+                        if (appPolicy.first == AppRoutingMode.EXCLUDE) " (в обход: ${appPolicy.second})"
+                        else " (через VPN: ${appPolicy.second})",
+                    )
+                }
                 // Only worth showing when it differs from what the server asked
                 // for, because then it is the answer to "why is this slow here".
                 if (mtu != serverMtu) append(" (MTU $mtu)")
@@ -135,7 +140,7 @@ class MouseVpnService : VpnService() {
     }
 
     /**
-     * Routes the chosen apps around the tunnel and returns how many were applied.
+     * Applies the selected allowlist or denylist and returns how many entries worked.
      *
      * A package that has since been uninstalled must never prevent the tunnel
      * from coming up, so each entry is applied on its own and a failure only
@@ -146,13 +151,26 @@ class MouseVpnService : VpnService() {
      * and silently discarding a choice the user made is worse than carrying an
      * entry that costs one failed call per connection.
      */
-    private fun excludeApps(builder: Builder): Int {
+    private fun applyAppPolicy(builder: Builder): Pair<AppRoutingMode, Int> {
+        val policy = ExcludedApps(this).policy()
         var applied = 0
-        ExcludedApps(this).packages().forEach { packageName ->
-            runCatching { builder.addDisallowedApplication(packageName) }
+        policy.packages.forEach { packageName ->
+            runCatching {
+                if (policy.mode == AppRoutingMode.EXCLUDE) {
+                    builder.addDisallowedApplication(packageName)
+                } else {
+                    builder.addAllowedApplication(packageName)
+                }
+            }
                 .onSuccess { applied++ }
         }
-        return applied
+        // Calling addAllowedApplication activates Android's allowlist. With an
+        // empty or temporarily unavailable selection, adding our protected own
+        // process produces the intended "no apps through VPN" behavior.
+        if (policy.mode == AppRoutingMode.INCLUDE && applied == 0) {
+            builder.addAllowedApplication(packageName)
+        }
+        return policy.mode to applied
     }
 
     private fun monitor(currentHandle: Long) {

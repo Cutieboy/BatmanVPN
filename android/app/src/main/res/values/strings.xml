@@ -42,17 +42,29 @@
     <string name="profile_open_error">Не удалось открыть профили: %1$s</string>
     <string name="unknown_error">Неизвестная ошибка</string>
 
-    <string name="exclusions_open">Приложения в обход VPN</string>
-    <string name="exclusions_title">Приложения в обход VPN</string>
+    <string name="exclusions_open">Маршрутизация приложений</string>
+    <string name="exclusions_title">Приложения и VPN</string>
     <string name="exclusions_hint">Отмеченные приложения будут ходить в интернет напрямую, минуя туннель. Изменения применятся при следующем подключении.</string>
+    <string name="inclusions_hint">Только отмеченные приложения пойдут через VPN. Все остальные будут работать напрямую. Изменения применятся при следующем подключении.</string>
+    <string name="mode_exclude">Исключить из VPN</string>
+    <string name="mode_include">Только через VPN</string>
+    <string name="apps_search_hint">Поиск приложений…</string>
+    <string name="show_selected_only">Показать только отмеченные</string>
     <string name="exclusions_save">Сохранить</string>
     <string name="exclusions_clear">Снять все отметки</string>
     <string name="exclusions_icon_description">Значок приложения</string>
     <string name="exclusions_saved_empty">Весь трафик идёт через VPN</string>
+    <string name="inclusions_saved_empty">Ни одно приложение не будет направлено через VPN</string>
     <plurals name="exclusions_saved">
         <item quantity="one">%d приложение пойдёт напрямую</item>
         <item quantity="few">%d приложения пойдут напрямую</item>
         <item quantity="many">%d приложений пойдут напрямую</item>
         <item quantity="other">%d приложения пойдут напрямую</item>
+    </plurals>
+    <plurals name="inclusions_saved">
+        <item quantity="one">Только %d приложение пойдёт через VPN</item>
+        <item quantity="few">Только %d приложения пойдут через VPN</item>
+        <item quantity="many">Только %d приложений пойдут через VPN</item>
+        <item quantity="other">Только %d приложения пойдут через VPN</item>
     </plurals>
 </resources>

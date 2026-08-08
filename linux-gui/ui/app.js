@@ -31,13 +31,29 @@ const elements = {
   deleteMessage: document.querySelector("#deleteMessage"),
   cancelDelete: document.querySelector("#cancelDelete"),
   confirmDelete: document.querySelector("#confirmDelete"),
+  appExclusions: document.querySelector("#appExclusions"),
+  appExclusionsCount: document.querySelector("#appExclusionsCount"),
+  appExclusionsModal: document.querySelector("#appExclusionsModal"),
+  appExclusionsList: document.querySelector("#appExclusionsList"),
+  appExclusionsError: document.querySelector("#appExclusionsError"),
+  addAppExclusion: document.querySelector("#addAppExclusion"),
+  closeAppExclusions: document.querySelector("#closeAppExclusions"),
+  routingExclude: document.querySelector("#routingExclude"),
+  routingInclude: document.querySelector("#routingInclude"),
+  appRoutingHint: document.querySelector("#appRoutingHint"),
+  appRoutingSearch: document.querySelector("#appRoutingSearch"),
+  clearRoutedApps: document.querySelector("#clearRoutedApps"),
 };
 
 let profiles = [];
+let appRouting = { mode: "exclude", apps: [] };
 let selectedId = localStorage.getItem("mousevpn.selectedProfile");
 let pendingDeleteId = null;
 let connection = { state: "disconnected", message: "VPN выключен", profileId: null };
 let connectedAt = null;
+const isWindows = navigator.userAgent.includes("Windows");
+
+if (isWindows) elements.appExclusions.classList.remove("hidden");
 
 function escapeHtml(value) {
   return String(value)
@@ -124,6 +140,40 @@ function renderConnection(next) {
     elements.time.textContent = "—";
   }
   renderActiveProfile();
+}
+
+function renderAppExclusions() {
+  const count = appRouting.apps.length;
+  const includeMode = appRouting.mode === "include";
+  const query = elements.appRoutingSearch.value.trim().toLocaleLowerCase("ru");
+  const visibleApps = appRouting.apps.filter((app) =>
+    !query || `${app.name}\n${app.path}`.toLocaleLowerCase("ru").includes(query));
+  elements.routingExclude.checked = !includeMode;
+  elements.routingInclude.checked = includeMode;
+  elements.appRoutingHint.textContent = includeMode
+    ? "Только выбранные приложения используют VPN. Остальные подключаются напрямую. Изменения применятся при следующем подключении."
+    : "Выбранные приложения обходят VPN. Все остальные остаются в защищённом туннеле. Изменения применятся при следующем подключении.";
+  elements.appExclusionsCount.textContent = count
+    ? `${includeMode ? "Через VPN" : "В обход"}: ${count}`
+    : (includeMode ? "Никто не использует VPN" : "Все приложения через VPN");
+  elements.clearRoutedApps.disabled = count === 0;
+  elements.appExclusionsList.innerHTML = visibleApps.length
+    ? visibleApps.map((app) => `
+      <div class="exclusion-row ${app.available ? "" : "unavailable"}">
+        <span class="exclusion-icon">◇</span>
+        <span class="exclusion-copy">
+          <strong>${escapeHtml(app.name)}${app.available ? "" : " — файл не найден"}</strong>
+          <small title="${escapeHtml(app.path)}">${escapeHtml(app.path)}</small>
+        </span>
+        <button class="remove-exclusion" type="button" data-exclusion-path="${escapeHtml(app.path)}" aria-label="Удалить исключение">×</button>
+      </div>`).join("")
+    : `<div class="exclusions-empty">${query ? "По вашему запросу ничего не найдено" : includeMode ? "Ни одно приложение не выбрано для VPN" : "Нет приложений в обход VPN"}</div>`;
+}
+
+async function refreshAppExclusions() {
+  if (!isWindows) return;
+  appRouting = await invoke("get_app_routing");
+  renderAppExclusions();
 }
 
 async function refreshProfiles(preferId = null) {
@@ -219,6 +269,75 @@ elements.confirmDelete.addEventListener("click", async () => {
   }
 });
 
+elements.appExclusions.addEventListener("click", async () => {
+  elements.appExclusionsError.classList.add("hidden");
+  elements.appExclusionsModal.classList.remove("hidden");
+  try {
+    await refreshAppExclusions();
+  } catch (error) {
+    elements.appExclusionsError.textContent = String(error);
+    elements.appExclusionsError.classList.remove("hidden");
+  }
+});
+elements.closeAppExclusions.addEventListener("click", () => elements.appExclusionsModal.classList.add("hidden"));
+elements.addAppExclusion.addEventListener("click", async () => {
+  elements.addAppExclusion.disabled = true;
+  elements.appExclusionsError.classList.add("hidden");
+  try {
+    const path = await invoke("choose_executable");
+    if (path) {
+      appRouting = await invoke("add_routed_app", { path });
+      renderAppExclusions();
+    }
+  } catch (error) {
+    elements.appExclusionsError.textContent = String(error);
+    elements.appExclusionsError.classList.remove("hidden");
+  } finally {
+    elements.addAppExclusion.disabled = false;
+  }
+});
+elements.appExclusionsList.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-exclusion-path]");
+  if (!button) return;
+  button.disabled = true;
+  try {
+    appRouting = await invoke("remove_routed_app", { path: button.dataset.exclusionPath });
+    renderAppExclusions();
+  } catch (error) {
+    elements.appExclusionsError.textContent = String(error);
+    elements.appExclusionsError.classList.remove("hidden");
+    button.disabled = false;
+  }
+});
+
+elements.appRoutingSearch.addEventListener("input", renderAppExclusions);
+document.querySelectorAll('input[name="routingMode"]').forEach((radio) => {
+  radio.addEventListener("change", async () => {
+    if (!radio.checked) return;
+    elements.appExclusionsError.classList.add("hidden");
+    try {
+      appRouting = await invoke("set_app_routing_mode", { mode: radio.value });
+      renderAppExclusions();
+    } catch (error) {
+      elements.appExclusionsError.textContent = String(error);
+      elements.appExclusionsError.classList.remove("hidden");
+      renderAppExclusions();
+    }
+  });
+});
+elements.clearRoutedApps.addEventListener("click", async () => {
+  elements.clearRoutedApps.disabled = true;
+  elements.appExclusionsError.classList.add("hidden");
+  try {
+    appRouting = await invoke("clear_routed_apps");
+    renderAppExclusions();
+  } catch (error) {
+    elements.appExclusionsError.textContent = String(error);
+    elements.appExclusionsError.classList.remove("hidden");
+    elements.clearRoutedApps.disabled = false;
+  }
+});
+
 elements.power.addEventListener("click", async () => {
   try {
     const next = connection.state === "connected"
@@ -234,6 +353,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!elements.profileModal.classList.contains("hidden")) closeProfileModal();
   if (!elements.deleteModal.classList.contains("hidden")) elements.cancelDelete.click();
+  if (!elements.appExclusionsModal.classList.contains("hidden")) elements.closeAppExclusions.click();
 });
 
 setInterval(async () => {
@@ -251,6 +371,6 @@ setInterval(() => {
     : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }, 1000);
 
-Promise.all([refreshProfiles(), invoke("connection_status").then(renderConnection)]).catch((error) => {
+Promise.all([refreshProfiles(), refreshAppExclusions(), invoke("connection_status").then(renderConnection)]).catch((error) => {
   renderConnection({ state: "error", message: String(error), profileId: null });
 });

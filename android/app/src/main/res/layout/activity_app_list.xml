@@ -18,6 +18,7 @@
         android:textStyle="bold" />
 
     <TextView
+        android:id="@+id/exclusionsHint"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
@@ -25,11 +26,61 @@
         android:textColor="@color/text_secondary"
         android:textSize="14sp" />
 
+    <RadioGroup
+        android:id="@+id/routingMode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/modeExclude"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:buttonTint="@color/accent"
+            android:text="@string/mode_exclude"
+            android:textColor="@color/text_primary" />
+
+        <RadioButton
+            android:id="@+id/modeInclude"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:buttonTint="@color/accent"
+            android:text="@string/mode_include"
+            android:textColor="@color/text_primary" />
+    </RadioGroup>
+
+    <EditText
+        android:id="@+id/appSearch"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_input"
+        android:hint="@string/apps_search_hint"
+        android:imeOptions="actionDone"
+        android:inputType="text"
+        android:maxLines="1"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:textColor="@color/text_primary"
+        android:textColorHint="@color/text_secondary" />
+
+    <CheckBox
+        android:id="@+id/showSelectedOnly"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:buttonTint="@color/accent"
+        android:text="@string/show_selected_only"
+        android:textColor="@color/text_secondary" />
+
     <ListView
         android:id="@+id/appList"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="4dp"
         android:layout_weight="1" />
 
     <Button

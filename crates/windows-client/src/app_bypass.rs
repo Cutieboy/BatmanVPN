@@ -1,0 +1,738 @@
+use std::{
+    ffi::c_void,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+    process::Command,
+    ptr,
+    sync::{Arc, Mutex},
+};
+
+use windows_sys::{
+    core::GUID,
+    Win32::{
+        Foundation::HANDLE,
+        NetworkManagement::WindowsFilteringPlatform::{
+            FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFreeMemory0,
+            FwpmGetAppIdFromFileName0, FwpmProviderAdd0, FwpmProviderContextAdd0, FwpmSubLayerAdd0,
+            FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
+            FWPM_ACTION0_0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
+            FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_PROTOCOL, FWPM_DISPLAY_DATA0,
+            FWPM_FILTER0, FWPM_FILTER0_0, FWPM_FILTER_CONDITION0,
+            FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT,
+            FWPM_GENERAL_CONTEXT, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWPM_LAYER_ALE_BIND_REDIRECT_V4, FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, FWPM_LAYER_ALE_CONNECT_REDIRECT_V6, FWPM_PROVIDER0,
+            FWPM_PROVIDER_CONTEXT0, FWPM_PROVIDER_CONTEXT0_0, FWPM_SESSION0,
+            FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_CALLOUT_TERMINATING,
+            FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
+            FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL, FWP_UINT8,
+        },
+        System::Rpc::RPC_C_AUTHN_WINNT,
+    },
+};
+
+use crate::{
+    network::{self, PhysicalAddresses},
+    AppRoutingMode, AppRoutingPolicy, ClientError,
+};
+
+const SERVICE_NAME: &str = "MouseVpnSplitTunnel";
+const DRIVER_FILE: &str = "MouseVpnSplitTunnel.sys";
+const IPPROTO_TCP: u8 = 6;
+
+const PROVIDER_KEY: GUID = GUID::from_u128(0x8148ae22_9f61_4798_89e5_02107d18808a);
+const SUBLAYER_KEY: GUID = GUID::from_u128(0x32733b84_083d_4c21_b0e2_5f9e6500804f);
+const CONNECT_CALLOUT_KEY: GUID = GUID::from_u128(0x0b7e42e1_06ba_4777_84d5_bf99480de6ce);
+const BIND_CALLOUT_KEY: GUID = GUID::from_u128(0x02b4a98b_cd65_490d_83c6_0bfb6f10fa95);
+const IPV4_CONTEXT_KEY: GUID = GUID::from_u128(0x3762a995_29e1_4507_be82_8f2ee765811c);
+const CONNECT_V6_CALLOUT_KEY: GUID = GUID::from_u128(0x5e96782f_3fcb_441c_8d09_fef5c16b00b0);
+const BIND_V6_CALLOUT_KEY: GUID = GUID::from_u128(0xc61160b3_be17_41ef_b7a6_2f669da8cc96);
+const IPV6_CONTEXT_KEY: GUID = GUID::from_u128(0xad93e1c7_bdac_472e_9b64_c3e6abbaffdd);
+
+pub(crate) struct AppBypassGuard {
+    state: Arc<Mutex<BypassState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AppBypassRefresher {
+    state: Arc<Mutex<BypassState>>,
+}
+
+struct BypassState {
+    engine: usize,
+    policy: AppRoutingPolicy,
+    physical_addresses: PhysicalAddresses,
+}
+
+impl AppBypassGuard {
+    pub(crate) fn install(policy: &AppRoutingPolicy) -> Result<Option<Self>, ClientError> {
+        if policy.apps.is_empty() && policy.mode == AppRoutingMode::Exclude {
+            return Ok(None);
+        }
+        for app in &policy.apps {
+            if !app.is_absolute() || !app.is_file() {
+                return Err(ClientError::Platform(format!(
+                    "excluded Windows application is unavailable: {}",
+                    app.display()
+                )));
+            }
+        }
+
+        let driver = driver_path()?;
+        ensure_driver_started(&driver)?;
+        let physical_addresses = network::physical_addresses()?;
+        match open_engine(policy, physical_addresses) {
+            Ok(engine) => Ok(Some(Self {
+                state: Arc::new(Mutex::new(BypassState {
+                    engine: engine as usize,
+                    policy: policy.clone(),
+                    physical_addresses,
+                })),
+            })),
+            Err(error) => {
+                stop_driver();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn refresher(&self) -> AppBypassRefresher {
+        AppBypassRefresher {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Drop for AppBypassGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            close_engine(&mut state.engine);
+        }
+        stop_driver();
+    }
+}
+
+impl AppBypassRefresher {
+    pub(crate) fn refresh(&self) -> Result<(), ClientError> {
+        let physical_addresses = network::physical_addresses()?;
+        let mut state = self.state.lock().map_err(|_| {
+            ClientError::Platform("application bypass refresh lock was poisoned".to_owned())
+        })?;
+        if physical_addresses == state.physical_addresses && state.engine != 0 {
+            return Ok(());
+        }
+
+        // Fixed WFP object keys cannot coexist in two dynamic sessions. Closing
+        // the old one first briefly fails closed under the firewall kill switch.
+        close_engine(&mut state.engine);
+        let engine = open_engine(&state.policy, physical_addresses)?;
+        state.engine = engine as usize;
+        state.physical_addresses = physical_addresses;
+        Ok(())
+    }
+}
+
+fn open_engine(
+    policy: &AppRoutingPolicy,
+    addresses: PhysicalAddresses,
+) -> Result<HANDLE, ClientError> {
+    let mut session_name = wide("MouseVPN application bypass");
+    let session = FWPM_SESSION0 {
+        displayData: display_data(&mut session_name),
+        flags: FWPM_SESSION_FLAG_DYNAMIC,
+        ..Default::default()
+    };
+    let mut engine = ptr::null_mut();
+    check_wfp(
+        unsafe {
+            FwpmEngineOpen0(
+                ptr::null(),
+                RPC_C_AUTHN_WINNT,
+                ptr::null(),
+                &raw const session,
+                &raw mut engine,
+            )
+        },
+        "open the WFP engine",
+    )?;
+
+    let result = unsafe { configure_engine(engine, policy, addresses) };
+    if let Err(error) = result {
+        unsafe {
+            FwpmEngineClose0(engine);
+        }
+        return Err(error);
+    }
+    Ok(engine)
+}
+
+fn close_engine(engine: &mut usize) {
+    if *engine != 0 {
+        unsafe {
+            FwpmEngineClose0(*engine as HANDLE);
+        }
+        *engine = 0;
+    }
+}
+
+unsafe fn configure_engine(
+    engine: HANDLE,
+    policy: &AppRoutingPolicy,
+    addresses: PhysicalAddresses,
+) -> Result<(), ClientError> {
+    check_wfp(
+        unsafe { FwpmTransactionBegin0(engine, 0) },
+        "begin the WFP transaction",
+    )?;
+    let result = unsafe { configure_transaction(engine, policy, addresses) };
+    match result {
+        Ok(()) => check_wfp(
+            unsafe { FwpmTransactionCommit0(engine) },
+            "commit the WFP transaction",
+        ),
+        Err(error) => {
+            unsafe {
+                FwpmTransactionAbort0(engine);
+            }
+            Err(error)
+        }
+    }
+}
+
+unsafe fn configure_transaction(
+    engine: HANDLE,
+    policy: &AppRoutingPolicy,
+    addresses: PhysicalAddresses,
+) -> Result<(), ClientError> {
+    let mut provider_name = wide("MouseVPN application bypass");
+    let mut provider = FWPM_PROVIDER0 {
+        providerKey: PROVIDER_KEY,
+        displayData: display_data(&mut provider_name),
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmProviderAdd0(engine, &raw const provider, ptr::null_mut()) },
+        "add the MouseVPN WFP provider",
+    )?;
+
+    let mut sublayer_name = wide("MouseVPN application bypass policy");
+    let sublayer = FWPM_SUBLAYER0 {
+        subLayerKey: SUBLAYER_KEY,
+        displayData: display_data(&mut sublayer_name),
+        providerKey: ptr::from_mut(&mut provider.providerKey),
+        weight: 0xfffe,
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmSubLayerAdd0(engine, &raw const sublayer, ptr::null_mut()) },
+        "add the MouseVPN WFP sublayer",
+    )?;
+
+    add_callout(
+        engine,
+        CONNECT_CALLOUT_KEY,
+        FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+        &mut provider.providerKey,
+        "MouseVPN TCP application bypass",
+    )?;
+    add_callout(
+        engine,
+        BIND_CALLOUT_KEY,
+        FWPM_LAYER_ALE_BIND_REDIRECT_V4,
+        &mut provider.providerKey,
+        "MouseVPN UDP application bypass",
+    )?;
+    if addresses.ipv6.is_some() {
+        add_callout(
+            engine,
+            CONNECT_V6_CALLOUT_KEY,
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            &mut provider.providerKey,
+            "MouseVPN TCP IPv6 application bypass",
+        )?;
+        add_callout(
+            engine,
+            BIND_V6_CALLOUT_KEY,
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+            &mut provider.providerKey,
+            "MouseVPN UDP IPv6 application bypass",
+        )?;
+    }
+
+    add_redirect_context(
+        engine,
+        &mut provider.providerKey,
+        IPV4_CONTEXT_KEY,
+        &mut RedirectContext::ipv4(addresses.ipv4),
+        "MouseVPN physical IPv4 address",
+    )?;
+
+    if let Some(ipv6) = addresses.ipv6 {
+        add_redirect_context(
+            engine,
+            &mut provider.providerKey,
+            IPV6_CONTEXT_KEY,
+            &mut RedirectContext::ipv6(ipv6),
+            "MouseVPN physical IPv6 address",
+        )?;
+    }
+
+    match policy.mode {
+        AppRoutingMode::Exclude => {
+            for path in &policy.apps {
+                let app_id = AppId::from_path(path)?;
+                add_excluded_app_filters(engine, app_id.blob, addresses.ipv6.is_some())?;
+            }
+        }
+        AppRoutingMode::Include => {
+            add_default_bypass_filters(engine, addresses.ipv6.is_some())?;
+            for path in &policy.apps {
+                let app_id = AppId::from_path(path)?;
+                add_vpn_app_filters(engine, app_id.blob, addresses.ipv6.is_some())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_redirect_context(
+    engine: HANDLE,
+    provider_key: &mut GUID,
+    context_key: GUID,
+    redirect_bytes: &mut [u8],
+    name: &str,
+) -> Result<(), ClientError> {
+    let mut redirect_blob = FWP_BYTE_BLOB {
+        size: u32::try_from(redirect_bytes.len()).expect("redirect context fits in u32"),
+        data: redirect_bytes.as_mut_ptr(),
+    };
+    let mut name = wide(name);
+    let context = FWPM_PROVIDER_CONTEXT0 {
+        providerContextKey: context_key,
+        displayData: display_data(&mut name),
+        providerKey: ptr::from_mut(provider_key),
+        r#type: FWPM_GENERAL_CONTEXT,
+        Anonymous: FWPM_PROVIDER_CONTEXT0_0 {
+            dataBuffer: ptr::from_mut(&mut redirect_blob),
+        },
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe {
+            FwpmProviderContextAdd0(engine, &raw const context, ptr::null_mut(), ptr::null_mut())
+        },
+        "add a physical-address WFP context",
+    )
+}
+
+fn add_excluded_app_filters(
+    engine: HANDLE,
+    app_id: *mut FWP_BYTE_BLOB,
+    ipv6: bool,
+) -> Result<(), ClientError> {
+    add_redirect_filter(
+        engine,
+        Some(app_id),
+        FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+        CONNECT_CALLOUT_KEY,
+        IPV4_CONTEXT_KEY,
+        FWP_MATCH_EQUAL,
+        15,
+        "MouseVPN excluded TCP application",
+    )?;
+    add_redirect_filter(
+        engine,
+        Some(app_id),
+        FWPM_LAYER_ALE_BIND_REDIRECT_V4,
+        BIND_CALLOUT_KEY,
+        IPV4_CONTEXT_KEY,
+        FWP_MATCH_NOT_EQUAL,
+        15,
+        "MouseVPN excluded UDP application",
+    )?;
+    add_permit_filter(engine, app_id)?;
+    if ipv6 {
+        add_redirect_filter(
+            engine,
+            Some(app_id),
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            CONNECT_V6_CALLOUT_KEY,
+            IPV6_CONTEXT_KEY,
+            FWP_MATCH_EQUAL,
+            15,
+            "MouseVPN excluded TCP IPv6 application",
+        )?;
+        add_redirect_filter(
+            engine,
+            Some(app_id),
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+            BIND_V6_CALLOUT_KEY,
+            IPV6_CONTEXT_KEY,
+            FWP_MATCH_NOT_EQUAL,
+            15,
+            "MouseVPN excluded UDP IPv6 application",
+        )?;
+        add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
+    }
+    Ok(())
+}
+
+fn add_default_bypass_filters(engine: HANDLE, ipv6: bool) -> Result<(), ClientError> {
+    add_redirect_filter(
+        engine,
+        None,
+        FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+        CONNECT_CALLOUT_KEY,
+        IPV4_CONTEXT_KEY,
+        FWP_MATCH_EQUAL,
+        10,
+        "MouseVPN default TCP bypass",
+    )?;
+    add_redirect_filter(
+        engine,
+        None,
+        FWPM_LAYER_ALE_BIND_REDIRECT_V4,
+        BIND_CALLOUT_KEY,
+        IPV4_CONTEXT_KEY,
+        FWP_MATCH_NOT_EQUAL,
+        10,
+        "MouseVPN default UDP bypass",
+    )?;
+    if ipv6 {
+        add_redirect_filter(
+            engine,
+            None,
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            CONNECT_V6_CALLOUT_KEY,
+            IPV6_CONTEXT_KEY,
+            FWP_MATCH_EQUAL,
+            10,
+            "MouseVPN default TCP IPv6 bypass",
+        )?;
+        add_redirect_filter(
+            engine,
+            None,
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+            BIND_V6_CALLOUT_KEY,
+            IPV6_CONTEXT_KEY,
+            FWP_MATCH_NOT_EQUAL,
+            10,
+            "MouseVPN default UDP IPv6 bypass",
+        )?;
+    }
+    Ok(())
+}
+
+fn add_vpn_app_filters(
+    engine: HANDLE,
+    app_id: *mut FWP_BYTE_BLOB,
+    ipv6: bool,
+) -> Result<(), ClientError> {
+    for layer in [
+        FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+        FWPM_LAYER_ALE_BIND_REDIRECT_V4,
+    ] {
+        add_permit_filter_for_layer(engine, app_id, layer)?;
+    }
+    if ipv6 {
+        for layer in [
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+        ] {
+            add_permit_filter_for_layer(engine, app_id, layer)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_callout(
+    engine: HANDLE,
+    key: GUID,
+    layer: GUID,
+    provider_key: &mut GUID,
+    name: &str,
+) -> Result<(), ClientError> {
+    let mut name = wide(name);
+    let callout = FWPM_CALLOUT0 {
+        calloutKey: key,
+        displayData: display_data(&mut name),
+        flags: FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
+        providerKey: ptr::from_mut(provider_key),
+        applicableLayer: layer,
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmCalloutAdd0(engine, &raw const callout, ptr::null_mut(), ptr::null_mut()) },
+        "register the MouseVPN WFP callout",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_redirect_filter(
+    engine: HANDLE,
+    app_id: Option<*mut FWP_BYTE_BLOB>,
+    layer: GUID,
+    callout: GUID,
+    context_key: GUID,
+    protocol_match: i32,
+    filter_weight: u64,
+    name: &str,
+) -> Result<(), ClientError> {
+    let mut conditions = Vec::with_capacity(2);
+    if let Some(app_id) = app_id {
+        conditions.push(app_condition(app_id));
+    }
+    conditions.push(protocol_condition(protocol_match));
+    let mut name = wide(name);
+    let mut provider_key = PROVIDER_KEY;
+    let mut weight = filter_weight;
+    let filter = FWPM_FILTER0 {
+        displayData: display_data(&mut name),
+        flags: FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT,
+        providerKey: ptr::from_mut(&mut provider_key),
+        layerKey: layer,
+        subLayerKey: SUBLAYER_KEY,
+        weight: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0 {
+            r#type: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
+            Anonymous:
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
+                    uint64: ptr::from_mut(&mut weight),
+                },
+        },
+        numFilterConditions: u32::try_from(conditions.len()).expect("condition count fits u32"),
+        filterCondition: conditions.as_mut_ptr(),
+        action: FWPM_ACTION0 {
+            r#type: FWP_ACTION_CALLOUT_TERMINATING,
+            Anonymous: FWPM_ACTION0_0 {
+                calloutKey: callout,
+            },
+        },
+        Anonymous: FWPM_FILTER0_0 {
+            providerContextKey: context_key,
+        },
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), ptr::null_mut()) },
+        "add an application redirect filter",
+    )
+}
+
+fn add_permit_filter(engine: HANDLE, app_id: *mut FWP_BYTE_BLOB) -> Result<(), ClientError> {
+    add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_AUTH_CONNECT_V4)
+}
+
+fn add_permit_filter_for_layer(
+    engine: HANDLE,
+    app_id: *mut FWP_BYTE_BLOB,
+    layer: GUID,
+) -> Result<(), ClientError> {
+    let mut condition = app_condition(app_id);
+    let mut name = wide("MouseVPN application permit");
+    let mut provider_key = PROVIDER_KEY;
+    let mut weight = 15_u64;
+    let filter = FWPM_FILTER0 {
+        displayData: display_data(&mut name),
+        flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        providerKey: ptr::from_mut(&mut provider_key),
+        layerKey: layer,
+        subLayerKey: SUBLAYER_KEY,
+        weight: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0 {
+            r#type: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
+            Anonymous:
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
+                    uint64: ptr::from_mut(&mut weight),
+                },
+        },
+        numFilterConditions: 1,
+        filterCondition: ptr::from_mut(&mut condition),
+        action: FWPM_ACTION0 {
+            r#type: FWP_ACTION_PERMIT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), ptr::null_mut()) },
+        "add an application firewall permit",
+    )
+}
+
+fn app_condition(app_id: *mut FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_ALE_APP_ID,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_BYTE_BLOB_TYPE,
+            Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+        },
+    }
+}
+
+fn protocol_condition(match_type: i32) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_PROTOCOL,
+        matchType: match_type,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT8,
+            Anonymous: FWP_CONDITION_VALUE0_0 { uint8: IPPROTO_TCP },
+        },
+    }
+}
+
+struct AppId {
+    blob: *mut FWP_BYTE_BLOB,
+}
+
+impl AppId {
+    fn from_path(path: &Path) -> Result<Self, ClientError> {
+        let path = wide(&path.display().to_string());
+        let mut blob = ptr::null_mut();
+        check_wfp(
+            unsafe { FwpmGetAppIdFromFileName0(path.as_ptr(), &raw mut blob) },
+            "resolve an application path for WFP",
+        )?;
+        Ok(Self { blob })
+    }
+}
+
+impl Drop for AppId {
+    fn drop(&mut self) {
+        unsafe {
+            FwpmFreeMemory0(ptr::from_mut(&mut self.blob).cast::<*mut c_void>());
+        }
+    }
+}
+
+struct RedirectContext;
+
+impl RedirectContext {
+    fn ipv4(address: Ipv4Addr) -> [u8; 20] {
+        let mut bytes = [0_u8; 20];
+        bytes[..2].copy_from_slice(&2_u16.to_ne_bytes()); // AF_INET
+        bytes[4..8].copy_from_slice(&address.octets());
+        bytes
+    }
+
+    fn ipv6(address: Ipv6Addr) -> [u8; 20] {
+        let mut bytes = [0_u8; 20];
+        bytes[..2].copy_from_slice(&23_u16.to_ne_bytes()); // AF_INET6
+        bytes[4..].copy_from_slice(&address.octets());
+        bytes
+    }
+}
+
+fn ensure_driver_started(path: &Path) -> Result<(), ClientError> {
+    if !path.is_file() {
+        return Err(ClientError::Platform(format!(
+            "application bypass driver is missing: {}; install the complete MouseVPN package",
+            path.display()
+        )));
+    }
+    let path = path.display().to_string();
+    let query = run_sc(["query", SERVICE_NAME])?;
+    if query.0 {
+        let configured = run_sc(["config", SERVICE_NAME, "binPath=", &path])?;
+        if !configured.0 {
+            return Err(sc_error(
+                "update the application bypass driver",
+                &configured.1,
+            ));
+        }
+    } else {
+        let created = run_sc([
+            "create",
+            SERVICE_NAME,
+            "type=",
+            "kernel",
+            "start=",
+            "demand",
+            "binPath=",
+            &path,
+            "DisplayName=",
+            "MouseVPN Split Tunnel",
+        ])?;
+        if !created.0 {
+            return Err(sc_error(
+                "install the application bypass driver",
+                &created.1,
+            ));
+        }
+    }
+    let started = run_sc(["start", SERVICE_NAME])?;
+    if started.0 || started.1.contains("1056") {
+        Ok(())
+    } else {
+        Err(sc_error("start the application bypass driver", &started.1))
+    }
+}
+
+fn stop_driver() {
+    let _ = run_sc(["stop", SERVICE_NAME]);
+}
+
+fn driver_path() -> Result<PathBuf, ClientError> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        ClientError::Platform("MouseVPN executable has no parent directory".to_owned())
+    })?;
+    Ok(directory.join(DRIVER_FILE))
+}
+
+fn run_sc<const N: usize>(arguments: [&str; N]) -> Result<(bool, String), ClientError> {
+    let output = Command::new("sc.exe").args(arguments).output()?;
+    let details = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok((output.status.success(), details.trim().to_owned()))
+}
+
+fn sc_error(operation: &str, details: &str) -> ClientError {
+    ClientError::Platform(format!("failed to {operation}: {details}"))
+}
+
+fn check_wfp(code: u32, operation: &str) -> Result<(), ClientError> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(ClientError::Platform(format!(
+            "failed to {operation}: Windows error {code}"
+        )))
+    }
+}
+
+fn display_data(name: &mut [u16]) -> FWPM_DISPLAY_DATA0 {
+    FWPM_DISPLAY_DATA0 {
+        name: name.as_mut_ptr(),
+        description: ptr::null_mut(),
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::RedirectContext;
+
+    #[test]
+    fn redirect_context_matches_the_driver_abi() {
+        assert_eq!(
+            RedirectContext::ipv4(Ipv4Addr::new(192, 168, 1, 7)),
+            [2, 0, 0, 0, 192, 168, 1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn ipv6_redirect_context_matches_the_driver_abi() {
+        let address = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
+        let context = RedirectContext::ipv6(address);
+        assert_eq!(&context[..4], &[23, 0, 0, 0]);
+        assert_eq!(&context[4..], &address.octets());
+    }
+}

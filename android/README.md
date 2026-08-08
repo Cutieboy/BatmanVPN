@@ -38,6 +38,10 @@ The command asks for a password twice and prints one opaque `MV1.…` token.
 In the Android app, tap `+`, enter that token in the configuration-key field,
 and enter its password. The app does not read or write the clipboard itself.
 
+The application-routing screen supports both modes: selected apps can bypass
+the VPN, or only selected apps can use it. Search matches both the visible app
+name and Android package name; a separate switch shows only selected entries.
+
 ## Security model
 
 - The portable `MV1.…` profile string is encrypted with PBKDF2-HMAC-SHA256 and AES-256-GCM.

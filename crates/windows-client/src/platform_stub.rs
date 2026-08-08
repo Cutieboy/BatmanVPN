@@ -2,7 +2,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use mousevpn_config::ValidatedClientConfig;
 
-use crate::ClientError;
+use crate::{AppRoutingPolicy, ClientError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDiagnostics {
@@ -32,7 +32,9 @@ pub fn diagnose() -> RuntimeDiagnostics {
 pub fn run_with_stop(
     _config: &ValidatedClientConfig,
     _stopping: &Arc<AtomicBool>,
+    app_routing: &AppRoutingPolicy,
 ) -> Result<(), ClientError> {
+    let _app_bypass = crate::app_bypass::AppBypassGuard::install(app_routing)?;
     Err(ClientError::Platform(
         "the MouseVPN Windows networking backend can only run on Windows".to_owned(),
     ))

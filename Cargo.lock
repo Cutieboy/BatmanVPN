@@ -2394,6 +2394,7 @@ dependencies = [
  "mousevpn-transport",
  "serde",
  "toml 1.1.4+spec-1.1.0",
+ "windows-sys 0.61.2",
  "wintun",
 ]
 

@@ -42,7 +42,20 @@ While connected, temporarily disable and re-enable Wi-Fi or unplug/reconnect
 Ethernet. MouseVPN should show a reconnecting state and recover without removing
 the kill switch. Repeat once while switching from Ethernet to Wi-Fi.
 
-## 4. Controlled crash recovery
+## 4. Application routing
+
+Use disposable applications whose public IP can be observed independently.
+
+1. In **Exclude from VPN** mode, add one `.exe`, reconnect, and verify that it
+   sees the physical public IP while an unselected application sees the VPN IP.
+2. Switch to **Only through VPN**, reconnect, and verify the inverse.
+3. Test TCP, UDP and DNS on both IPv4 and IPv6 where the physical network offers
+   IPv6. Disconnect or stop the server during each test and check that an app
+   selected for VPN does not fall back to the physical adapter.
+4. Rename one selected executable and confirm that MouseVPN reports the missing
+   file instead of silently weakening the policy.
+
+## 5. Controlled crash recovery
 
 Save work and run:
 
@@ -59,7 +72,7 @@ PowerShell:
 .\windows-gui\dist\MouseVPN-windows-x64.exe --repair-network
 ```
 
-## 5. Results to send back
+## 6. Results to send back
 
 Send the console output from `test-windows.ps1`, the Windows version from
 `winver`, and whether the connection used Wi-Fi, Ethernet or both. Do not send

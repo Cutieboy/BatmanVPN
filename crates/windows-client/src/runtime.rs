@@ -11,11 +11,12 @@ use mousevpn_config::ValidatedClientConfig;
 use wintun::Adapter;
 
 use crate::{
+    app_bypass::AppBypassGuard,
     handshake::connect,
     network::{self, NetworkGuard, RuntimeLock, ADAPTER_NAME},
     packet_loop,
     platform::{ensure_supported_runtime, materialize_wintun},
-    ClientError,
+    AppRoutingPolicy, ClientError,
 };
 
 const ADAPTER_TUNNEL_TYPE: &str = "MouseVPN";
@@ -35,6 +36,7 @@ pub use crate::platform::{diagnose, RuntimeDiagnostics};
 pub fn run_with_stop(
     config: &ValidatedClientConfig,
     stopping: &Arc<AtomicBool>,
+    app_routing: &AppRoutingPolicy,
 ) -> Result<(), ClientError> {
     ensure_supported_runtime()?;
     let _runtime_lock = RuntimeLock::acquire()?;
@@ -67,7 +69,14 @@ pub fn run_with_stop(
             .start_session(wintun::MAX_RING_CAPACITY)
             .map_err(|error| ClientError::Platform(format!("failed to start Wintun: {error}")))?,
     );
-    let network = NetworkGuard::install(server_ip, config.server.port(), parameters)?;
+    let app_bypass = AppBypassGuard::install(app_routing)?;
+    let network = NetworkGuard::install(
+        server_ip,
+        config.server.port(),
+        parameters,
+        app_routing,
+        app_bypass,
+    )?;
     let mut transports = (incoming, outgoing, plane);
     let mut restart_backoff = RESTART_BACKOFF_MIN;
 
