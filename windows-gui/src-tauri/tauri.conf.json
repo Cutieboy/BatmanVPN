@@ -1,0 +1,39 @@
+{
+  "productName": "MouseVPN",
+  "version": "0.1.0",
+  "identifier": "dev.mousevpn.windows",
+  "build": {
+    "frontendDist": "../../linux-gui/ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "MouseVPN for Windows",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 620,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico"],
+    "category": "Utility",
+    "shortDescription": "Fast private MouseVPN client",
+    "longDescription": "MouseVPN desktop client for Windows",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
+  }
+}

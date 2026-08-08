@@ -30,6 +30,7 @@ fn ensure_private_permissions(path: &Path) -> Result<(), ConfigError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keeps the platform checks behind one fallible interface.
 fn ensure_private_permissions(_path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }

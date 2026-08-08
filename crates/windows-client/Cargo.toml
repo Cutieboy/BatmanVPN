@@ -1,0 +1,24 @@
+[package]
+name = "mousevpn-windows-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs2 = "0.4"
+getrandom = "0.3"
+mousevpn-config = { path = "../config" }
+mousevpn-crypto = { path = "../crypto" }
+mousevpn-data-plane = { path = "../data-plane" }
+mousevpn-protocol = { path = "../protocol" }
+mousevpn-transport = { path = "../transport" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5.1"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

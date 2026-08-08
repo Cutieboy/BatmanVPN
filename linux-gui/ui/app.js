@@ -1,5 +1,10 @@
 const invoke = window.__TAURI__.core.invoke;
 
+const platformLabel = document.querySelector(".brand span");
+if (platformLabel && navigator.userAgent.includes("Windows")) {
+  platformLabel.textContent = "Windows Client";
+}
+
 const elements = {
   profiles: document.querySelector("#profiles"),
   addProfile: document.querySelector("#addProfile"),
