@@ -135,6 +135,15 @@ button { border: 0; }
 .button-copy small { margin-top: 3px; color: #71869b; font-size: 10px; }
 
 .sidebar-footer { display: flex; gap: 10px; align-items: center; margin-top: 22px; padding: 14px; border-radius: 13px; background: #101e30; }
+.autostart-setting { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 12px 14px; border: 1px solid #263a50; border-radius: 13px; background: #0d1929; cursor: pointer; }
+.autostart-setting input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.autostart-switch { position: relative; flex: 0 0 34px; height: 19px; border-radius: 999px; background: #293d52; transition: background .18s ease; }
+.autostart-switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%; background: #91a4b7; transition: transform .18s ease, background .18s ease; }
+.autostart-setting input:checked + .autostart-switch { background: #17645f; }
+.autostart-setting input:checked + .autostart-switch::after { transform: translateX(15px); background: #53e0d6; }
+.autostart-setting strong, .autostart-setting small { display: block; }
+.autostart-setting strong { font-size: 11px; }
+.autostart-setting small { margin-top: 3px; color: #71869b; font-size: 10px; }
 .security-mark { display: grid; flex: 0 0 28px; height: 28px; place-items: center; border-radius: 50%; background: #163b43; color: #42d9d0; }
 .sidebar-footer strong, .sidebar-footer span { display: block; }
 .sidebar-footer strong { font-size: 11px; }

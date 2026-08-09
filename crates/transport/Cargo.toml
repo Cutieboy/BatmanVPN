@@ -10,3 +10,6 @@ workspace = true
 
 [dependencies]
 socket2 = "0.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+nix = { version = "0.30", features = ["socket", "uio"] }

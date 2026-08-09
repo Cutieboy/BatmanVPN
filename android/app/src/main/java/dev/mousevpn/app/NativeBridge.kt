@@ -16,4 +16,5 @@ object NativeBridge {
     external fun networkChanged(handle: Long)
     external fun stop(handle: Long)
     external fun status(handle: Long): String
+    external fun metrics(handle: Long): String
 }

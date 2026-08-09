@@ -11,7 +11,8 @@ use mousevpn_config::ClientConfig;
 use crate::{
     handshake::{bind_socket, negotiate},
     registry::{
-        insert_pending, insert_running, network_changed, status, stop, take_pending, PendingSession,
+        insert_pending, insert_running, metrics, network_changed, status, stop, take_pending,
+        PendingSession,
     },
     session,
     socket_protector::SocketProtector,
@@ -142,6 +143,16 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_status(
     handle: jlong,
 ) -> jstring {
     env.new_string(status(handle))
+        .map_or(std::ptr::null_mut(), JString::into_raw)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_metrics(
+    env: JNIEnv,
+    _object: JObject,
+    handle: jlong,
+) -> jstring {
+    env.new_string(metrics(handle))
         .map_or(std::ptr::null_mut(), JString::into_raw)
 }
 

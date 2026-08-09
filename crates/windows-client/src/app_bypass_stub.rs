@@ -15,12 +15,14 @@ impl AppBypassGuard {
         }
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn refresher(&self) -> AppBypassRefresher {
         AppBypassRefresher
     }
 }
 
 impl AppBypassRefresher {
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     pub(crate) fn refresh(&self) -> Result<(), ClientError> {
         Ok(())
     }

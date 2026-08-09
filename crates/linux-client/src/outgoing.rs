@@ -1,4 +1,5 @@
 use std::{
+    io,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Receiver,
@@ -9,7 +10,8 @@ use std::{
 
 use mousevpn_data_plane::{PacketDevice, TunnelSender};
 use mousevpn_linux_platform::LinuxTun;
-use mousevpn_transport::{DatagramTransport, UdpTransport};
+use mousevpn_transport::UdpTransport;
+use nix::poll::{poll, PollFd, PollFlags};
 
 use crate::{
     error::{is_peer_unavailable, is_retryable_network},
@@ -17,7 +19,8 @@ use crate::{
 };
 
 const PACKET_BUFFER_LEN: usize = 65_535;
-const PAUSE_POLL: Duration = Duration::from_millis(5);
+const BATCH_SIZE: usize = 32;
+const TUN_POLL_MS: u16 = 100;
 /// Minimum gap between reports of dropped packets, so a broken flow cannot
 /// flood the journal.
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -36,41 +39,73 @@ pub(crate) fn run(
     stopping: &Arc<AtomicBool>,
     reconnect: &ReconnectControl,
 ) -> Result<(), ClientError> {
-    let mut packet = vec![0_u8; PACKET_BUFFER_LEN];
-    // Reused for every datagram: the send path allocates nothing in steady state.
-    let mut datagram = Vec::with_capacity(PACKET_BUFFER_LEN);
+    let mut packets: Vec<Vec<u8>> = (0..BATCH_SIZE)
+        .map(|_| vec![0_u8; PACKET_BUFFER_LEN])
+        .collect();
+    let mut datagrams: Vec<Vec<u8>> = (0..BATCH_SIZE)
+        .map(|_| Vec::with_capacity(PACKET_BUFFER_LEN))
+        .collect();
     let mut drops = Drops::default();
 
     while !stopping.load(Ordering::Relaxed) {
-        let length = match tun.receive(&mut packet) {
-            Ok(length) => length,
-            Err(error) if is_retryable_network(&error) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if is_ipv6(&packet[..length]) {
-            continue;
-        }
-        while reconnect.paused.load(Ordering::Relaxed) && !stopping.load(Ordering::Relaxed) {
-            std::thread::sleep(PAUSE_POLL);
-        }
         // A connected UDP socket can retain its pre-suspend source address and
         // route.  Reconnect creates a fresh socket and hands its clone to this
         // direction before unpausing packet delivery.
         while let Ok(replacement) = reconnect.transport_replacements.try_recv() {
             *transport = replacement;
         }
+        if reconnect.paused.load(Ordering::Relaxed) {
+            let _ = poll(&mut [], TUN_POLL_MS);
+            continue;
+        }
 
-        {
-            let mut sender = sender.lock().map_err(|_| ClientError::WorkerStopped)?;
-            // One unencodable packet is a packet to drop, not a reason to tear
-            // the tunnel down.
-            if let Err(error) = sender.encode_ip_into(&packet[..length], &mut datagram) {
-                drops.record(&error);
-                continue;
+        let mut descriptors = [PollFd::new(tun.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, TUN_POLL_MS) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        if reconnect.paused.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let mut lengths = Vec::with_capacity(BATCH_SIZE);
+        for packet in &mut packets {
+            match tun.receive(packet) {
+                Ok(length) => lengths.push(length),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if is_retryable_network(&error) => break,
+                Err(error) => return Err(error.into()),
             }
         }
-        match transport.send(&datagram) {
-            Ok(()) => {}
+        if lengths.is_empty() {
+            continue;
+        }
+
+        let mut encoded = 0;
+        {
+            let mut sender = sender.lock().map_err(|_| ClientError::WorkerStopped)?;
+            for (index, &length) in lengths.iter().enumerate() {
+                if is_ipv6(&packets[index][..length]) {
+                    continue;
+                }
+                if let Err(error) =
+                    sender.encode_ip_into(&packets[index][..length], &mut datagrams[encoded])
+                {
+                    drops.record(&error);
+                    continue;
+                }
+                encoded += 1;
+            }
+        }
+        if encoded == 0 {
+            continue;
+        }
+        match transport.send_batch(&datagrams[..encoded]) {
+            Ok(sent) if sent == encoded => {}
+            Ok(sent) => drops.record(&format_args!(
+                "UDP send queue accepted {sent} of {encoded} batched packets"
+            )),
             // The receive loop owns liveness, but both directions share one
             // kernel socket, so the peer's ICMP error is delivered to whichever
             // syscall runs first. Under load that is almost always this send,

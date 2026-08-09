@@ -31,6 +31,8 @@ use windows_sys::{
     },
 };
 
+use std::os::windows::process::CommandExt;
+
 use crate::{
     network::{self, PhysicalAddresses},
     AppRoutingMode, AppRoutingPolicy, ClientError,
@@ -39,6 +41,7 @@ use crate::{
 const SERVICE_NAME: &str = "MouseVpnSplitTunnel";
 const DRIVER_FILE: &str = "MouseVpnSplitTunnel.sys";
 const IPPROTO_TCP: u8 = 6;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const PROVIDER_KEY: GUID = GUID::from_u128(0x8148ae22_9f61_4798_89e5_02107d18808a);
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x32733b84_083d_4c21_b0e2_5f9e6500804f);
@@ -89,10 +92,7 @@ impl AppBypassGuard {
                     physical_addresses,
                 })),
             })),
-            Err(error) => {
-                stop_driver();
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -108,7 +108,9 @@ impl Drop for AppBypassGuard {
         if let Ok(mut state) = self.state.lock() {
             close_engine(&mut state.engine);
         }
-        stop_driver();
+        // Dynamic WFP filters disappear with the engine. Keep the signed,
+        // policy-free callout driver loaded so the next connection does not
+        // depend on the original package still being in the same directory.
     }
 }
 
@@ -623,23 +625,36 @@ impl RedirectContext {
 }
 
 fn ensure_driver_started(path: &Path) -> Result<(), ClientError> {
-    if !path.is_file() {
-        return Err(ClientError::Platform(format!(
-            "application bypass driver is missing: {}; install the complete MouseVPN package",
-            path.display()
-        )));
-    }
-    let path = path.display().to_string();
     let query = run_sc(["query", SERVICE_NAME])?;
     if query.0 {
-        let configured = run_sc(["config", SERVICE_NAME, "binPath=", &path])?;
-        if !configured.0 {
-            return Err(sc_error(
-                "update the application bypass driver",
-                &configured.1,
-            ));
+        if path.is_file() {
+            let path = path.display().to_string();
+            let configured = run_sc(["config", SERVICE_NAME, "binPath=", &path])?;
+            if !configured.0 {
+                return Err(sc_error(
+                    "update the application bypass driver",
+                    &configured.1,
+                ));
+            }
+        } else {
+            let started = run_sc(["start", SERVICE_NAME])?;
+            if started.0 || started.1.contains("1056") {
+                return Ok(());
+            }
+            return Err(ClientError::Platform(format!(
+                "application bypass driver is installed but cannot be started, and the package copy is missing: {}; {}",
+                path.display(),
+                started.1
+            )));
         }
     } else {
+        if !path.is_file() {
+            return Err(ClientError::Platform(format!(
+                "application bypass driver is missing: {}; install the complete MouseVPN package",
+                path.display()
+            )));
+        }
+        let path = path.display().to_string();
         let created = run_sc([
             "create",
             SERVICE_NAME,
@@ -667,10 +682,6 @@ fn ensure_driver_started(path: &Path) -> Result<(), ClientError> {
     }
 }
 
-fn stop_driver() {
-    let _ = run_sc(["stop", SERVICE_NAME]);
-}
-
 fn driver_path() -> Result<PathBuf, ClientError> {
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or_else(|| {
@@ -680,7 +691,9 @@ fn driver_path() -> Result<PathBuf, ClientError> {
 }
 
 fn run_sc<const N: usize>(arguments: [&str; N]) -> Result<(bool, String), ClientError> {
-    let output = Command::new("sc.exe").args(arguments).output()?;
+    let mut command = Command::new("sc.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.args(arguments).output()?;
     let details = format!(
         "{} {}",
         String::from_utf8_lossy(&output.stdout).trim(),

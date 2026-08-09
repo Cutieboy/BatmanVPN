@@ -18,8 +18,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             // Internal MVP builds remain upgrade-compatible with the installed debug APK.
             // A separately protected production key is required before public distribution.
             signingConfig = signingConfigs.getByName("debug")
@@ -45,6 +48,7 @@ val buildRust by tasks.registering(Exec::class) {
     commandLine(
         cargo,
         "ndk",
+        // MouseVPN intentionally ships 64-bit ABIs only; minSdk is not an ABI promise.
         "-t", "arm64-v8a",
         "-t", "x86_64",
         "-o", output.asFile.absolutePath,

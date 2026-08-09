@@ -43,6 +43,8 @@ const elements = {
   appRoutingHint: document.querySelector("#appRoutingHint"),
   appRoutingSearch: document.querySelector("#appRoutingSearch"),
   clearRoutedApps: document.querySelector("#clearRoutedApps"),
+  autostartSetting: document.querySelector("#autostartSetting"),
+  autostartEnabled: document.querySelector("#autostartEnabled"),
 };
 
 let profiles = [];
@@ -53,7 +55,14 @@ let connection = { state: "disconnected", message: "VPN выключен", profi
 let connectedAt = null;
 const isWindows = navigator.userAgent.includes("Windows");
 
-if (isWindows) elements.appExclusions.classList.remove("hidden");
+// Windows application routing requires a production-signed WFP callout driver.
+// Keep the control hidden until the complete signed package is available.
+if (isWindows) elements.autostartSetting.classList.remove("hidden");
+
+async function refreshAutostart() {
+  if (!isWindows) return;
+  elements.autostartEnabled.checked = await invoke("autostart_enabled");
+}
 
 function escapeHtml(value) {
   return String(value)
@@ -338,6 +347,20 @@ elements.clearRoutedApps.addEventListener("click", async () => {
   }
 });
 
+elements.autostartEnabled.addEventListener("change", async () => {
+  const requested = elements.autostartEnabled.checked;
+  elements.autostartEnabled.disabled = true;
+  try {
+    elements.autostartEnabled.checked = await invoke("set_autostart", { enabled: requested });
+    elements.autostartSetting.title = "";
+  } catch (error) {
+    elements.autostartEnabled.checked = !requested;
+    elements.autostartSetting.title = String(error);
+  } finally {
+    elements.autostartEnabled.disabled = false;
+  }
+});
+
 elements.power.addEventListener("click", async () => {
   try {
     const next = connection.state === "connected"
@@ -371,6 +394,6 @@ setInterval(() => {
     : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }, 1000);
 
-Promise.all([refreshProfiles(), refreshAppExclusions(), invoke("connection_status").then(renderConnection)]).catch((error) => {
+Promise.all([refreshProfiles(), refreshAppExclusions(), refreshAutostart(), invoke("connection_status").then(renderConnection)]).catch((error) => {
   renderConnection({ state: "error", message: String(error), profileId: null });
 });

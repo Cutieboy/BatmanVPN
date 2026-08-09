@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
-    env, fs, io,
+    env, fs,
+    io::{self, IoSlice, IoSliceMut},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    os::fd::AsRawFd,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mousevpn_admin_api::{
@@ -21,12 +23,19 @@ use mousevpn_data_plane::{
 };
 use mousevpn_linux_platform::{LinuxTun, LinuxTunConfig, DEFAULT_TX_QUEUE_LEN};
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
+use nix::poll::{poll, PollFd, PollFlags};
+use nix::sys::socket::{
+    recvmmsg, sendmmsg, setsockopt, sockopt::RxqOvfl, ControlMessageOwned, MsgFlags, MultiHeaders,
+    SockaddrStorage,
+};
 use socket2::SockRef;
 
 use crate::{rate_limit::HandshakeLimiter, ServerDaemonError};
 
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
+const UDP_BATCH_SIZE: usize = 32;
 const SOCKET_BUFFER_LEN: usize = 8 * 1024 * 1024;
+const PEER_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// Outer IPv4 and UDP headers carried around every tunnel datagram.
 const IPV4_UDP_OVERHEAD: usize = 28;
 
@@ -39,6 +48,7 @@ struct RuntimeSession {
     inbound: Mutex<TunnelReceiver>,
     /// Server-to-client direction, driven by the TUN worker alone.
     outbound: Mutex<TunnelSender>,
+    last_peer_log: Mutex<Option<Instant>>,
 }
 
 impl RuntimeSession {
@@ -55,14 +65,29 @@ impl RuntimeSession {
         if self.peer() == Some(peer) {
             return;
         }
-        if let Ok(mut current) = self.peer.write() {
-            if *current != peer {
-                eprintln!(
-                    "session for {} moved from {} to {peer}",
-                    self.client_address, *current
-                );
-                *current = peer;
+        let previous = {
+            let Ok(mut current) = self.peer.write() else {
+                return;
+            };
+            if *current == peer {
+                return;
             }
+            let previous = *current;
+            *current = peer;
+            previous
+        };
+        let should_log = self.last_peer_log.lock().is_ok_and(|mut last| {
+            if last.is_some_and(|last| last.elapsed() < PEER_LOG_INTERVAL) {
+                return false;
+            }
+            *last = Some(Instant::now());
+            true
+        });
+        if should_log {
+            eprintln!(
+                "session for {} moved from {previous} to {peer}",
+                self.client_address
+            );
         }
     }
 }
@@ -78,6 +103,13 @@ struct Sessions {
 }
 
 type SessionMap = Arc<RwLock<Sessions>>;
+
+struct ReceivedDatagram {
+    index: usize,
+    length: usize,
+    peer: SocketAddr,
+    rx_overflow: Option<u32>,
+}
 
 /// Last handshake seen from a device, so duplicates stay harmless.
 ///
@@ -104,59 +136,132 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
         mtu: config.tun.mtu,
         tx_queue_len: DEFAULT_TX_QUEUE_LEN,
     })?);
+    tun.set_nonblocking(true)?;
     let socket = UdpSocket::bind(config.listen)?;
     configure_socket_buffers(&socket)?;
+    setsockopt(&socket, RxqOvfl, &1).map_err(io::Error::from)?;
     let sessions: SessionMap = Arc::new(RwLock::new(Sessions::default()));
     let authorized = open_device_registry(config)?;
     start_admin_if_configured(config, &authorized)?;
-    let mut handshake_limiter = HandshakeLimiter::new(10, Duration::from_secs(60));
+    let mut handshake_limiter = HandshakeLimiter::new(50, Duration::from_secs(60));
     let mut handshake_cache: HashMap<PublicKey, CachedHandshake> = HashMap::new();
 
     start_tun_worker(Arc::clone(&tun), socket.try_clone()?, Arc::clone(&sessions));
-    let mut buffer = vec![0_u8; DATAGRAM_BUFFER_LEN];
+    let mut buffers: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+        .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
+        .collect();
+    let mut headers =
+        MultiHeaders::<SockaddrStorage>::preallocate(UDP_BATCH_SIZE, Some(nix::cmsg_space!(u32)));
+    let mut received = Vec::with_capacity(UDP_BATCH_SIZE);
+    let mut last_rx_overflow = 0_u32;
     // Reused across packets so the steady-state receive path never allocates.
     let mut plaintext = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
     let mut response = Vec::with_capacity(usize::from(config.tun.mtu) + 128);
     loop {
-        let (length, peer) = match socket.recv_from(&mut buffer) {
-            Ok(received) => received,
+        match receive_batch(&socket, &mut buffers, &mut headers, &mut received) {
+            Ok(()) => {}
             Err(error) if is_recoverable(&error) => continue,
             Err(error) => return Err(error.into()),
-        };
-        if !looks_like_protocol_datagram(&buffer[..length]) {
-            continue;
         }
-        let Ok(datagram) = Datagram::decode(&buffer[..length]) else {
-            continue;
-        };
-        match datagram.header.kind {
-            PacketKind::HandshakeInit if handshake_limiter.allow(peer.ip()) => {
-                handle_handshake(
-                    &socket,
-                    peer,
-                    datagram,
-                    config,
-                    &authorized,
-                    &sessions,
-                    &mut handshake_cache,
-                );
+        for received in received.drain(..) {
+            let ReceivedDatagram {
+                index,
+                length,
+                peer,
+                rx_overflow,
+            } = received;
+            if let Some(rx_overflow) = rx_overflow {
+                if rx_overflow > last_rx_overflow {
+                    eprintln!(
+                        "MouseVPN UDP receive queue dropped {} datagrams (total {rx_overflow})",
+                        rx_overflow - last_rx_overflow
+                    );
+                    last_rx_overflow = rx_overflow;
+                }
             }
-            PacketKind::Data => {
-                handle_client_data(peer, datagram, &sessions, &tun, &mut plaintext);
+            let buffer = &buffers[index][..length];
+            if !looks_like_protocol_datagram(buffer) {
+                continue;
             }
-            PacketKind::Keepalive => {
-                handle_keepalive(
-                    &socket,
-                    peer,
-                    datagram,
-                    &sessions,
-                    &mut plaintext,
-                    &mut response,
-                );
+            let Ok(datagram) = Datagram::decode(buffer) else {
+                continue;
+            };
+            match datagram.header.kind {
+                PacketKind::HandshakeInit if handshake_limiter.allow(peer.ip()) => {
+                    handle_handshake(
+                        &socket,
+                        peer,
+                        datagram,
+                        config,
+                        &authorized,
+                        &sessions,
+                        &mut handshake_cache,
+                    );
+                }
+                PacketKind::Data => {
+                    handle_client_data(peer, datagram, &sessions, &tun, &mut plaintext);
+                }
+                PacketKind::Keepalive => {
+                    handle_keepalive(
+                        &socket,
+                        peer,
+                        datagram,
+                        &sessions,
+                        &mut plaintext,
+                        &mut response,
+                    );
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
+}
+
+fn receive_batch(
+    socket: &UdpSocket,
+    buffers: &mut [Vec<u8>],
+    headers: &mut MultiHeaders<SockaddrStorage>,
+    received: &mut Vec<ReceivedDatagram>,
+) -> io::Result<()> {
+    let mut slices: Vec<_> = buffers
+        .iter_mut()
+        .map(|buffer| [IoSliceMut::new(buffer)])
+        .collect();
+    let messages = recvmmsg(
+        socket.as_raw_fd(),
+        headers,
+        slices.iter_mut(),
+        MsgFlags::MSG_WAITFORONE,
+        None,
+    )
+    .map_err(io::Error::from)?;
+    received.clear();
+    for (index, message) in messages.enumerate() {
+        let Some(address) = message.address.and_then(socket_address) else {
+            continue;
+        };
+        let overflow = message.cmsgs().ok().and_then(|mut messages| {
+            messages.find_map(|message| match message {
+                ControlMessageOwned::RxqOvfl(value) => Some(value),
+                _ => None,
+            })
+        });
+        received.push(ReceivedDatagram {
+            index,
+            length: message.bytes,
+            peer: address,
+            rx_overflow: overflow,
+        });
+    }
+    Ok(())
+}
+
+fn socket_address(address: SockaddrStorage) -> Option<SocketAddr> {
+    address
+        .as_sockaddr_in()
+        .copied()
+        .map(SocketAddr::from)
+        .or_else(|| address.as_sockaddr_in6().copied().map(SocketAddr::from))
 }
 
 /// Warns when the configured tunnel MTU cannot fit a 1500-byte path.
@@ -190,7 +295,11 @@ fn is_recoverable(error: &io::Error) -> bool {
 fn configure_socket_buffers(socket: &UdpSocket) -> std::io::Result<()> {
     let socket = SockRef::from(socket);
     socket.set_recv_buffer_size(SOCKET_BUFFER_LEN)?;
-    socket.set_send_buffer_size(SOCKET_BUFFER_LEN)
+    socket.set_send_buffer_size(SOCKET_BUFFER_LEN)?;
+    let received = socket.recv_buffer_size()?;
+    let sent = socket.send_buffer_size()?;
+    eprintln!("MouseVPN UDP buffers: receive={received} send={sent} requested={SOCKET_BUFFER_LEN}");
+    Ok(())
 }
 
 fn handle_keepalive(
@@ -284,6 +393,7 @@ fn handle_handshake(
         peer: RwLock::new(peer),
         inbound: Mutex::new(receiver),
         outbound: Mutex::new(sender),
+        last_peer_log: Mutex::new(None),
     });
 
     let Ok(mut guard) = sessions.write() else {
@@ -323,11 +433,14 @@ fn handle_client_data(
     if !session.authorization.is_active() {
         return;
     }
-    let Ok(mut inbound) = session.inbound.lock() else {
-        return;
-    };
-    let Ok(Decoded::Ip(packet)) = inbound.decode_into(datagram, plaintext) else {
-        return;
+    let packet = {
+        let Ok(mut inbound) = session.inbound.lock() else {
+            return;
+        };
+        let Ok(Decoded::Ip(packet)) = inbound.decode_into(datagram, plaintext) else {
+            return;
+        };
+        packet
     };
     let Ok(ip) = Ipv4Packet::parse(packet) else {
         return;
@@ -336,47 +449,103 @@ fn handle_client_data(
         return;
     }
     let _ = tun.send(packet);
-    drop(inbound);
     session.adopt_peer(peer);
 }
 
 fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap) {
     thread::spawn(move || {
-        let mut packet = vec![0_u8; DATAGRAM_BUFFER_LEN];
-        let mut datagram = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
+        let mut packets: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+            .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
+            .collect();
+        let mut datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+            .map(|_| Vec::with_capacity(DATAGRAM_BUFFER_LEN))
+            .collect();
+        let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
+        let mut peers = Vec::with_capacity(UDP_BATCH_SIZE);
+        let mut send_headers = MultiHeaders::preallocate(UDP_BATCH_SIZE, None);
         loop {
-            let length = match tun.receive(&mut packet) {
-                Ok(length) => length,
-                Err(error) if is_recoverable(&error) => continue,
-                Err(error) => {
+            let mut descriptor = [PollFd::new(tun.as_fd(), PollFlags::POLLIN)];
+            if let Err(error) = poll(&mut descriptor, None::<u16>) {
+                if error == nix::errno::Errno::EINTR {
+                    continue;
+                }
+                eprintln!("MouseVPN TUN worker stopped: {error}");
+                return;
+            }
+            let mut packet_count = 0;
+            while packet_count < UDP_BATCH_SIZE {
+                match tun.receive(&mut packets[packet_count]) {
+                    Ok(length) => {
+                        packet_lengths[packet_count] = length;
+                        packet_count += 1;
+                    }
+                    Err(error) if is_recoverable(&error) => break,
+                    Err(error) => {
+                        eprintln!("MouseVPN TUN worker stopped: {error}");
+                        return;
+                    }
+                }
+            }
+
+            peers.clear();
+            let mut datagram_count = 0;
+            for index in 0..packet_count {
+                let packet = &packets[index][..packet_lengths[index]];
+                let Ok(ip) = Ipv4Packet::parse(packet) else {
+                    continue;
+                };
+                let Some(session) = find_session_by_address(&sessions, ip.destination()) else {
+                    continue;
+                };
+                if !session.authorization.is_active() {
+                    continue;
+                }
+                let Some(peer) = session.peer() else {
+                    continue;
+                };
+                {
+                    let Ok(mut outbound) = session.outbound.lock() else {
+                        continue;
+                    };
+                    if outbound
+                        .encode_ip_into(ip.as_bytes(), &mut datagrams[datagram_count])
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                peers.push(peer);
+                datagram_count += 1;
+            }
+            if datagram_count == 0 {
+                continue;
+            }
+
+            let slices: [[IoSlice<'_>; 1]; UDP_BATCH_SIZE] = std::array::from_fn(|index| {
+                [IoSlice::new(
+                    datagrams.get(index).map_or(&[], Vec::as_slice),
+                )]
+            });
+            let addresses: [Option<SockaddrStorage>; UDP_BATCH_SIZE] =
+                std::array::from_fn(|index| peers.get(index).copied().map(SockaddrStorage::from));
+            let send_result = sendmmsg(
+                socket.as_raw_fd(),
+                &mut send_headers,
+                &slices[..datagram_count],
+                &addresses[..datagram_count],
+                [],
+                MsgFlags::empty(),
+            );
+            match send_result {
+                Ok(results) => {
+                    let _complete_batch = results.count() == datagram_count;
+                }
+                Err(error) if !is_recoverable(&io::Error::from(error)) => {
                     eprintln!("MouseVPN TUN worker stopped: {error}");
                     return;
                 }
-            };
-            let Ok(ip) = Ipv4Packet::parse(&packet[..length]) else {
-                continue;
-            };
-            let Some(session) = find_session_by_address(&sessions, ip.destination()) else {
-                continue;
-            };
-            if !session.authorization.is_active() {
-                continue;
+                Err(_) => {}
             }
-            let Some(peer) = session.peer() else {
-                continue;
-            };
-            {
-                let Ok(mut outbound) = session.outbound.lock() else {
-                    continue;
-                };
-                if outbound
-                    .encode_ip_into(ip.as_bytes(), &mut datagram)
-                    .is_err()
-                {
-                    continue;
-                }
-            }
-            let _ = socket.send_to(&datagram, peer);
         }
     });
 }

@@ -58,12 +58,6 @@ pub(crate) fn get() -> Result<AppRoutingSettings, String> {
     })
 }
 
-pub(crate) fn policy() -> Result<(AppRoutingMode, Vec<PathBuf>), String> {
-    let mut settings = load()?;
-    normalize(&mut settings);
-    Ok((settings.mode, settings.apps))
-}
-
 pub(crate) fn set_mode(mode: AppRoutingMode) -> Result<AppRoutingSettings, String> {
     let mut settings = load()?;
     normalize(&mut settings);

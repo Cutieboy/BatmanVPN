@@ -15,6 +15,8 @@ mod handshake;
 mod liveness;
 mod network;
 #[cfg(windows)]
+mod network_events;
+#[cfg(windows)]
 mod packet_loop;
 #[cfg(windows)]
 mod platform;
