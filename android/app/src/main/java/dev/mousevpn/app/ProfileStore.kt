@@ -15,6 +15,7 @@ import org.json.JSONArray
 class ProfileStore(context: Context) {
     private val preferences = context.getSharedPreferences("mousevpn_secure", Context.MODE_PRIVATE)
     private val key: SecretKey by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { loadOrCreateKey() }
+    private var cachedEncodedProfiles: String? = null
     private var cachedProfiles: List<VpnProfile>? = null
 
     @Synchronized
@@ -28,13 +29,16 @@ class ProfileStore(context: Context) {
 
     @Synchronized
     fun list(): List<VpnProfile> {
-        cachedProfiles?.let { return it }
-        val encoded = preferences.getString(PROFILES, null) ?: return emptyList<VpnProfile>().also {
-            cachedProfiles = it
+        val encoded = preferences.getString(PROFILES, null)
+        if (encoded == null) {
+            cachedEncodedProfiles = null
+            return emptyList<VpnProfile>().also { cachedProfiles = it }
         }
+        if (encoded == cachedEncodedProfiles) cachedProfiles?.let { return it }
         val json = decrypt(encoded)
         val values = JSONArray(json)
         return (0 until values.length()).map { VpnProfile.fromJson(values.getString(it)) }.also {
+            cachedEncodedProfiles = encoded
             cachedProfiles = it
         }
     }
@@ -61,7 +65,9 @@ class ProfileStore(context: Context) {
     private fun write(profiles: List<VpnProfile>) {
         val values = JSONArray()
         profiles.forEach { values.put(it.toJson()) }
-        preferences.edit().putString(PROFILES, encrypt(values.toString())).apply()
+        val encoded = encrypt(values.toString())
+        preferences.edit().putString(PROFILES, encoded).apply()
+        cachedEncodedProfiles = encoded
         cachedProfiles = profiles.toList()
     }
 
