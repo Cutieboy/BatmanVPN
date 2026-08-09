@@ -50,7 +50,7 @@ pub fn run_with_stop(
         }
     };
 
-    let (incoming, plane, parameters) = connect(config)?;
+    let (incoming, plane, mut parameters) = connect(config)?;
     incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
     let outgoing = incoming.try_clone()?;
     let wintun_path = materialize_wintun()?;
@@ -70,7 +70,7 @@ pub fn run_with_stop(
             .map_err(|error| ClientError::Platform(format!("failed to start Wintun: {error}")))?,
     );
     let app_bypass = AppBypassGuard::install(app_routing)?;
-    let network = NetworkGuard::install(
+    let mut network = NetworkGuard::install(
         server_ip,
         config.server.port(),
         parameters,
@@ -90,7 +90,7 @@ pub fn run_with_stop(
             parameters,
             &session,
             stopping,
-            &network,
+            &mut network,
         );
         let _ = session.shutdown();
         if stopping.load(Ordering::Acquire) {
@@ -118,17 +118,12 @@ pub fn run_with_stop(
                 continue;
             }
 
-            let attempt = (|| {
+            let attempt: Result<_, ClientError> = (|| {
                 let (next_incoming, next_plane, next_parameters) = connect(config)?;
-                if next_parameters != parameters {
-                    return Err(ClientError::Platform(
-                        "server changed tunnel parameters during runtime restart".to_owned(),
-                    ));
-                }
                 next_incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
                 let next_outgoing = next_incoming.try_clone()?;
                 adapter
-                    .set_mtu(usize::from(parameters.mtu))
+                    .set_mtu(usize::from(next_parameters.mtu))
                     .map_err(|error| {
                         ClientError::Platform(format!("failed to restore Wintun MTU: {error}"))
                     })?;
@@ -136,11 +131,27 @@ pub fn run_with_stop(
                     Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).map_err(
                         |error| ClientError::Platform(format!("failed to restart Wintun: {error}")),
                     )?);
-                Ok((next_incoming, next_outgoing, next_plane, next_session))
+                Ok((
+                    next_incoming,
+                    next_outgoing,
+                    next_plane,
+                    next_session,
+                    next_parameters,
+                ))
             })();
 
             match attempt {
-                Ok((next_incoming, next_outgoing, next_plane, next_session)) => {
+                Ok((next_incoming, next_outgoing, next_plane, next_session, next_parameters)) => {
+                    if next_parameters != parameters {
+                        if let Err(error) = network.update_parameters(next_parameters) {
+                            let _ = adapter.set_mtu(usize::from(parameters.mtu));
+                            eprintln!("MOUSEVPN_RUNTIME_WARNING={error}");
+                            restart_backoff = (restart_backoff * 2).min(RESTART_BACKOFF_MAX);
+                            continue;
+                        }
+                        parameters = next_parameters;
+                        eprintln!("MOUSEVPN_STATE=parameters_updated");
+                    }
                     transports = (next_incoming, next_outgoing, next_plane);
                     session = next_session;
                     restart_backoff = RESTART_BACKOFF_MIN;

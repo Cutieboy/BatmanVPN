@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, Sender, TryRecvError},
@@ -22,11 +23,14 @@ use crate::{
 };
 
 const PACKET_BUFFER_LEN: usize = 65_535;
+const BATCH_SIZE: usize = 32;
+const MIGRATION_ATTEMPTS: usize = 3;
+const MIGRATION_POLL: Duration = Duration::from_millis(500);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 enum ReceiveEvent {
-    Packet(usize),
+    Packets,
     Idle,
     PeerUnavailable,
 }
@@ -55,7 +59,10 @@ pub(crate) struct PacketLoop<'a> {
 
 impl PacketLoop<'_> {
     pub(crate) fn run(mut self) -> Result<(), ClientError> {
-        let mut datagram = vec![0_u8; PACKET_BUFFER_LEN];
+        let mut datagrams: Vec<Vec<u8>> = (0..BATCH_SIZE)
+            .map(|_| vec![0_u8; PACKET_BUFFER_LEN])
+            .collect();
+        let mut lengths = Vec::with_capacity(BATCH_SIZE);
         // Reused across packets: the receive path allocates nothing in steady state.
         let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
         let mut keepalive = Vec::with_capacity(128);
@@ -64,22 +71,24 @@ impl PacketLoop<'_> {
 
         while !self.stopping.load(Ordering::Relaxed) {
             check_worker(&self.worker, &self.stopping)?;
-            match self.receive(&mut datagram)? {
-                ReceiveEvent::Packet(length) => {
-                    if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
-                        match self.receiver.decode_into(parsed, &mut plaintext) {
-                            Ok(Decoded::Ip(packet)) => {
-                                liveness.packet_received(Instant::now());
-                                // A failed TUN write costs one packet; the
-                                // tunnel itself stays up.
-                                if let Err(error) = self.tun.send(packet) {
-                                    if !is_recoverable(&error) {
-                                        return Err(error.into());
+            match self.receive(&mut datagrams, &mut lengths)? {
+                ReceiveEvent::Packets => {
+                    for (datagram, &length) in datagrams.iter().zip(&lengths) {
+                        if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
+                            match self.receiver.decode_into(parsed, &mut plaintext) {
+                                Ok(Decoded::Ip(packet)) => {
+                                    liveness.packet_received(Instant::now());
+                                    // A failed TUN write costs one packet; the
+                                    // tunnel itself stays up.
+                                    if let Err(error) = self.tun.send(packet) {
+                                        if !is_recoverable(&error) {
+                                            return Err(error.into());
+                                        }
                                     }
                                 }
+                                Ok(Decoded::Keepalive) => liveness.packet_received(Instant::now()),
+                                Err(_) => {}
                             }
-                            Ok(Decoded::Keepalive) => liveness.packet_received(Instant::now()),
-                            Err(_) => {}
                         }
                     }
                 }
@@ -105,9 +114,13 @@ impl PacketLoop<'_> {
         Ok(())
     }
 
-    fn receive(&mut self, datagram: &mut [u8]) -> Result<ReceiveEvent, ClientError> {
-        match self.transport.receive(datagram) {
-            Ok(length) => Ok(ReceiveEvent::Packet(length)),
+    fn receive(
+        &mut self,
+        datagrams: &mut [Vec<u8>],
+        lengths: &mut Vec<usize>,
+    ) -> Result<ReceiveEvent, ClientError> {
+        match self.transport.receive_batch(datagrams, lengths) {
+            Ok(()) => Ok(ReceiveEvent::Packets),
             Err(error)
                 if error.kind() == io::ErrorKind::Interrupted
                     && self.stopping.load(Ordering::Relaxed) =>
@@ -171,7 +184,10 @@ impl PacketLoop<'_> {
             }
         }
         liveness.reconnect_attempted(now);
-        match self.establish_replacement() {
+        match self.try_migrate().or_else(|migration_error| {
+            eprintln!("MOUSEVPN_MIGRATION_WARNING={migration_error}");
+            self.establish_replacement()
+        }) {
             Ok(()) => {
                 liveness.reconnected(Instant::now());
                 eprintln!("MOUSEVPN_STATE=reconnected");
@@ -203,6 +219,57 @@ impl PacketLoop<'_> {
         self.session_generation.fetch_add(1, Ordering::Relaxed);
         self.reconnect_requested.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn try_migrate(&mut self) -> Result<(), ClientError> {
+        let local = match self.config.server {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0_u16; 8], 0)),
+        };
+        let mut replacement = UdpTransport::bind(local, self.config.server)?;
+        replacement.set_read_timeout(Some(MIGRATION_POLL))?;
+        let mut keepalive = Vec::with_capacity(128);
+        let mut datagram = vec![0_u8; PACKET_BUFFER_LEN];
+        let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
+
+        for _ in 0..MIGRATION_ATTEMPTS {
+            self.sender
+                .lock()
+                .map_err(|_| ClientError::WorkerStopped)?
+                .encode_keepalive_into(&mut keepalive)?;
+            replacement.send(&keepalive)?;
+            match replacement.receive(&mut datagram) {
+                Ok(length) => {
+                    let parsed = Datagram::decode(&datagram[..length])
+                        .map_err(|_| io::Error::other("invalid migration response"))?;
+                    match self.receiver.decode_into(parsed, &mut plaintext) {
+                        Ok(Decoded::Keepalive) => {}
+                        Ok(Decoded::Ip(packet)) => {
+                            if let Err(error) = self.tun.send(packet) {
+                                if !is_recoverable(&error) {
+                                    return Err(error.into());
+                                }
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    replacement.set_read_timeout(Some(POLL_INTERVAL))?;
+                    let outgoing = replacement.try_clone()?;
+                    self.outgoing_transport
+                        .send(outgoing)
+                        .map_err(|_| ClientError::WorkerStopped)?;
+                    self.transport = replacement;
+                    self.session_generation.fetch_add(1, Ordering::Relaxed);
+                    self.reconnect_requested.store(0, Ordering::Relaxed);
+                    eprintln!("MOUSEVPN_STATE=migrated");
+                    return Ok(());
+                }
+                Err(error) if is_timeout(&error) || is_peer_unavailable(&error) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "fast migration timed out").into())
     }
 
     fn apply_session_parameters(

@@ -2298,6 +2298,7 @@ dependencies = [
  "mousevpn-linux-platform",
  "mousevpn-protocol",
  "mousevpn-transport",
+ "nix 0.30.1",
  "signal-hook",
  "socket2",
  "tokio",
@@ -2371,6 +2372,7 @@ dependencies = [
  "mousevpn-linux-platform",
  "mousevpn-protocol",
  "mousevpn-transport",
+ "nix 0.30.1",
  "socket2",
 ]
 
@@ -2378,6 +2380,7 @@ dependencies = [
 name = "mousevpn-transport"
 version = "0.1.0"
 dependencies = [
+ "nix 0.30.1",
  "socket2",
 ]
 

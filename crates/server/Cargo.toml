@@ -13,6 +13,7 @@ mousevpn-data-plane = { path = "../data-plane" }
 mousevpn-linux-platform = { path = "../linux-platform" }
 mousevpn-protocol = { path = "../protocol" }
 mousevpn-transport = { path = "../transport" }
+nix = { version = "0.30", features = ["net", "poll", "socket", "uio"] }
 socket2 = "0.6"
 
 [dev-dependencies]

@@ -66,6 +66,7 @@ pub(crate) struct NetworkGuard {
     refresh_lock: Arc<Mutex<()>>,
     app_routing: AppRoutingPolicy,
     app_bypass: Option<AppBypassGuard>,
+    parameters: SessionParameters,
 }
 
 #[derive(Clone)]
@@ -126,7 +127,45 @@ impl NetworkGuard {
             refresh_lock: Arc::new(Mutex::new(())),
             app_routing: app_routing.clone(),
             app_bypass,
+            parameters,
         })
+    }
+
+    pub(crate) fn update_parameters(
+        &mut self,
+        parameters: SessionParameters,
+    ) -> Result<(), ClientError> {
+        if parameters == self.parameters {
+            return Ok(());
+        }
+        let _guard = self.refresh_lock.lock().map_err(|_| {
+            ClientError::Platform("Windows network policy refresh lock was poisoned".to_owned())
+        })?;
+        let previous = self.parameters;
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
+             try {{ \
+               Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop; \
+               New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} -ErrorAction Stop | Out-Null; \
+               Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}' -ErrorAction Stop \
+             }} catch {{ \
+               $applyError=$_.Exception.Message; \
+               Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; \
+               New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} -ErrorAction Stop | Out-Null; \
+               Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}' -ErrorAction Stop; \
+               throw ('updating MouseVPN session parameters failed: '+$applyError) \
+             }}",
+            parameters.client_address,
+            parameters.prefix_len,
+            parameters.dns,
+            previous.client_address,
+            previous.prefix_len,
+            previous.dns,
+        );
+        run_powershell(&script, "update the Windows tunnel parameters")?;
+        self.parameters = parameters;
+        Ok(())
     }
 
     pub(crate) fn refresh(&self) -> Result<(), ClientError> {

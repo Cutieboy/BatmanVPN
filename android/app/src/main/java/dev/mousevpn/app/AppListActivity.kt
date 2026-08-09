@@ -4,8 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
-import android.graphics.drawable.Drawable
 import android.os.Bundle
+import android.util.LruCache
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -17,11 +17,11 @@ import android.widget.ListView
 import android.widget.RadioButton
 import android.widget.TextView
 import android.widget.Toast
+import java.util.concurrent.Executors
 
 private data class InstalledApp(
     val packageName: String,
     val label: String,
-    val icon: Drawable,
 )
 
 /** Lets the user choose which apps use or bypass the tunnel. */
@@ -32,6 +32,8 @@ class AppListActivity : Activity() {
     private var mode = AppRoutingMode.EXCLUDE
     private var query = ""
     private var selectedOnly = false
+    private val loader = Executors.newSingleThreadExecutor()
+    private val icons = LruCache<String, android.graphics.drawable.Drawable>(64)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,8 +44,14 @@ class AppListActivity : Activity() {
         mode = policy.mode
         selected.addAll(policy.packages)
 
-        adapter = AppAdapter(loadApps())
+        adapter = AppAdapter(emptyList())
         findViewById<ListView>(R.id.appList).adapter = adapter
+        loader.execute {
+            val apps = loadApps()
+            runOnUiThread {
+                if (!isDestroyed) adapter.replace(apps)
+            }
+        }
         findViewById<RadioButton>(R.id.modeExclude).apply {
             isChecked = mode == AppRoutingMode.EXCLUDE
             setOnClickListener { setMode(AppRoutingMode.EXCLUDE) }
@@ -72,6 +80,11 @@ class AppListActivity : Activity() {
             adapter.applyFilter(query, selectedOnly)
         }
         findViewById<Button>(R.id.saveExclusions).setOnClickListener { save() }
+    }
+
+    override fun onDestroy() {
+        loader.shutdownNow()
+        super.onDestroy()
     }
 
     private fun save() {
@@ -120,7 +133,6 @@ class AppListActivity : Activity() {
         return InstalledApp(
             packageName = info.packageName,
             label = manager.getApplicationLabel(info).toString(),
-            icon = manager.getApplicationIcon(info),
         )
     }
 
@@ -132,8 +144,14 @@ class AppListActivity : Activity() {
         )
     }
 
-    private inner class AppAdapter(private val allApps: List<InstalledApp>) : BaseAdapter() {
+    private inner class AppAdapter(initialApps: List<InstalledApp>) : BaseAdapter() {
+        private var allApps = initialApps
         private var apps = allApps
+
+        fun replace(loaded: List<InstalledApp>) {
+            allApps = loaded
+            applyFilter(query, selectedOnly)
+        }
 
         fun applyFilter(query: String, selectedOnly: Boolean) {
             val needle = query.trim().lowercase()
@@ -158,7 +176,21 @@ class AppListActivity : Activity() {
             val view = convertView
                 ?: layoutInflater.inflate(R.layout.item_app, parent, false)
             val app = apps[position]
-            view.findViewById<ImageView>(R.id.appIcon).setImageDrawable(app.icon)
+            val icon = view.findViewById<ImageView>(R.id.appIcon)
+            icon.tag = app.packageName
+            val cached = synchronized(icons) { icons.get(app.packageName) }
+            icon.setImageDrawable(cached ?: packageManager.defaultActivityIcon)
+            if (cached == null) {
+                loader.execute {
+                    val loaded = runCatching {
+                        packageManager.getApplicationIcon(app.packageName)
+                    }.getOrNull() ?: return@execute
+                    synchronized(icons) { icons.put(app.packageName, loaded) }
+                    runOnUiThread {
+                        if (icon.tag == app.packageName) icon.setImageDrawable(loaded)
+                    }
+                }
+            }
             view.findViewById<TextView>(R.id.appLabel).text = app.label
             view.findViewById<TextView>(R.id.appPackage).text = app.packageName
             val checkBox = view.findViewById<CheckBox>(R.id.appExcluded)

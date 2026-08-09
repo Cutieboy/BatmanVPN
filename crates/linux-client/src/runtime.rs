@@ -108,6 +108,7 @@ fn run_mode(
         })
         .map_err(|error| context("creating the MouseVPN tunnel", &error))?,
     );
+    enable_nonblocking(&tun)?;
     let tun_name = tun.name()?;
     // The two directions share no mutable state; only reconnect swaps the
     // sender, so the send path is uncontended and the receive path is lock-free.
@@ -207,6 +208,11 @@ pub fn repair_stale_network(server: std::net::Ipv4Addr) -> Result<(), ClientErro
 
 fn context(operation: &str, error: &std::io::Error) -> std::io::Error {
     std::io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
+fn enable_nonblocking(tun: &LinuxTun) -> Result<(), ClientError> {
+    tun.set_nonblocking(true)
+        .map_err(|error| context("enabling nonblocking TUN reads", &error).into())
 }
 
 fn ipv4_server(config: &ValidatedClientConfig) -> Result<std::net::Ipv4Addr, ClientError> {

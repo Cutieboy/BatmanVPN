@@ -9,18 +9,26 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
 class MouseVpnService : VpnService() {
     private val executor = Executors.newSingleThreadExecutor()
+    private val stopExecutor = Executors.newSingleThreadExecutor()
+    private val networkHandler = Handler(Looper.getMainLooper())
     private var task: Future<*>? = null
     @Volatile private var handle = 0L
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = signalNetworkChange()
 
         override fun onLost(network: Network) = signalNetworkChange()
+    }
+    private val signalNetworkChange = Runnable {
+        val current = handle
+        if (current != 0L) NativeBridge.networkChanged(current)
     }
 
     override fun onCreate() {
@@ -175,7 +183,16 @@ class MouseVpnService : VpnService() {
 
     private fun monitor(currentHandle: Long) {
         while (!Thread.currentThread().isInterrupted && handle == currentHandle) {
-            if (NativeBridge.status(currentHandle) != "running") {
+            val nativeStatus = NativeBridge.status(currentHandle)
+            if (nativeStatus == "parameters-changed") {
+                NativeBridge.stop(currentHandle)
+                handle = 0L
+                connectedSinceElapsedRealtime = 0L
+                broadcast("Подключение…")
+                connect()
+                return
+            }
+            if (nativeStatus != "running") {
                 NativeBridge.stop(currentHandle)
                 handle = 0L
                 connectedSinceElapsedRealtime = 0L
@@ -196,7 +213,7 @@ class MouseVpnService : VpnService() {
         val current = handle
         handle = 0L
         connectedSinceElapsedRealtime = 0L
-        if (current != 0L) NativeBridge.stop(current)
+        stopNativeAsync(current)
         task?.cancel(true)
         task = null
         broadcast("Отключено")
@@ -214,8 +231,12 @@ class MouseVpnService : VpnService() {
     }
 
     private fun signalNetworkChange() {
-        val current = handle
-        if (current != 0L) NativeBridge.networkChanged(current)
+        networkHandler.removeCallbacks(signalNetworkChange)
+        networkHandler.postDelayed(signalNetworkChange, NETWORK_CHANGE_DEBOUNCE_MS)
+    }
+
+    private fun stopNativeAsync(current: Long) {
+        if (current != 0L) stopExecutor.execute { NativeBridge.stop(current) }
     }
 
     override fun onRevoke() {
@@ -227,11 +248,14 @@ class MouseVpnService : VpnService() {
         val current = handle
         handle = 0L
         connectedSinceElapsedRealtime = 0L
-        if (current != 0L) NativeBridge.stop(current)
+        networkHandler.removeCallbacks(signalNetworkChange)
+        stopNativeAsync(current)
         runCatching {
             getSystemService(ConnectivityManager::class.java)
                 .unregisterNetworkCallback(networkCallback)
         }
+        executor.shutdownNow()
+        stopExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -252,6 +276,7 @@ class MouseVpnService : VpnService() {
 
         /** Floor for the tunnel MTU; every path is expected to carry this. */
         private const val MINIMUM_MTU = 1_280
+        private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
 
         const val ACTION_CONNECT = "dev.mousevpn.app.CONNECT"
         const val ACTION_DISCONNECT = "dev.mousevpn.app.DISCONNECT"

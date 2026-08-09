@@ -14,8 +14,9 @@ protocol implementation.
 - marks the dedicated tunnel as a Public network for Store/UWP network
   isolation compatibility;
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
-- supports application denylist and allowlist routing, with searchable saved
-  executable paths, through a small WFP bind/connect redirection driver;
+- currently ships as a full-tunnel client; application denylist/allowlist UI is
+  hidden until the WFP callout driver has production signing and is included in
+  the complete installer;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving
@@ -24,6 +25,8 @@ protocol implementation.
   runtime after an unexpected fatal packet-path error;
 - keeps running in the Windows notification area when its main window is
   closed, with show, connect/disconnect and quit actions;
+- can register an elevated Task Scheduler logon task and start minimized in
+  the notification area without showing a UAC prompt on every launch;
 - starts the tunnel helper and Windows networking commands without visible
   console windows;
 - keeps a rotated helper diagnostic log under

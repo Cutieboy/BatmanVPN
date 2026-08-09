@@ -11,12 +11,17 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::{Datagram, SessionParameters};
 use mousevpn_transport::{DatagramTransport, UdpTransport};
+use windows_sys::Win32::{
+    Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::WaitForSingleObject,
+};
 use wintun::Session;
 
 use crate::{
     handshake::negotiate,
     liveness::{Action, Liveness},
     network::NetworkGuard,
+    network_events::NetworkEventGuard,
     ClientError,
 };
 
@@ -33,13 +38,15 @@ pub(crate) fn run(
     parameters: SessionParameters,
     session: &Arc<Session>,
     stopping: &Arc<AtomicBool>,
-    network: &NetworkGuard,
+    network: &mut NetworkGuard,
 ) -> Result<(), ClientError> {
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
     let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let _network_events =
+        NetworkEventGuard::subscribe(&session.get_adapter(), Arc::clone(&reconnect_requested))?;
     let outgoing_worker = spawn_outgoing(
         Arc::clone(session),
         outgoing,
@@ -92,7 +99,7 @@ struct IncomingLoop<'a> {
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
-    network: &'a NetworkGuard,
+    network: &'a mut NetworkGuard,
     wintun_send_drops: u64,
 }
 
@@ -194,9 +201,24 @@ impl IncomingLoop<'_> {
         match result {
             Ok((replacement, parameters)) => {
                 if parameters != self.parameters {
-                    return Err(ClientError::Platform(
-                        "server changed tunnel parameters during reconnect".to_owned(),
-                    ));
+                    let adapter = self.session.get_adapter();
+                    let previous = self.parameters;
+                    adapter
+                        .set_mtu(usize::from(parameters.mtu))
+                        .map_err(|error| {
+                            ClientError::Platform(format!("failed to update Wintun MTU: {error}"))
+                        })?;
+                    if let Err(error) = self.network.update_parameters(parameters) {
+                        let rollback = adapter.set_mtu(usize::from(previous.mtu));
+                        return match rollback {
+                            Ok(()) => Err(error),
+                            Err(rollback) => Err(ClientError::Platform(format!(
+                                "updating Windows tunnel parameters failed: {error}; MTU rollback failed: {rollback}"
+                            ))),
+                        };
+                    }
+                    self.parameters = parameters;
+                    eprintln!("MOUSEVPN_STATE=parameters_updated");
                 }
                 let (sender, receiver) = replacement.split();
                 *self.sender.lock().map_err(|_| poisoned_sender())? = sender;
@@ -261,43 +283,73 @@ fn spawn_outgoing(
     result_tx: mpsc::SyncSender<Result<(), ClientError>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut encrypted = Vec::new();
+        const BATCH_SIZE: usize = 32;
+        const WAIT_MS: u32 = 100;
+        let mut encrypted: Vec<Vec<u8>> = (0..BATCH_SIZE).map(|_| Vec::new()).collect();
         let mut dropped_packets = 0_u64;
         let result = (|| {
             while !stopping.load(Ordering::Acquire) {
-                let packet = session.receive_blocking().map_err(|error| {
-                    ClientError::Platform(format!("failed to receive a Wintun packet: {error}"))
-                })?;
-                if reconnecting.load(Ordering::Acquire)
-                    || packet.bytes().first().map(|byte| byte >> 4) != Some(4)
-                {
+                if reconnecting.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                let mut locked = sender.lock().map_err(|_| poisoned_sender())?;
-                match locked.encode_ip_into(packet.bytes(), &mut encrypted) {
-                    Ok(()) => {}
-                    Err(DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_)) => {
-                        note_packet_drop(
-                            &mut dropped_packets,
-                            "Windows supplied an invalid or oversized IPv4 packet",
-                        );
+                let read_event = session.get_read_wait_event().map_err(|error| {
+                    ClientError::Platform(format!("failed to get Wintun read event: {error}"))
+                })?;
+                match unsafe { WaitForSingleObject(read_event as _, WAIT_MS) } {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => continue,
+                    WAIT_FAILED => {
+                        return Err(ClientError::Platform(
+                            "waiting for Wintun packets failed".to_owned(),
+                        ));
+                    }
+                    result => {
+                        return Err(ClientError::Platform(format!(
+                            "unexpected Wintun wait result: {result}"
+                        )));
+                    }
+                }
+                if reconnecting.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                let mut encoded = 0;
+                while encoded < BATCH_SIZE {
+                    let Some(packet) = session.try_receive().map_err(|error| {
+                        ClientError::Platform(format!("failed to receive a Wintun packet: {error}"))
+                    })?
+                    else {
+                        break;
+                    };
+                    if packet.bytes().first().map(|byte| byte >> 4) != Some(4) {
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
-                }
-                drop(locked);
-                match transport.send(&encrypted) {
-                    Ok(()) => {}
-                    Err(error) if is_peer_unavailable(&error) => {
-                        reconnect_requested.store(true, Ordering::Release);
+                    let mut locked = sender.lock().map_err(|_| poisoned_sender())?;
+                    match locked.encode_ip_into(packet.bytes(), &mut encrypted[encoded]) {
+                        Ok(()) => encoded += 1,
+                        Err(DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_)) => {
+                            note_packet_drop(
+                                &mut dropped_packets,
+                                "Windows supplied an invalid or oversized IPv4 packet",
+                            );
+                        }
+                        Err(error) => return Err(error.into()),
                     }
-                    Err(error) if is_transient_io(&error) => {
-                        note_packet_drop(
+                }
+                for datagram in &encrypted[..encoded] {
+                    match transport.send(datagram) {
+                        Ok(()) => {}
+                        Err(error) if is_peer_unavailable(&error) => {
+                            reconnect_requested.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(error) if is_transient_io(&error) => note_packet_drop(
                             &mut dropped_packets,
                             "UDP send queue is temporarily unavailable",
-                        );
+                        ),
+                        Err(error) => return Err(error.into()),
                     }
-                    Err(error) => return Err(error.into()),
                 }
             }
             Ok(())

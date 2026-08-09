@@ -1,4 +1,9 @@
-use std::{io, net::Ipv4Addr, sync::Mutex};
+use std::{
+    io,
+    net::Ipv4Addr,
+    os::fd::{AsFd, BorrowedFd},
+    sync::Mutex,
+};
 
 use mousevpn_data_plane::PacketDevice;
 use tun_rs::{DeviceBuilder, SyncDevice};
@@ -47,6 +52,20 @@ impl LinuxTun {
     /// Returns an I/O error when the interface name cannot be queried.
     pub fn name(&self) -> io::Result<String> {
         self.device.name()
+    }
+
+    /// Selects blocking or nonblocking packet reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor flags cannot be updated.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.device.set_nonblocking(nonblocking)
+    }
+
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.device.as_fd()
     }
 
     /// Atomically updates the IPv4 address and MTU as far as the platform API
