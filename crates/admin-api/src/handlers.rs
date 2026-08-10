@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use mousevpn_config::encode_secret_key;
 use mousevpn_profile_cli::{encrypt_profile, PortableProfile};
+use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
@@ -14,7 +15,13 @@ use crate::{
         CreateDeviceRequest, DeviceSummary, HealthResponse, ProvisionDeviceResponse, RevokeResponse,
     },
     state::ApiState,
+    traffic::{TrafficReport, MAX_QUERY_HOURS},
 };
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct TrafficQuery {
+    hours: Option<u64>,
+}
 
 pub(crate) async fn health(
     State(state): State<ApiState>,
@@ -37,6 +44,25 @@ pub(crate) async fn list_devices(
         .map(DeviceSummary::from)
         .collect();
     Ok(Json(devices))
+}
+
+pub(crate) async fn traffic(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<TrafficQuery>,
+) -> Result<Json<TrafficReport>, ApiError> {
+    authenticate(&headers, &state)?;
+    let hours = query.hours.unwrap_or(24);
+    if hours == 0 || hours > MAX_QUERY_HOURS {
+        return Err(ApiError::bad_request(format!(
+            "hours must be between 1 and {MAX_QUERY_HOURS}"
+        )));
+    }
+    state
+        .traffic
+        .report(hours)
+        .map(Json)
+        .map_err(ApiError::internal_with)
 }
 
 pub(crate) async fn provision_device(

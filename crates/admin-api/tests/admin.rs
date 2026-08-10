@@ -7,6 +7,7 @@ use axum::{
 use http_body_util::BodyExt;
 use mousevpn_admin_api::{
     router, AdminSettings, AdminToken, DevicePlatform, SeedDevice, SharedDeviceRegistry,
+    TrafficStore,
 };
 use mousevpn_config::decode_public_key;
 use mousevpn_crypto::KeyPair;
@@ -95,6 +96,7 @@ fn revocation_disables_an_existing_session_flag() {
 fn test_router(temporary: &TempDir) -> axum::Router {
     router(
         registry(temporary.path()),
+        TrafficStore::open(temporary.path().join("traffic.toml")).expect("traffic store"),
         AdminToken::new(TOKEN).expect("admin token"),
         AdminSettings {
             public_endpoint: "198.51.100.10:51820"
@@ -104,6 +106,31 @@ fn test_router(temporary: &TempDir) -> axum::Router {
             tun_name: "mousevpn0".to_owned(),
         },
     )
+}
+
+#[tokio::test]
+async fn returns_authenticated_traffic_report() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let traffic = TrafficStore::open(temporary.path().join("traffic.toml")).expect("traffic store");
+    let counter = traffic.counter("phone-key", "Alice phone");
+    counter.add_upload(1_024);
+    counter.add_download(2_048);
+    let app = router(
+        registry(temporary.path()),
+        traffic,
+        AdminToken::new(TOKEN).expect("admin token"),
+        AdminSettings {
+            public_endpoint: "198.51.100.10:51820".parse().expect("endpoint"),
+            server_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            tun_name: "mousevpn0".to_owned(),
+        },
+    );
+
+    let report = send_json(&app, Method::GET, "/v1/traffic?hours=24", None).await;
+    assert_eq!(report["totals"]["hour"]["upload_bytes"], 1_024);
+    assert_eq!(report["totals"]["day"]["download_bytes"], 2_048);
+    assert_eq!(report["hourly"].as_array().expect("hourly").len(), 24);
+    assert_eq!(report["devices"][0]["name"], "Alice phone");
 }
 
 fn registry(directory: &Path) -> SharedDeviceRegistry {

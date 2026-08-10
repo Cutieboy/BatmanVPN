@@ -11,7 +11,8 @@ use std::{
 };
 
 use mousevpn_admin_api::{
-    AdminSettings, AdminToken, DeviceAuthorization, SeedDevice, SharedDeviceRegistry,
+    AdminSettings, AdminToken, DeviceAuthorization, DeviceTrafficCounter, SeedDevice,
+    SharedDeviceRegistry, TrafficStore,
 };
 use mousevpn_config::{
     encode_public_key, ValidatedServerConfig, DEFAULT_TUN_MTU, MAX_SAFE_TUN_MTU,
@@ -42,6 +43,7 @@ const IPV4_UDP_OVERHEAD: usize = 28;
 struct RuntimeSession {
     client_address: Ipv4Addr,
     authorization: DeviceAuthorization,
+    traffic: Arc<DeviceTrafficCounter>,
     /// Current client endpoint, replaced only after a packet authenticates.
     peer: RwLock<SocketAddr>,
     /// Client-to-server direction, driven by the UDP loop alone.
@@ -122,6 +124,14 @@ struct CachedHandshake {
     response: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct HandshakeServices<'a> {
+    config: &'a ValidatedServerConfig,
+    authorized: &'a SharedDeviceRegistry,
+    traffic: &'a TrafficStore,
+    sessions: &'a SessionMap,
+}
+
 /// Creates the server TUN/UDP endpoints and runs until a fatal I/O error.
 ///
 /// # Errors
@@ -142,7 +152,9 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     setsockopt(&socket, RxqOvfl, &1).map_err(io::Error::from)?;
     let sessions: SessionMap = Arc::new(RwLock::new(Sessions::default()));
     let authorized = open_device_registry(config)?;
-    start_admin_if_configured(config, &authorized)?;
+    let traffic = open_traffic_store()?;
+    traffic.spawn_flusher(Duration::from_secs(10));
+    start_admin_if_configured(config, &authorized, &traffic)?;
     let mut handshake_limiter = HandshakeLimiter::new(50, Duration::from_secs(60));
     let mut handshake_cache: HashMap<PublicKey, CachedHandshake> = HashMap::new();
 
@@ -192,9 +204,12 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
                         &socket,
                         peer,
                         datagram,
-                        config,
-                        &authorized,
-                        &sessions,
+                        HandshakeServices {
+                            config,
+                            authorized: &authorized,
+                            traffic: &traffic,
+                            sessions: &sessions,
+                        },
                         &mut handshake_cache,
                     );
                 }
@@ -343,13 +358,13 @@ fn handle_handshake(
     socket: &UdpSocket,
     peer: SocketAddr,
     datagram: Datagram<'_>,
-    config: &ValidatedServerConfig,
-    authorized: &SharedDeviceRegistry,
-    sessions: &SessionMap,
+    services: HandshakeServices<'_>,
     cache: &mut HashMap<PublicKey, CachedHandshake>,
 ) {
-    let Ok(mut handshake) = ServerHandshake::new(&config.server_private_key, &config.context)
-    else {
+    let Ok(mut handshake) = ServerHandshake::new(
+        &services.config.server_private_key,
+        &services.config.context,
+    ) else {
         return;
     };
     if handshake.read_initial(datagram.payload).is_err() {
@@ -358,7 +373,7 @@ fn handle_handshake(
     let Some(public_key) = handshake.peer_static_key() else {
         return;
     };
-    let Some(client) = authorized.authorize(&public_key) else {
+    let Some(client) = services.authorized.authorize(&public_key) else {
         return;
     };
 
@@ -374,29 +389,32 @@ fn handle_handshake(
 
     let parameters = SessionParameters {
         client_address: client.address,
-        prefix_len: config.tun.prefix_len,
-        mtu: config.tun.mtu,
-        dns: config.tun.dns,
+        prefix_len: services.config.tun.prefix_len,
+        mtu: services.config.tun.mtu,
+        dns: services.config.tun.dns,
     };
     let Ok((crypto, response)) = handshake.finish(&parameters.encode()) else {
         return;
     };
     let (sender, receiver) = TunnelDataPlane::new(
         datagram.header.session_id,
-        usize::from(config.tun.mtu),
+        usize::from(services.config.tun.mtu),
         crypto,
     )
     .split();
     let session = Arc::new(RuntimeSession {
         client_address: client.address,
         authorization: client.authorization,
+        traffic: services
+            .traffic
+            .counter(&encode_public_key(&client.public_key), &client.name),
         peer: RwLock::new(peer),
         inbound: Mutex::new(receiver),
         outbound: Mutex::new(sender),
         last_peer_log: Mutex::new(None),
     });
 
-    let Ok(mut guard) = sessions.write() else {
+    let Ok(mut guard) = services.sessions.write() else {
         return;
     };
     guard.replace_client(datagram.header.session_id, session);
@@ -448,8 +466,10 @@ fn handle_client_data(
     if ip.source() != session.client_address {
         return;
     }
-    let _ = tun.send(packet);
-    session.adopt_peer(peer);
+    if tun.send(packet).is_ok() {
+        session.traffic.add_upload(packet.len() as u64);
+        session.adopt_peer(peer);
+    }
 }
 
 fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap) {
@@ -462,6 +482,8 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
             .collect();
         let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
         let mut peers = Vec::with_capacity(UDP_BATCH_SIZE);
+        let mut traffic = Vec::with_capacity(UDP_BATCH_SIZE);
+        let mut payload_lengths = Vec::with_capacity(UDP_BATCH_SIZE);
         let mut send_headers = MultiHeaders::preallocate(UDP_BATCH_SIZE, None);
         loop {
             let mut descriptor = [PollFd::new(tun.as_fd(), PollFlags::POLLIN)];
@@ -488,6 +510,8 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
             }
 
             peers.clear();
+            traffic.clear();
+            payload_lengths.clear();
             let mut datagram_count = 0;
             for index in 0..packet_count {
                 let packet = &packets[index][..packet_lengths[index]];
@@ -515,6 +539,8 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
                     }
                 }
                 peers.push(peer);
+                traffic.push(Arc::clone(&session.traffic));
+                payload_lengths.push(ip.as_bytes().len() as u64);
                 datagram_count += 1;
             }
             if datagram_count == 0 {
@@ -538,7 +564,7 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
             );
             match send_result {
                 Ok(results) => {
-                    let _complete_batch = results.count() == datagram_count;
+                    record_downloads(results.count(), &traffic, &payload_lengths);
                 }
                 Err(error) if !is_recoverable(&io::Error::from(error)) => {
                     eprintln!("MouseVPN TUN worker stopped: {error}");
@@ -548,6 +574,12 @@ fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap)
             }
         }
     });
+}
+
+fn record_downloads(sent: usize, traffic: &[Arc<DeviceTrafficCounter>], payload_lengths: &[u64]) {
+    for index in 0..sent {
+        traffic[index].add_download(payload_lengths[index]);
+    }
 }
 
 fn open_device_registry(
@@ -570,9 +602,18 @@ fn open_device_registry(
         .map_err(|error| ServerDaemonError::Configuration(error.to_string()))
 }
 
+fn open_traffic_store() -> Result<TrafficStore, ServerDaemonError> {
+    let path = env::var_os("MOUSEVPN_TRAFFIC_STORE").map_or_else(
+        || PathBuf::from("/var/lib/mousevpn/traffic.toml"),
+        PathBuf::from,
+    );
+    TrafficStore::open(path).map_err(|error| ServerDaemonError::Configuration(error.to_string()))
+}
+
 fn start_admin_if_configured(
     config: &ValidatedServerConfig,
     registry: &SharedDeviceRegistry,
+    traffic: &TrafficStore,
 ) -> Result<(), ServerDaemonError> {
     let Some(raw_token) = load_admin_token()? else {
         eprintln!("MouseVPN admin disabled: /etc/mousevpn/admin.token does not exist");
@@ -614,7 +655,7 @@ fn start_admin_if_configured(
         server_public_key: encode_public_key(&config.server_public_key),
         tun_name: config.tun.name.clone(),
     };
-    mousevpn_admin_api::spawn(listen, registry.clone(), token, settings)?;
+    mousevpn_admin_api::spawn(listen, registry.clone(), traffic.clone(), token, settings)?;
     Ok(())
 }
 

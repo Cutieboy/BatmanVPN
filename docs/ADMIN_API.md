@@ -30,7 +30,9 @@ the browser tab's `sessionStorage`.
 - `GET /v1/health` — authenticated health check;
 - `GET /v1/devices` — list registered devices;
 - `POST /v1/devices` — create an independently revocable Android or Linux key;
-- `DELETE /v1/devices/{public_key}` — revoke a key immediately.
+- `DELETE /v1/devices/{public_key}` — revoke a key immediately;
+- `GET /v1/traffic?hours=24` — hourly totals and per-device traffic for
+  the selected period (1–744 hours), plus current-hour, 24-hour and 7-day totals.
 
 Example creation request:
 
@@ -49,6 +51,13 @@ The persistent public device registry lives at
 `/var/lib/mousevpn/devices.toml`. Updates are atomically replaced on disk.
 Revocation flips an atomic authorization flag held by active sessions, so no
 registry lock, Base64 decoding, or disk access occurs on the packet hot path.
+
+Hourly traffic history lives at `/var/lib/mousevpn/traffic.toml` and is retained
+for 400 days. The server counts successfully forwarded inner IPv4 bytes (not
+UDP, encryption or keepalive overhead) with per-device atomic counters and
+flushes them to the private, atomically replaced store every 10 seconds. Set
+`MOUSEVPN_TRAFFIC_STORE` to override the path. A crash can lose at most the
+currently unflushed interval; normal API reports include pending counters.
 
 ## Opt-in public endpoint
 

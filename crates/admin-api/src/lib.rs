@@ -7,6 +7,7 @@ mod models;
 mod registry;
 mod registry_store;
 mod state;
+mod traffic;
 mod ui;
 
 use std::{io, net::SocketAddr, thread};
@@ -17,7 +18,7 @@ use axum::{
 };
 
 pub use auth::{AdminToken, TokenError};
-use handlers::{health, list_devices, provision_device, revoke_device};
+use handlers::{health, list_devices, provision_device, revoke_device, traffic};
 pub use registry::{
     DeviceAuthorization, DeviceLease, DevicePlatform, DeviceRecord, ProvisionedDevice, SeedDevice,
     SharedDeviceRegistry,
@@ -25,19 +26,22 @@ pub use registry::{
 pub use registry_store::RegistryError;
 pub use state::AdminSettings;
 use state::ApiState;
+pub use traffic::{DeviceTrafficCounter, TrafficError, TrafficStore};
 use ui::admin_page;
 
 pub fn router(
     registry: SharedDeviceRegistry,
+    traffic_store: TrafficStore,
     token: AdminToken,
     settings: AdminSettings,
 ) -> Router {
-    let state = ApiState::new(registry, token, settings);
+    let state = ApiState::new(registry, traffic_store, token, settings);
     Router::new()
         .route("/", get(admin_page))
         .route("/v1/health", get(health))
         .route("/v1/devices", get(list_devices).post(provision_device))
         .route("/v1/devices/{public_key}", delete(revoke_device))
+        .route("/v1/traffic", get(traffic))
         .with_state(state)
 }
 
@@ -49,6 +53,7 @@ pub fn router(
 pub fn spawn(
     address: SocketAddr,
     registry: SharedDeviceRegistry,
+    traffic_store: TrafficStore,
     token: AdminToken,
     settings: AdminSettings,
 ) -> io::Result<thread::JoinHandle<()>> {
@@ -74,7 +79,9 @@ pub fn spawn(
                 }
             };
             eprintln!("MouseVPN admin listening on http://{address}");
-            if let Err(error) = axum::serve(listener, router(registry, token, settings)).await {
+            if let Err(error) =
+                axum::serve(listener, router(registry, traffic_store, token, settings)).await
+            {
                 eprintln!("MouseVPN admin stopped: {error}");
             }
         });
