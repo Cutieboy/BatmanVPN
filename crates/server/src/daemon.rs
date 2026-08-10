@@ -604,7 +604,7 @@ fn open_device_registry(
 
 fn open_traffic_store() -> Result<TrafficStore, ServerDaemonError> {
     let path = env::var_os("MOUSEVPN_TRAFFIC_STORE").map_or_else(
-        || PathBuf::from("/var/lib/mousevpn/traffic.toml"),
+        || PathBuf::from("/var/lib/mousevpn/traffic.sqlite"),
         PathBuf::from,
     );
     TrafficStore::open(path).map_err(|error| ServerDaemonError::Configuration(error.to_string()))

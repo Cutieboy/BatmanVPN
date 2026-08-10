@@ -10,6 +10,7 @@ axum = "0.8.9"
 mousevpn-config = { path = "../config" }
 mousevpn-crypto = { path = "../crypto" }
 mousevpn-profile-cli = { path = "../profile-cli" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 subtle = "2.6"
 tempfile = "3.20"

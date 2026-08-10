@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt, fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,12 +10,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 const TRAFFIC_VERSION: u8 = 1;
 const SECONDS_PER_HOUR: u64 = 3_600;
 const RETENTION_HOURS: u64 = 24 * 400;
+const LEGACY_MIGRATION_KEY: &str = "legacy_toml_v1";
 pub(crate) const MAX_QUERY_HOURS: u64 = 24 * 31;
 
 #[derive(Debug, Default)]
@@ -40,66 +40,34 @@ struct RegisteredCounter {
     counter: Arc<DeviceTrafficCounter>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct TrafficBucket {
-    hour: u64,
-    public_key: String,
-    name: String,
-    upload_bytes: u64,
-    download_bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct TrafficDocument {
-    version: u8,
-    buckets: Vec<TrafficBucket>,
-}
-
-impl Default for TrafficDocument {
-    fn default() -> Self {
-        Self {
-            version: TRAFFIC_VERSION,
-            buckets: Vec::new(),
-        }
-    }
-}
-
 struct TrafficStoreInner {
-    path: PathBuf,
+    database: Mutex<Connection>,
     counters: RwLock<HashMap<String, Arc<RegisteredCounter>>>,
-    history: Mutex<TrafficDocument>,
 }
 
 #[derive(Clone)]
 pub struct TrafficStore(Arc<TrafficStoreInner>);
 
 impl TrafficStore {
-    /// Opens or creates the durable hourly traffic store.
+    /// Opens or creates the `SQLite` traffic store and imports a legacy TOML file once.
+    ///
+    /// A requested `*.toml` path is treated as the legacy path and mapped to a
+    /// sibling `*.sqlite` database for compatibility with the old environment variable.
     ///
     /// # Errors
     ///
-    /// Returns an error for insecure permissions, invalid data or I/O failures.
+    /// Returns an error for insecure permissions, invalid legacy data, `SQLite` or I/O failures.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, TrafficError> {
-        let path = path.into();
-        let history = if path.exists() {
-            ensure_private_permissions(&path)?;
-            let document: TrafficDocument = toml::from_str(&fs::read_to_string(&path)?)?;
-            if document.version != TRAFFIC_VERSION {
-                return Err(TrafficError::new("unsupported traffic store version"));
-            }
-            document
-        } else {
-            TrafficDocument::default()
-        };
-        let store = Self(Arc::new(TrafficStoreInner {
-            path,
+        let requested = path.into();
+        let (database_path, legacy_path) = storage_paths(&requested);
+        prepare_database_file(&database_path)?;
+        let connection = Connection::open(&database_path)?;
+        configure_database(&connection)?;
+        migrate_legacy_toml(&connection, &legacy_path)?;
+        Ok(Self(Arc::new(TrafficStoreInner {
+            database: Mutex::new(connection),
             counters: RwLock::new(HashMap::new()),
-            history: Mutex::new(history),
-        }));
-        if !store.0.path.exists() {
-            store.persist_document(&TrafficDocument::default())?;
-        }
-        Ok(store)
+        })))
     }
 
     #[must_use]
@@ -142,11 +110,11 @@ impl TrafficStore {
         });
     }
 
-    /// Moves current atomic counters into the durable hourly history.
+    /// Upserts current atomic counters into the durable hourly history.
     ///
     /// # Errors
     ///
-    /// Returns an error if locks are poisoned or the atomic file replacement fails.
+    /// Returns an error if locks are poisoned or the `SQLite` transaction fails.
     pub fn flush(&self) -> Result<(), TrafficError> {
         self.flush_at(unix_seconds())
     }
@@ -161,100 +129,92 @@ impl TrafficStore {
             return Ok(());
         }
         let current_hour = now / SECONDS_PER_HOUR;
-        let mut history = self
-            .0
-            .history
-            .lock()
-            .map_err(|_| TrafficError::new("traffic history lock is poisoned"))?;
-        let mut next = history.clone();
-        merge_pending(&mut next.buckets, current_hour, &pending);
         let oldest = current_hour.saturating_sub(RETENTION_HOURS);
-        next.buckets.retain(|bucket| bucket.hour >= oldest);
-        if let Err(error) = self.persist_document(&next) {
+        let result = self.persist_pending(current_hour, oldest, &pending);
+        if result.is_err() {
             self.restore_pending(&pending);
-            return Err(error);
         }
-        *history = next;
+        result
+    }
+
+    fn persist_pending(
+        &self,
+        current_hour: u64,
+        oldest: u64,
+        pending: &[PendingTraffic],
+    ) -> Result<(), TrafficError> {
+        let mut connection = self
+            .0
+            .database
+            .lock()
+            .map_err(|_| TrafficError::new("traffic database lock is poisoned"))?;
+        let transaction = connection.transaction()?;
+        for item in pending {
+            transaction.execute(
+                "INSERT INTO traffic_hourly
+                    (hour, public_key, name, upload_bytes, download_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(hour, public_key) DO UPDATE SET
+                    name = excluded.name,
+                    upload_bytes = traffic_hourly.upload_bytes + excluded.upload_bytes,
+                    download_bytes = traffic_hourly.download_bytes + excluded.download_bytes",
+                params![
+                    to_sql_integer(current_hour),
+                    item.public_key,
+                    item.name,
+                    to_sql_integer(item.upload_bytes),
+                    to_sql_integer(item.download_bytes),
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM traffic_hourly WHERE hour < ?1",
+            [to_sql_integer(oldest)],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
     fn report_at(&self, hours: u64, now: u64) -> Result<TrafficReport, TrafficError> {
         let hours = hours.clamp(1, MAX_QUERY_HOURS);
         let current_hour = now / SECONDS_PER_HOUR;
-        let mut buckets = self
-            .0
-            .history
-            .lock()
-            .map_err(|_| TrafficError::new("traffic history lock is poisoned"))?
-            .buckets
-            .clone();
-        let pending = self.peek_pending()?;
-        merge_pending(&mut buckets, current_hour, &pending);
-
         let series_start = current_hour.saturating_sub(hours - 1);
-        let mut hourly = (series_start..=current_hour)
-            .map(|hour| TrafficPoint {
-                hour: hour * SECONDS_PER_HOUR,
-                upload_bytes: 0,
-                download_bytes: 0,
-            })
-            .collect::<Vec<_>>();
-        let mut devices = HashMap::<String, DeviceTrafficSummary>::new();
-        let mut hour_total = TrafficTotals::default();
-        let mut day_total = TrafficTotals::default();
-        let mut week_total = TrafficTotals::default();
+        let week_start = current_hour.saturating_sub(167);
+        let query_start = series_start.min(week_start);
+        let mut buckets = self.load_buckets(query_start, current_hour)?;
+        merge_pending(&mut buckets, current_hour, &self.peek_pending()?);
+        Ok(build_report(
+            hours,
+            now,
+            current_hour,
+            series_start,
+            buckets,
+        ))
+    }
 
-        for bucket in buckets {
-            let age = current_hour.saturating_sub(bucket.hour);
-            if bucket.hour > current_hour || age >= 168 {
-                continue;
-            }
-            let totals = TrafficTotals {
-                upload_bytes: bucket.upload_bytes,
-                download_bytes: bucket.download_bytes,
-            };
-            week_total.add(totals);
-            if age < 24 {
-                day_total.add(totals);
-            }
-            if age == 0 {
-                hour_total.add(totals);
-            }
-            if bucket.hour >= series_start {
-                let index = usize::try_from(bucket.hour - series_start)
-                    .map_err(|_| TrafficError::new("traffic bucket index overflow"))?;
-                hourly[index].add(totals);
-                let device = devices.entry(bucket.public_key.clone()).or_insert_with(|| {
-                    DeviceTrafficSummary {
-                        public_key: bucket.public_key,
-                        name: bucket.name.clone(),
-                        upload_bytes: 0,
-                        download_bytes: 0,
-                    }
-                });
-                device.name = bucket.name;
-                device.upload_bytes = device.upload_bytes.saturating_add(bucket.upload_bytes);
-                device.download_bytes = device.download_bytes.saturating_add(bucket.download_bytes);
-            }
-        }
-        let mut devices = devices.into_values().collect::<Vec<_>>();
-        devices.sort_by(|left, right| {
-            right
-                .total_bytes()
-                .cmp(&left.total_bytes())
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(TrafficReport {
-            generated_at: now,
-            selected_hours: hours,
-            totals: TrafficPeriodTotals {
-                hour: hour_total,
-                day: day_total,
-                week: week_total,
-            },
-            hourly,
-            devices,
-        })
+    fn load_buckets(&self, start: u64, end: u64) -> Result<Vec<TrafficBucket>, TrafficError> {
+        let connection = self
+            .0
+            .database
+            .lock()
+            .map_err(|_| TrafficError::new("traffic database lock is poisoned"))?;
+        let mut statement = connection.prepare(
+            "SELECT hour, public_key, name, upload_bytes, download_bytes
+             FROM traffic_hourly
+             WHERE hour BETWEEN ?1 AND ?2
+             ORDER BY hour",
+        )?;
+        let rows =
+            statement.query_map(params![to_sql_integer(start), to_sql_integer(end)], |row| {
+                Ok(TrafficBucket {
+                    hour: from_sql_integer(row.get(0)?),
+                    public_key: row.get(1)?,
+                    name: row.get(2)?,
+                    upload_bytes: from_sql_integer(row.get(3)?),
+                    download_bytes: from_sql_integer(row.get(4)?),
+                })
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn take_pending(&self) -> Result<Vec<PendingTraffic>, TrafficError> {
@@ -312,28 +272,95 @@ impl TrafficStore {
             counter.add_download(item.download_bytes);
         }
     }
+}
 
-    fn persist_document(&self, document: &TrafficDocument) -> Result<(), TrafficError> {
-        let parent = self
-            .0
-            .path
-            .parent()
-            .ok_or_else(|| TrafficError::new("traffic store has no parent directory"))?;
-        fs::create_dir_all(parent)?;
-        let encoded = toml::to_string_pretty(document)?;
-        let mut temporary = NamedTempFile::new_in(parent)?;
-        set_private_permissions(temporary.as_file())?;
-        temporary.write_all(encoded.as_bytes())?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(&self.0.path)
-            .map_err(|error| TrafficError::new(error.error.to_string()))?;
-        Ok(())
+fn build_report(
+    hours: u64,
+    now: u64,
+    current_hour: u64,
+    series_start: u64,
+    buckets: Vec<TrafficBucket>,
+) -> TrafficReport {
+    let mut hourly = (series_start..=current_hour)
+        .map(|hour| TrafficPoint {
+            hour: hour * SECONDS_PER_HOUR,
+            upload_bytes: 0,
+            download_bytes: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut devices = HashMap::<String, DeviceTrafficSummary>::new();
+    let mut hour_total = TrafficTotals::default();
+    let mut day_total = TrafficTotals::default();
+    let mut week_total = TrafficTotals::default();
+
+    for bucket in buckets {
+        let age = current_hour.saturating_sub(bucket.hour);
+        if bucket.hour > current_hour {
+            continue;
+        }
+        let totals = TrafficTotals {
+            upload_bytes: bucket.upload_bytes,
+            download_bytes: bucket.download_bytes,
+        };
+        if age < 168 {
+            week_total.add(totals);
+        }
+        if age < 24 {
+            day_total.add(totals);
+        }
+        if age == 0 {
+            hour_total.add(totals);
+        }
+        if bucket.hour >= series_start {
+            let index = usize::try_from(bucket.hour - series_start).unwrap_or_default();
+            if let Some(point) = hourly.get_mut(index) {
+                point.add(totals);
+            }
+            let device =
+                devices
+                    .entry(bucket.public_key.clone())
+                    .or_insert_with(|| DeviceTrafficSummary {
+                        public_key: bucket.public_key,
+                        name: bucket.name.clone(),
+                        upload_bytes: 0,
+                        download_bytes: 0,
+                    });
+            device.name = bucket.name;
+            device.upload_bytes = device.upload_bytes.saturating_add(bucket.upload_bytes);
+            device.download_bytes = device.download_bytes.saturating_add(bucket.download_bytes);
+        }
+    }
+    let mut devices = devices.into_values().collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        right
+            .total_bytes()
+            .cmp(&left.total_bytes())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    TrafficReport {
+        generated_at: now,
+        selected_hours: hours,
+        totals: TrafficPeriodTotals {
+            hour: hour_total,
+            day: day_total,
+            week: week_total,
+        },
+        hourly,
+        devices,
     }
 }
 
 #[derive(Clone)]
 struct PendingTraffic {
+    public_key: String,
+    name: String,
+    upload_bytes: u64,
+    download_bytes: u64,
+}
+
+#[derive(Clone)]
+struct TrafficBucket {
+    hour: u64,
     public_key: String,
     name: String,
     upload_bytes: u64,
@@ -359,6 +386,124 @@ fn merge_pending(buckets: &mut Vec<TrafficBucket>, hour: u64, pending: &[Pending
             });
         }
     }
+}
+
+fn configure_database(connection: &Connection) -> Result<(), TrafficError> {
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         CREATE TABLE IF NOT EXISTS traffic_hourly (
+            hour INTEGER NOT NULL,
+            public_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            upload_bytes INTEGER NOT NULL CHECK(upload_bytes >= 0),
+            download_bytes INTEGER NOT NULL CHECK(download_bytes >= 0),
+            PRIMARY KEY (hour, public_key)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS traffic_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+         ) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
+
+fn storage_paths(requested: &Path) -> (PathBuf, PathBuf) {
+    if requested
+        .extension()
+        .is_some_and(|extension| extension == "toml")
+    {
+        (requested.with_extension("sqlite"), requested.to_owned())
+    } else {
+        (requested.to_owned(), requested.with_extension("toml"))
+    }
+}
+
+fn prepare_database_file(path: &Path) -> Result<(), TrafficError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| TrafficError::new("traffic database has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    if path.exists() {
+        ensure_private_permissions(path)?;
+        return Ok(());
+    }
+    create_private_file(path)?;
+    Ok(())
+}
+
+fn migrate_legacy_toml(connection: &Connection, path: &Path) -> Result<(), TrafficError> {
+    let migrated = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM traffic_metadata WHERE key = ?1)",
+        [LEGACY_MIGRATION_KEY],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    if path.exists() {
+        ensure_private_permissions(path)?;
+        let legacy: LegacyTrafficDocument = toml::from_str(&fs::read_to_string(path)?)?;
+        if legacy.version != TRAFFIC_VERSION {
+            return Err(TrafficError::new(
+                "unsupported legacy traffic store version",
+            ));
+        }
+        let transaction = connection.unchecked_transaction()?;
+        for bucket in legacy.buckets {
+            transaction.execute(
+                "INSERT INTO traffic_hourly
+                    (hour, public_key, name, upload_bytes, download_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(hour, public_key) DO UPDATE SET
+                    name = excluded.name,
+                    upload_bytes = traffic_hourly.upload_bytes + excluded.upload_bytes,
+                    download_bytes = traffic_hourly.download_bytes + excluded.download_bytes",
+                params![
+                    to_sql_integer(bucket.hour),
+                    bucket.public_key,
+                    bucket.name,
+                    to_sql_integer(bucket.upload_bytes),
+                    to_sql_integer(bucket.download_bytes),
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO traffic_metadata (key, value) VALUES (?1, 'done')",
+            [LEGACY_MIGRATION_KEY],
+        )?;
+        transaction.commit()?;
+    } else {
+        connection.execute(
+            "INSERT INTO traffic_metadata (key, value) VALUES (?1, 'none')",
+            [LEGACY_MIGRATION_KEY],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct LegacyTrafficDocument {
+    version: u8,
+    buckets: Vec<LegacyTrafficBucket>,
+}
+
+#[derive(Deserialize)]
+struct LegacyTrafficBucket {
+    hour: u64,
+    public_key: String,
+    name: String,
+    upload_bytes: u64,
+    download_bytes: u64,
+}
+
+fn to_sql_integer(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn from_sql_integer(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -427,6 +572,27 @@ fn unix_seconds() -> u64 {
 }
 
 #[cfg(unix)]
+fn create_private_file(path: &Path) -> Result<(), TrafficError> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> Result<(), TrafficError> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn ensure_private_permissions(path: &Path) -> Result<(), TrafficError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -441,19 +607,6 @@ fn ensure_private_permissions(path: &Path) -> Result<(), TrafficError> {
 
 #[cfg(not(unix))]
 fn ensure_private_permissions(_path: &Path) -> Result<(), TrafficError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_permissions(file: &fs::File) -> Result<(), TrafficError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_file: &fs::File) -> Result<(), TrafficError> {
     Ok(())
 }
 
@@ -480,20 +633,22 @@ impl From<std::io::Error> for TrafficError {
     }
 }
 
+impl From<rusqlite::Error> for TrafficError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl From<toml::de::Error> for TrafficError {
     fn from(error: toml::de::Error) -> Self {
         Self::new(error.to_string())
     }
 }
 
-impl From<toml::ser::Error> for TrafficError {
-    fn from(error: toml::ser::Error) -> Self {
-        Self::new(error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::TempDir;
 
     use super::{TrafficStore, SECONDS_PER_HOUR};
@@ -501,7 +656,7 @@ mod tests {
     #[test]
     fn reports_and_reopens_hourly_traffic() {
         let temporary = TempDir::new().expect("temporary directory");
-        let path = temporary.path().join("traffic.toml");
+        let path = temporary.path().join("traffic.sqlite");
         let store = TrafficStore::open(&path).expect("traffic store");
         let alice = store.counter("alice-key", "Alice phone");
         alice.add_upload(1_000);
@@ -509,6 +664,7 @@ mod tests {
         store
             .flush_at(100 * SECONDS_PER_HOUR)
             .expect("traffic flush");
+        drop(store);
 
         let reopened = TrafficStore::open(path).expect("reopened traffic store");
         let report = reopened
@@ -528,7 +684,7 @@ mod tests {
     fn includes_unflushed_counters_in_reports() {
         let temporary = TempDir::new().expect("temporary directory");
         let store =
-            TrafficStore::open(temporary.path().join("traffic.toml")).expect("traffic store");
+            TrafficStore::open(temporary.path().join("traffic.sqlite")).expect("traffic store");
         let counter = store.counter("key", "Laptop");
         counter.add_upload(42);
         counter.add_download(84);
@@ -539,4 +695,41 @@ mod tests {
         assert_eq!(report.totals.hour.upload_bytes, 42);
         assert_eq!(report.totals.hour.download_bytes, 84);
     }
+
+    #[test]
+    fn migrates_legacy_toml_once() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let legacy = temporary.path().join("traffic.toml");
+        fs::write(
+            &legacy,
+            "version = 1\n\n[[buckets]]\nhour = 50\npublic_key = \"old-key\"\nname = \"Old phone\"\nupload_bytes = 123\ndownload_bytes = 456\n",
+        )
+        .expect("legacy traffic file");
+        set_private_test_permissions(&legacy);
+
+        let store = TrafficStore::open(&legacy).expect("migrated store");
+        let report = store
+            .report_at(1, 50 * SECONDS_PER_HOUR)
+            .expect("traffic report");
+        assert_eq!(report.totals.hour.upload_bytes, 123);
+        assert_eq!(report.totals.hour.download_bytes, 456);
+        drop(store);
+
+        let reopened = TrafficStore::open(&legacy).expect("reopened store");
+        let report = reopened
+            .report_at(1, 50 * SECONDS_PER_HOUR)
+            .expect("traffic report");
+        assert_eq!(report.totals.hour.upload_bytes, 123);
+        assert!(temporary.path().join("traffic.sqlite").exists());
+    }
+
+    #[cfg(unix)]
+    fn set_private_test_permissions(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private permissions");
+    }
+
+    #[cfg(not(unix))]
+    fn set_private_test_permissions(_path: &std::path::Path) {}
 }

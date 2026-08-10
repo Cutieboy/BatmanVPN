@@ -96,7 +96,7 @@ fn revocation_disables_an_existing_session_flag() {
 fn test_router(temporary: &TempDir) -> axum::Router {
     router(
         registry(temporary.path()),
-        TrafficStore::open(temporary.path().join("traffic.toml")).expect("traffic store"),
+        TrafficStore::open(temporary.path().join("traffic.sqlite")).expect("traffic store"),
         AdminToken::new(TOKEN).expect("admin token"),
         AdminSettings {
             public_endpoint: "198.51.100.10:51820"
@@ -111,7 +111,8 @@ fn test_router(temporary: &TempDir) -> axum::Router {
 #[tokio::test]
 async fn returns_authenticated_traffic_report() {
     let temporary = TempDir::new().expect("temporary directory");
-    let traffic = TrafficStore::open(temporary.path().join("traffic.toml")).expect("traffic store");
+    let traffic =
+        TrafficStore::open(temporary.path().join("traffic.sqlite")).expect("traffic store");
     let counter = traffic.counter("phone-key", "Alice phone");
     counter.add_upload(1_024);
     counter.add_download(2_048);

@@ -52,12 +52,15 @@ The persistent public device registry lives at
 Revocation flips an atomic authorization flag held by active sessions, so no
 registry lock, Base64 decoding, or disk access occurs on the packet hot path.
 
-Hourly traffic history lives at `/var/lib/mousevpn/traffic.toml` and is retained
-for 400 days. The server counts successfully forwarded inner IPv4 bytes (not
-UDP, encryption or keepalive overhead) with per-device atomic counters and
-flushes them to the private, atomically replaced store every 10 seconds. Set
-`MOUSEVPN_TRAFFIC_STORE` to override the path. A crash can lose at most the
-currently unflushed interval; normal API reports include pending counters.
+Hourly traffic history lives in the SQLite/WAL database
+`/var/lib/mousevpn/traffic.sqlite` and is retained for 400 days. On first start,
+an existing `traffic.toml` is imported automatically and kept as a fallback
+copy. The server counts successfully forwarded inner IPv4 bytes (not UDP,
+encryption or keepalive overhead) with per-device atomic counters and upserts
+only the current hourly rows every 10 seconds. Set `MOUSEVPN_TRAFFIC_STORE` to
+override the database path; an old value ending in `.toml` is mapped to a
+sibling `.sqlite` database and migrated. A crash can lose at most the currently
+unflushed interval; normal API reports include pending counters.
 
 ## Opt-in public endpoint
 
