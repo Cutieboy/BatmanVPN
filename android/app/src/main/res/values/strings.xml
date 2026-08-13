@@ -42,6 +42,13 @@
     <string name="profile_open_error">Не удалось открыть профили: %1$s</string>
     <string name="unknown_error">Неизвестная ошибка</string>
 
+    <string name="diagnostics_open">Диагностика соединения</string>
+    <string name="diagnostics_title">Диагностика</string>
+    <string name="diagnostics_privacy">Сбор полностью пассивный. MouseVPN не отправляет дополнительные пакеты и не сохраняет сайты, содержимое трафика или ключи.</string>
+    <string name="diagnostics_export">Экспортировать JSON</string>
+    <string name="diagnostics_clear">Очистить историю</string>
+    <string name="diagnostics_cleared">История диагностики очищена</string>
+
     <string name="exclusions_open">Маршрутизация приложений</string>
     <string name="exclusions_title">Приложения и VPN</string>
     <string name="exclusions_hint">Отмеченные приложения будут ходить в интернет напрямую, минуя туннель. Изменения применятся при следующем подключении.</string>

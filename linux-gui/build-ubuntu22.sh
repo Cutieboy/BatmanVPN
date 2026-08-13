@@ -21,7 +21,7 @@ docker run --rm \
     cargo tauri build --bundles deb,appimage
 
     appdir=/build/target/release/bundle/appimage/MouseVPN.AppDir
-    output=/build/target/release/bundle/appimage/MouseVPN_0.1.0_amd64.AppImage
+    output=/build/target/release/bundle/appimage/MouseVPN_0.1.7_amd64.AppImage
     tool=/build/target/.tools/appimagetool-modern-x86_64.AppImage
 
     # libEGL is supplied by the host graphics driver. Bundling Ubuntu libwayland
@@ -47,11 +47,11 @@ docker run --rm \
     ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$tool" "$appdir" "$output"
 
     install -m 0755 "$output" \
-      /workspace/linux-gui/dist/MouseVPN_0.1.0_ubuntu22_amd64.AppImage
+      /workspace/linux-gui/dist/MouseVPN_0.1.7_ubuntu22_amd64.AppImage
     install -m 0644 \
-      /build/target/release/bundle/deb/MouseVPN_0.1.0_amd64.deb \
-      /workspace/linux-gui/dist/MouseVPN_0.1.0_ubuntu22_amd64.deb
+      /build/target/release/bundle/deb/MouseVPN_0.1.7_amd64.deb \
+      /workspace/linux-gui/dist/MouseVPN_0.1.7_ubuntu22_amd64.deb
     chown "$(stat -c %u /workspace):$(stat -c %g /workspace)" \
-      /workspace/linux-gui/dist/MouseVPN_0.1.0_ubuntu22_amd64.AppImage \
-      /workspace/linux-gui/dist/MouseVPN_0.1.0_ubuntu22_amd64.deb
+      /workspace/linux-gui/dist/MouseVPN_0.1.7_ubuntu22_amd64.AppImage \
+      /workspace/linux-gui/dist/MouseVPN_0.1.7_ubuntu22_amd64.deb
   '

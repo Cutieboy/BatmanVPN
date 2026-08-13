@@ -40,6 +40,11 @@
             android:label="@string/exclusions_title" />
 
         <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="false"
+            android:label="@string/diagnostics_title" />
+
+        <activity
             android:name=".AddProfileActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />

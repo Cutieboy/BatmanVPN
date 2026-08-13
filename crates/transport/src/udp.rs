@@ -24,6 +24,25 @@ pub struct UdpTransport {
     socket: UdpSocket,
 }
 
+/// Thread-local scratch space for Linux/Android `sendmmsg` and `recvmmsg`.
+///
+/// `nix` deliberately keeps this type non-`Send` because its headers contain
+/// internal pointers. Create it inside the packet worker that uses it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug)]
+pub struct UdpBatch {
+    headers: MultiHeaders<()>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Default for UdpBatch {
+    fn default() -> Self {
+        Self {
+            headers: MultiHeaders::preallocate(32, None),
+        }
+    }
+}
+
 impl UdpTransport {
     /// Binds a UDP socket and connects it to one peer.
     ///
@@ -84,6 +103,20 @@ impl UdpTransport {
     /// reported as the number of datagrams accepted by the kernel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn send_batch(&mut self, packets: &[Vec<u8>]) -> io::Result<usize> {
+        self.send_batch_with(packets, &mut UdpBatch::default())
+    }
+
+    /// Sends a group while reusing caller-owned syscall headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error under the same conditions as [`Self::send_batch`].
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn send_batch_with(
+        &mut self,
+        packets: &[Vec<u8>],
+        batch: &mut UdpBatch,
+    ) -> io::Result<usize> {
         if packets.is_empty() {
             return Ok(0);
         }
@@ -97,10 +130,9 @@ impl UdpTransport {
             [IoSlice::new(packets.get(index).map_or(&[], Vec::as_slice))]
         });
         let addresses = [None::<()>; 32];
-        let mut headers = MultiHeaders::<()>::preallocate(packets.len(), None);
         let sent = sendmmsg(
             self.socket.as_raw_fd(),
-            &mut headers,
+            &mut batch.headers,
             &slices[..packets.len()],
             &addresses[..packets.len()],
             [],
@@ -122,6 +154,21 @@ impl UdpTransport {
         buffers: &mut [Vec<u8>],
         lengths: &mut Vec<usize>,
     ) -> io::Result<()> {
+        self.receive_batch_with(buffers, lengths, &mut UdpBatch::default())
+    }
+
+    /// Receives a group while reusing caller-owned syscall headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error under the same conditions as [`Self::receive_batch`].
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn receive_batch_with(
+        &mut self,
+        buffers: &mut [Vec<u8>],
+        lengths: &mut Vec<usize>,
+        batch: &mut UdpBatch,
+    ) -> io::Result<()> {
         if buffers.is_empty() || buffers.len() > 32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -132,10 +179,9 @@ impl UdpTransport {
             .iter_mut()
             .map(|buffer| [IoSliceMut::new(buffer)])
             .collect();
-        let mut headers = MultiHeaders::<()>::preallocate(slices.len(), None);
         let messages = recvmmsg(
             self.socket.as_raw_fd(),
-            &mut headers,
+            &mut batch.headers,
             slices.iter_mut(),
             MsgFlags::MSG_WAITFORONE,
             None,
@@ -169,7 +215,7 @@ impl DatagramTransport for UdpTransport {
 mod tests {
     use std::{net::UdpSocket, time::Duration};
 
-    use super::UdpTransport;
+    use super::{UdpBatch, UdpTransport};
 
     #[test]
     fn sends_connected_datagrams_as_a_batch() {
@@ -182,9 +228,12 @@ mod tests {
             UdpTransport::from_socket(sender, receiver.local_addr().expect("receiver address"))
                 .expect("create transport");
         let packets = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+        let mut batch = UdpBatch::default();
 
         assert_eq!(
-            transport.send_batch(&packets).expect("send batch"),
+            transport
+                .send_batch_with(&packets, &mut batch)
+                .expect("send batch"),
             packets.len()
         );
 

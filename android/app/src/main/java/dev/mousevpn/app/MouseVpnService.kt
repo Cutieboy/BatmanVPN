@@ -12,19 +12,40 @@ import android.os.SystemClock
 import android.os.Handler
 import android.os.Looper
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
 
 class MouseVpnService : VpnService() {
     private val executor = Executors.newSingleThreadExecutor()
     private val stopExecutor = Executors.newSingleThreadExecutor()
     private val networkHandler = Handler(Looper.getMainLooper())
     private var task: Future<*>? = null
+    @Volatile private var stopRequested = false
+    private val connectionGeneration = AtomicLong()
     @Volatile private var handle = 0L
+    @Volatile private var diagnosticSessionId = 0L
+    @Volatile private var underlyingNetwork = "unknown"
+    private val underlyingNetworks = ConcurrentHashMap<Network, UnderlyingNetworkState>()
+    private var selectedUnderlyingNetwork: Network? = null
+    private var selectedUnderlyingState: UnderlyingNetworkState? = null
+    private lateinit var diagnostics: DiagnosticStore
+    private var lastCheckpointElapsedRealtime = 0L
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = signalNetworkChange()
+        override fun onAvailable(network: Network) {
+            if (updateUnderlyingNetwork(network)) signalNetworkChange()
+        }
 
-        override fun onLost(network: Network) = signalNetworkChange()
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            underlyingNetworks[network] = networkState(capabilities)
+            if (refreshUnderlyingNetwork()) signalNetworkChange()
+        }
+
+        override fun onLost(network: Network) {
+            underlyingNetworks.remove(network)
+            if (refreshUnderlyingNetwork()) signalNetworkChange()
+        }
     }
     private val signalNetworkChange = Runnable {
         val current = handle
@@ -33,6 +54,7 @@ class MouseVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        diagnostics = DiagnosticStore(this)
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -47,15 +69,44 @@ class MouseVpnService : VpnService() {
             return START_NOT_STICKY
         }
         startForeground(VpnNotification.ID, VpnNotification.create(this, "Подключение…"))
-        if (task?.isDone != false) task = executor.submit(::connect)
+        if (task?.isDone != false) {
+            stopRequested = false
+            val generation = connectionGeneration.incrementAndGet()
+            task = executor.submit { runConnectionLoop(generation) }
+        }
         return START_STICKY
     }
 
-    private fun connect() {
+    private fun runConnectionLoop(generation: Long) {
+        val backoff = ReconnectBackoff()
+        while (isAttemptActive(generation)) {
+            val result = connectOnce(generation)
+            if (!isAttemptActive(generation) || result.outcome == AttemptOutcome.STOPPED) {
+                return
+            }
+            if (result.connectedForMs >= RECONNECT_BACKOFF_RESET_MS) backoff.reset()
+            val delay = if (result.outcome == AttemptOutcome.PARAMETERS_CHANGED) 0L else backoff.nextDelayMs()
+            if (delay > 0L) {
+                val status = "Подключение… повтор через ${delay / 1_000} с"
+                broadcast(status)
+                getSystemService(android.app.NotificationManager::class.java)
+                    .notify(VpnNotification.ID, VpnNotification.create(this, status))
+            }
+            if (!waitForRetry(delay, generation)) return
+        }
+    }
+
+    private fun connectOnce(generation: Long): AttemptResult {
         var descriptor: ParcelFileDescriptor? = null
+        var connectedAt = 0L
         try {
+            ensureAttemptActive(generation)
             broadcast("Подключение…")
             val profile = requireNotNull(ProfileStore(this).selected()) { "Сначала вставьте профиль" }
+            diagnosticSessionId = runCatching {
+                diagnostics.begin(profile, underlyingNetwork)
+            }.getOrDefault(0L)
+            lastCheckpointElapsedRealtime = SystemClock.elapsedRealtime()
             val prepared = JSONObject(
                 NativeBridge.prepare(
                     this,
@@ -65,6 +116,7 @@ class MouseVpnService : VpnService() {
                 ),
             )
             handle = prepared.getLong("handle")
+            ensureAttemptActive(generation)
             val serverMtu = prepared.getInt("mtu")
             val mtu = tunnelMtu(serverMtu)
             val builder = Builder()
@@ -77,10 +129,15 @@ class MouseVpnService : VpnService() {
             val appPolicy = applyAppPolicy(builder)
             descriptor = builder.establish()
             requireNotNull(descriptor) { "Android не создал VPN-интерфейс" }
+            ensureAttemptActive(generation)
             val fd = descriptor.detachFd()
             descriptor = null
             check(NativeBridge.start(handle, fd)) { "Rust-ядро не запустило туннель" }
-            connectedSinceElapsedRealtime = SystemClock.elapsedRealtime()
+            connectedAt = SystemClock.elapsedRealtime()
+            connectedSinceElapsedRealtime = connectedAt
+            if (diagnosticSessionId != 0L) {
+                runCatching { diagnostics.connected(diagnosticSessionId, underlyingNetwork) }
+            }
             val summary = buildString {
                 append("Подключено: ${profile.endpoint}")
                 if (appPolicy.second > 0) {
@@ -97,17 +154,49 @@ class MouseVpnService : VpnService() {
             val notification = VpnNotification.create(this, summary)
             getSystemService(android.app.NotificationManager::class.java)
                 .notify(VpnNotification.ID, notification)
-            monitor(handle)
+            return monitor(handle, connectedAt)
+        } catch (_: InterruptedException) {
+            val current = handle
+            if (current != 0L) NativeBridge.stop(current)
+            handle = 0L
+            connectedSinceElapsedRealtime = 0L
+            return AttemptResult(AttemptOutcome.STOPPED, elapsedSince(connectedAt))
         } catch (error: Exception) {
+            finishDiagnostics(
+                "connection_error",
+                error.message ?: error.javaClass.simpleName,
+                handle,
+            )
             if (handle != 0L) NativeBridge.stop(handle)
             handle = 0L
             connectedSinceElapsedRealtime = 0L
-            broadcast("Ошибка: ${error.message ?: error.javaClass.simpleName}")
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            return AttemptResult(
+                AttemptOutcome.SETUP_FAILED,
+                connectedForMs = elapsedSince(connectedAt),
+            )
         } finally {
             descriptor?.close()
         }
+    }
+
+    private fun waitForRetry(delayMs: Long, generation: Long): Boolean {
+        if (delayMs == 0L) return isAttemptActive(generation)
+        return try {
+            Thread.sleep(delayMs)
+            isAttemptActive(generation)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    private fun isAttemptActive(generation: Long): Boolean =
+        !stopRequested &&
+            !Thread.currentThread().isInterrupted &&
+            connectionGeneration.get() == generation
+
+    private fun ensureAttemptActive(generation: Long) {
+        if (!isAttemptActive(generation)) throw InterruptedException()
     }
 
     /**
@@ -181,36 +270,61 @@ class MouseVpnService : VpnService() {
         return policy.mode to applied
     }
 
-    private fun monitor(currentHandle: Long) {
+    private fun monitor(currentHandle: Long, connectedAt: Long): AttemptResult {
         while (!Thread.currentThread().isInterrupted && handle == currentHandle) {
             val nativeStatus = NativeBridge.status(currentHandle)
             if (nativeStatus == "parameters-changed") {
+                finishDiagnostics("parameters_changed", null, currentHandle)
                 NativeBridge.stop(currentHandle)
                 handle = 0L
                 connectedSinceElapsedRealtime = 0L
-                broadcast("Подключение…")
-                connect()
-                return
+                return AttemptResult(
+                    AttemptOutcome.PARAMETERS_CHANGED,
+                    connectedForMs = elapsedSince(connectedAt),
+                )
             }
             if (nativeStatus != "running") {
+                finishDiagnostics("connection_lost", nativeStatus, currentHandle)
                 NativeBridge.stop(currentHandle)
                 handle = 0L
                 connectedSinceElapsedRealtime = 0L
-                broadcast("Соединение потеряно")
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return
+                return AttemptResult(
+                    AttemptOutcome.CONNECTION_LOST,
+                    connectedForMs = elapsedSince(connectedAt),
+                )
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastCheckpointElapsedRealtime >= DIAGNOSTIC_CHECKPOINT_MS) {
+                val sessionId = diagnosticSessionId
+                if (sessionId != 0L) {
+                    runCatching {
+                        diagnostics.checkpoint(
+                            sessionId,
+                            readMetrics(currentHandle),
+                            underlyingNetwork,
+                        )
+                    }
+                }
+                lastCheckpointElapsedRealtime = now
             }
             try {
                 Thread.sleep(1_000)
             } catch (_: InterruptedException) {
-                return
+                Thread.currentThread().interrupt()
+                return AttemptResult(AttemptOutcome.STOPPED, elapsedSince(connectedAt))
             }
         }
+        return AttemptResult(AttemptOutcome.STOPPED, elapsedSince(connectedAt))
     }
 
+    private fun elapsedSince(startedAt: Long): Long =
+        if (startedAt == 0L) 0L else (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
+
     private fun disconnect() {
+        stopRequested = true
+        connectionGeneration.incrementAndGet()
         val current = handle
+        finishDiagnostics("user_disconnect", null, current)
         handle = 0L
         connectedSinceElapsedRealtime = 0L
         stopNativeAsync(current)
@@ -235,6 +349,71 @@ class MouseVpnService : VpnService() {
         networkHandler.postDelayed(signalNetworkChange, NETWORK_CHANGE_DEBOUNCE_MS)
     }
 
+    private fun updateUnderlyingNetwork(network: Network): Boolean {
+        val capabilities = getSystemService(ConnectivityManager::class.java)
+            .getNetworkCapabilities(network)
+        if (capabilities != null) {
+            underlyingNetworks[network] = networkState(capabilities)
+            return refreshUnderlyingNetwork()
+        }
+        return false
+    }
+
+    @Synchronized
+    private fun refreshUnderlyingNetwork(): Boolean {
+        val previousNetwork = selectedUnderlyingNetwork
+        val previousState = selectedUnderlyingState
+        val highestPriority = underlyingNetworks.values.maxOfOrNull(::networkPriority)
+        val current = previousNetwork?.takeIf { network ->
+            underlyingNetworks[network]?.let(::networkPriority) == highestPriority
+        }
+        selectedUnderlyingNetwork = current ?: underlyingNetworks.entries
+            .firstOrNull { networkPriority(it.value) == highestPriority }
+            ?.key
+        selectedUnderlyingState = selectedUnderlyingNetwork?.let(underlyingNetworks::get)
+        underlyingNetwork = selectedUnderlyingState?.diagnosticLabel ?: "none"
+        return selectedUnderlyingNetwork != previousNetwork || selectedUnderlyingState != previousState
+    }
+
+    private fun networkPriority(network: UnderlyingNetworkState): Int =
+        (if (network.validated) 10 else 0) + when (network.transport) {
+            "ethernet" -> 3
+            "wifi" -> 2
+            "cellular" -> 1
+            else -> 0
+        }
+
+    private fun networkState(capabilities: NetworkCapabilities) = UnderlyingNetworkState(
+        transport = when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            else -> "other"
+        },
+        validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+    )
+
+    private fun readMetrics(currentHandle: Long): DiagnosticMetrics =
+        if (currentHandle == 0L) DiagnosticMetrics()
+        else runCatching { DiagnosticMetrics.parse(NativeBridge.metrics(currentHandle)) }
+            .getOrDefault(DiagnosticMetrics())
+
+    @Synchronized
+    private fun finishDiagnostics(outcome: String, detail: String?, currentHandle: Long) {
+        val sessionId = diagnosticSessionId
+        if (sessionId == 0L) return
+        diagnosticSessionId = 0L
+        runCatching {
+            diagnostics.finish(
+                sessionId,
+                outcome,
+                detail,
+                readMetrics(currentHandle),
+                underlyingNetwork,
+            )
+        }
+    }
+
     private fun stopNativeAsync(current: Long) {
         if (current != 0L) stopExecutor.execute { NativeBridge.stop(current) }
     }
@@ -245,7 +424,11 @@ class MouseVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        stopRequested = true
+        connectionGeneration.incrementAndGet()
+        task?.cancel(true)
         val current = handle
+        finishDiagnostics("service_destroyed", null, current)
         handle = 0L
         connectedSinceElapsedRealtime = 0L
         networkHandler.removeCallbacks(signalNetworkChange)
@@ -277,10 +460,42 @@ class MouseVpnService : VpnService() {
         /** Floor for the tunnel MTU; every path is expected to carry this. */
         private const val MINIMUM_MTU = 1_280
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
+        private const val DIAGNOSTIC_CHECKPOINT_MS = 60_000L
+        private const val RECONNECT_BACKOFF_RESET_MS = 60_000L
 
         const val ACTION_CONNECT = "dev.mousevpn.app.CONNECT"
         const val ACTION_DISCONNECT = "dev.mousevpn.app.DISCONNECT"
         const val ACTION_STATUS = "dev.mousevpn.app.STATUS"
         const val EXTRA_STATUS = "status"
+    }
+
+    private data class UnderlyingNetworkState(
+        val transport: String,
+        val validated: Boolean,
+    ) {
+        val diagnosticLabel: String
+            get() = if (validated) transport else "$transport-unvalidated"
+    }
+
+    private data class AttemptResult(
+        val outcome: AttemptOutcome,
+        val connectedForMs: Long,
+    )
+
+    private enum class AttemptOutcome {
+        SETUP_FAILED,
+        CONNECTION_LOST,
+        PARAMETERS_CHANGED,
+        STOPPED,
+    }
+
+    private class ReconnectBackoff {
+        private var nextMs = 1_000L
+
+        fun nextDelayMs(): Long = nextMs.also { nextMs = (nextMs * 2).coerceAtMost(16_000L) }
+
+        fun reset() {
+            nextMs = 1_000L
+        }
     }
 }

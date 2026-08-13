@@ -24,6 +24,9 @@ pub(crate) fn is_retryable_network(error: &std::io::Error) -> bool {
         std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::TimedOut
+    ) || matches!(
+        error.raw_os_error(),
+        Some(nix::libc::ENOBUFS | nix::libc::ENOMEM)
     ) || is_peer_unavailable(error)
 }
 
@@ -122,5 +125,12 @@ mod tests {
     fn permanent_local_errors_remain_fatal() {
         let error = Error::from(ErrorKind::PermissionDenied);
         assert!(!is_retryable_network(&error));
+    }
+
+    #[test]
+    fn udp_queue_pressure_is_retryable() {
+        for code in [nix::libc::ENOBUFS, nix::libc::ENOMEM] {
+            assert!(is_retryable_network(&Error::from_raw_os_error(code)));
+        }
     }
 }

@@ -315,26 +315,34 @@ fn spawn_outgoing(
                 }
 
                 let mut encoded = 0;
-                while encoded < BATCH_SIZE {
-                    let Some(packet) = session.try_receive().map_err(|error| {
-                        ClientError::Platform(format!("failed to receive a Wintun packet: {error}"))
-                    })?
-                    else {
-                        break;
-                    };
-                    if packet.bytes().first().map(|byte| byte >> 4) != Some(4) {
-                        continue;
-                    }
+                {
+                    // Reconnect is the only competing writer. One lock per
+                    // Wintun batch avoids 32 lock/unlock pairs on the hot path.
                     let mut locked = sender.lock().map_err(|_| poisoned_sender())?;
-                    match locked.encode_ip_into(packet.bytes(), &mut encrypted[encoded]) {
-                        Ok(()) => encoded += 1,
-                        Err(DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_)) => {
-                            note_packet_drop(
-                                &mut dropped_packets,
-                                "Windows supplied an invalid or oversized IPv4 packet",
-                            );
+                    while encoded < BATCH_SIZE {
+                        let Some(packet) = session.try_receive().map_err(|error| {
+                            ClientError::Platform(format!(
+                                "failed to receive a Wintun packet: {error}"
+                            ))
+                        })?
+                        else {
+                            break;
+                        };
+                        if packet.bytes().first().map(|byte| byte >> 4) != Some(4) {
+                            continue;
                         }
-                        Err(error) => return Err(error.into()),
+                        match locked.encode_ip_into(packet.bytes(), &mut encrypted[encoded]) {
+                            Ok(()) => encoded += 1,
+                            Err(
+                                DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_),
+                            ) => {
+                                note_packet_drop(
+                                    &mut dropped_packets,
+                                    "Windows supplied an invalid or oversized IPv4 packet",
+                                );
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                 }
                 for datagram in &encrypted[..encoded] {

@@ -72,6 +72,9 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.excludedApps).setOnClickListener {
             startActivity(Intent(this, AppListActivity::class.java))
         }
+        findViewById<View>(R.id.openDiagnostics).setOnClickListener {
+            startActivity(Intent(this, DiagnosticsActivity::class.java))
+        }
         powerButton.setOnClickListener {
             if (connected) disconnect() else if (!connecting) requestConnection()
         }

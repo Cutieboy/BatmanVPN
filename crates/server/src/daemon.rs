@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     os::fd::AsRawFd,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{mpsc, Arc, Mutex, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -37,6 +37,8 @@ const DATAGRAM_BUFFER_LEN: usize = 65_535;
 const UDP_BATCH_SIZE: usize = 32;
 const SOCKET_BUFFER_LEN: usize = 8 * 1024 * 1024;
 const PEER_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const UDP_DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const WORKER_HEALTH_POLL: Duration = Duration::from_secs(1);
 /// Outer IPv4 and UDP headers carried around every tunnel datagram.
 const IPV4_UDP_OVERHEAD: usize = 28;
 
@@ -149,6 +151,7 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     tun.set_nonblocking(true)?;
     let socket = UdpSocket::bind(config.listen)?;
     configure_socket_buffers(&socket)?;
+    socket.set_read_timeout(Some(WORKER_HEALTH_POLL))?;
     setsockopt(&socket, RxqOvfl, &1).map_err(io::Error::from)?;
     let sessions: SessionMap = Arc::new(RwLock::new(Sessions::default()));
     let authorized = open_device_registry(config)?;
@@ -158,7 +161,7 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     let mut handshake_limiter = HandshakeLimiter::new(50, Duration::from_secs(60));
     let mut handshake_cache: HashMap<PublicKey, CachedHandshake> = HashMap::new();
 
-    start_tun_worker(Arc::clone(&tun), socket.try_clone()?, Arc::clone(&sessions));
+    let tun_worker = start_tun_worker(Arc::clone(&tun), socket.try_clone()?, Arc::clone(&sessions));
     let mut buffers: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
         .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
         .collect();
@@ -170,9 +173,13 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     let mut plaintext = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
     let mut response = Vec::with_capacity(usize::from(config.tun.mtu) + 128);
     loop {
+        check_tun_worker(&tun_worker)?;
         match receive_batch(&socket, &mut buffers, &mut headers, &mut received) {
             Ok(()) => {}
-            Err(error) if is_recoverable(&error) => continue,
+            Err(error) if is_recoverable(&error) => {
+                check_tun_worker(&tun_worker)?;
+                continue;
+            }
             Err(error) => return Err(error.into()),
         }
         for received in received.drain(..) {
@@ -304,7 +311,18 @@ fn is_recoverable(error: &io::Error) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::ConnectionRefused
             | io::ErrorKind::ConnectionReset
+    ) || matches!(
+        error.raw_os_error(),
+        Some(nix::libc::ENOBUFS | nix::libc::ENOMEM)
     )
+}
+
+fn check_tun_worker(worker: &mpsc::Receiver<io::Error>) -> Result<(), ServerDaemonError> {
+    match worker.try_recv() {
+        Ok(error) => Err(error.into()),
+        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Err(mpsc::TryRecvError::Disconnected) => Err(ServerDaemonError::WorkerStopped),
+    }
 }
 
 fn configure_socket_buffers(socket: &UdpSocket) -> std::io::Result<()> {
@@ -472,108 +490,147 @@ fn handle_client_data(
     }
 }
 
-fn start_tun_worker(tun: Arc<LinuxTun>, socket: UdpSocket, sessions: SessionMap) {
+fn start_tun_worker(
+    tun: Arc<LinuxTun>,
+    socket: UdpSocket,
+    sessions: SessionMap,
+) -> mpsc::Receiver<io::Error> {
+    let (failure, failures) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let mut packets: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
-            .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
-            .collect();
-        let mut datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
-            .map(|_| Vec::with_capacity(DATAGRAM_BUFFER_LEN))
-            .collect();
-        let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
-        let mut peers = Vec::with_capacity(UDP_BATCH_SIZE);
-        let mut traffic = Vec::with_capacity(UDP_BATCH_SIZE);
-        let mut payload_lengths = Vec::with_capacity(UDP_BATCH_SIZE);
-        let mut send_headers = MultiHeaders::preallocate(UDP_BATCH_SIZE, None);
-        loop {
-            let mut descriptor = [PollFd::new(tun.as_fd(), PollFlags::POLLIN)];
-            if let Err(error) = poll(&mut descriptor, None::<u16>) {
-                if error == nix::errno::Errno::EINTR {
-                    continue;
-                }
-                eprintln!("MouseVPN TUN worker stopped: {error}");
-                return;
-            }
-            let mut packet_count = 0;
-            while packet_count < UDP_BATCH_SIZE {
-                match tun.receive(&mut packets[packet_count]) {
-                    Ok(length) => {
-                        packet_lengths[packet_count] = length;
-                        packet_count += 1;
-                    }
-                    Err(error) if is_recoverable(&error) => break,
-                    Err(error) => {
-                        eprintln!("MouseVPN TUN worker stopped: {error}");
-                        return;
-                    }
-                }
-            }
+        let error = run_tun_worker(&tun, &socket, &sessions)
+            .err()
+            .unwrap_or_else(|| io::Error::other("TUN worker stopped unexpectedly"));
+        let _ = failure.send(error);
+    });
+    failures
+}
 
-            peers.clear();
-            traffic.clear();
-            payload_lengths.clear();
-            let mut datagram_count = 0;
-            for index in 0..packet_count {
-                let packet = &packets[index][..packet_lengths[index]];
-                let Ok(ip) = Ipv4Packet::parse(packet) else {
-                    continue;
-                };
-                let Some(session) = find_session_by_address(&sessions, ip.destination()) else {
-                    continue;
-                };
-                if !session.authorization.is_active() {
-                    continue;
-                }
-                let Some(peer) = session.peer() else {
-                    continue;
-                };
-                {
-                    let Ok(mut outbound) = session.outbound.lock() else {
-                        continue;
-                    };
-                    if outbound
-                        .encode_ip_into(ip.as_bytes(), &mut datagrams[datagram_count])
-                        .is_err()
-                    {
-                        continue;
-                    }
-                }
-                peers.push(peer);
-                traffic.push(Arc::clone(&session.traffic));
-                payload_lengths.push(ip.as_bytes().len() as u64);
-                datagram_count += 1;
-            }
-            if datagram_count == 0 {
+fn run_tun_worker(tun: &LinuxTun, socket: &UdpSocket, sessions: &SessionMap) -> io::Result<()> {
+    let mut packets: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+        .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
+        .collect();
+    let mut datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+        .map(|_| Vec::with_capacity(DATAGRAM_BUFFER_LEN))
+        .collect();
+    let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
+    let mut peers = Vec::with_capacity(UDP_BATCH_SIZE);
+    let mut traffic = Vec::with_capacity(UDP_BATCH_SIZE);
+    let mut payload_lengths = Vec::with_capacity(UDP_BATCH_SIZE);
+    let mut send_headers = MultiHeaders::preallocate(UDP_BATCH_SIZE, None);
+    let mut dropped_datagrams = 0_u64;
+    let mut last_drop_report = None;
+    loop {
+        let mut descriptor = [PollFd::new(tun.as_fd(), PollFlags::POLLIN)];
+        if let Err(error) = poll(&mut descriptor, None::<u16>) {
+            if error == nix::errno::Errno::EINTR {
                 continue;
             }
-
-            let slices: [[IoSlice<'_>; 1]; UDP_BATCH_SIZE] = std::array::from_fn(|index| {
-                [IoSlice::new(
-                    datagrams.get(index).map_or(&[], Vec::as_slice),
-                )]
-            });
-            let addresses: [Option<SockaddrStorage>; UDP_BATCH_SIZE] =
-                std::array::from_fn(|index| peers.get(index).copied().map(SockaddrStorage::from));
-            let send_result = sendmmsg(
-                socket.as_raw_fd(),
-                &mut send_headers,
-                &slices[..datagram_count],
-                &addresses[..datagram_count],
-                [],
-                MsgFlags::empty(),
-            );
-            match send_result {
-                Ok(results) => {
-                    record_downloads(results.count(), &traffic, &payload_lengths);
+            return Err(io::Error::from(error));
+        }
+        let mut packet_count = 0;
+        while packet_count < UDP_BATCH_SIZE {
+            match tun.receive(&mut packets[packet_count]) {
+                Ok(length) => {
+                    packet_lengths[packet_count] = length;
+                    packet_count += 1;
                 }
-                Err(error) if !is_recoverable(&io::Error::from(error)) => {
-                    eprintln!("MouseVPN TUN worker stopped: {error}");
-                    return;
-                }
-                Err(_) => {}
+                Err(error) if is_recoverable(&error) => break,
+                Err(error) => return Err(error),
             }
         }
+
+        peers.clear();
+        traffic.clear();
+        payload_lengths.clear();
+        let mut datagram_count = 0;
+        for index in 0..packet_count {
+            let packet = &packets[index][..packet_lengths[index]];
+            let Ok(ip) = Ipv4Packet::parse(packet) else {
+                continue;
+            };
+            let Some(session) = find_session_by_address(sessions, ip.destination()) else {
+                continue;
+            };
+            if !session.authorization.is_active() {
+                continue;
+            }
+            let Some(peer) = session.peer() else {
+                continue;
+            };
+            {
+                let Ok(mut outbound) = session.outbound.lock() else {
+                    continue;
+                };
+                if outbound
+                    .encode_ip_into(ip.as_bytes(), &mut datagrams[datagram_count])
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            peers.push(peer);
+            traffic.push(Arc::clone(&session.traffic));
+            payload_lengths.push(ip.as_bytes().len() as u64);
+            datagram_count += 1;
+        }
+        if datagram_count == 0 {
+            continue;
+        }
+
+        let sent = send_server_batch(
+            socket,
+            &mut send_headers,
+            &datagrams,
+            &peers,
+            datagram_count,
+        )?;
+        record_downloads(sent, &traffic, &payload_lengths);
+        note_server_drops(
+            &mut dropped_datagrams,
+            &mut last_drop_report,
+            datagram_count.saturating_sub(sent),
+        );
+    }
+}
+
+fn send_server_batch(
+    socket: &UdpSocket,
+    headers: &mut MultiHeaders<SockaddrStorage>,
+    datagrams: &[Vec<u8>],
+    peers: &[SocketAddr],
+    count: usize,
+) -> io::Result<usize> {
+    let slices: [[IoSlice<'_>; 1]; UDP_BATCH_SIZE] = std::array::from_fn(|index| {
+        [IoSlice::new(
+            datagrams.get(index).map_or(&[], Vec::as_slice),
+        )]
     });
+    let addresses: [Option<SockaddrStorage>; UDP_BATCH_SIZE] =
+        std::array::from_fn(|index| peers.get(index).copied().map(SockaddrStorage::from));
+    match sendmmsg(
+        socket.as_raw_fd(),
+        headers,
+        &slices[..count],
+        &addresses[..count],
+        [],
+        MsgFlags::empty(),
+    ) {
+        Ok(results) => Ok(results.count()),
+        Err(error) if is_recoverable(&io::Error::from(error)) => Ok(0),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+fn note_server_drops(total: &mut u64, last_report: &mut Option<Instant>, dropped: usize) {
+    if dropped == 0 {
+        return;
+    }
+    *total = total.saturating_add(dropped as u64);
+    let now = Instant::now();
+    if last_report.is_none_or(|last| now.duration_since(last) >= UDP_DROP_LOG_INTERVAL) {
+        eprintln!("MouseVPN UDP send queue dropped {total} datagrams");
+        *last_report = Some(now);
+    }
 }
 
 fn record_downloads(sent: usize, traffic: &[Arc<DeviceTrafficCounter>], payload_lengths: &[u64]) {
@@ -720,9 +777,13 @@ impl Sessions {
 
 #[cfg(test)]
 mod admin_listener_tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr},
+        sync::mpsc,
+    };
 
-    use super::admin_listener_allowed;
+    use super::{admin_listener_allowed, check_tun_worker, is_recoverable};
 
     #[test]
     fn public_admin_listener_requires_explicit_opt_in() {
@@ -743,5 +804,29 @@ mod admin_listener_tests {
             tunnel,
             true
         ));
+    }
+
+    #[test]
+    fn udp_queue_pressure_does_not_stop_the_server() {
+        assert!(is_recoverable(&io::Error::from_raw_os_error(
+            nix::libc::ENOBUFS
+        )));
+        assert!(is_recoverable(&io::Error::from_raw_os_error(
+            nix::libc::ENOMEM
+        )));
+    }
+
+    #[test]
+    fn reports_worker_errors_and_disconnects() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(check_tun_worker(&receiver).is_ok());
+        sender
+            .send(io::Error::other("TUN worker failed"))
+            .expect("send worker failure");
+        assert!(check_tun_worker(&receiver).is_err());
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        assert!(check_tun_worker(&receiver).is_err());
     }
 }

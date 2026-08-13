@@ -15,7 +15,7 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::Datagram;
 use mousevpn_protocol::SessionParameters;
-use mousevpn_transport::{DatagramTransport, UdpTransport};
+use mousevpn_transport::{DatagramTransport, UdpBatch, UdpTransport};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::{
     poll::{poll, PollFd, PollFlags},
@@ -53,6 +53,15 @@ pub(crate) struct SessionMetrics {
     pub(crate) udp_send_drops: AtomicU64,
     pub(crate) reconnects: AtomicU64,
     pub(crate) last_reconnect_ms: AtomicU64,
+    pub(crate) network_changes: AtomicU64,
+    pub(crate) session_timeouts: AtomicU64,
+    pub(crate) peer_unreachable: AtomicU64,
+    pub(crate) reconnect_failures: AtomicU64,
+    pub(crate) invalid_datagrams: AtomicU64,
+    pub(crate) keepalives_sent: AtomicU64,
+    pub(crate) keepalive_responses: AtomicU64,
+    pub(crate) last_keepalive_rtt_ms: AtomicU64,
+    pub(crate) max_keepalive_rtt_ms: AtomicU64,
 }
 
 pub(crate) struct SpawnedSession {
@@ -84,6 +93,7 @@ struct IncomingLoop<'a> {
     context: &'a RunContext,
     reconnecting: Arc<AtomicBool>,
     last_sent: Instant,
+    keepalive_sent_at: Option<Instant>,
     last_received: Instant,
     next_reconnect: Instant,
     reconnect_backoff: Duration,
@@ -174,7 +184,7 @@ fn run(
     let packet_capacity = usize::from(context.parameters.mtu) + 128;
     let outgoing_metrics = Arc::clone(&context.metrics);
     let outgoing = thread::spawn(move || {
-        send_outgoing(
+        let result = send_outgoing(
             sending_tun,
             &OutgoingContext {
                 outbound: &outgoing_state,
@@ -186,7 +196,15 @@ fn run(
                 metrics: &outgoing_metrics,
             },
             packet_capacity,
-        )
+        );
+        // The receive direction owns the public session state. If this worker
+        // exits on its own (including a TUN EOF), wake that direction so the
+        // session cannot remain "running" with uploads silently dead.
+        if !session_stopping.load(Ordering::Relaxed) && !outgoing_flag.load(Ordering::Relaxed) {
+            session_stopping.store(true, Ordering::Release);
+            signal(&outgoing_wake);
+        }
+        result
     });
     let receive_result = IncomingLoop {
         tun: &mut tun,
@@ -196,6 +214,7 @@ fn run(
         context,
         reconnecting,
         last_sent: Instant::now(),
+        keepalive_sent_at: None,
         last_received: Instant::now(),
         next_reconnect: Instant::now(),
         reconnect_backoff: MIN_RECONNECT_RETRY,
@@ -221,15 +240,27 @@ impl IncomingLoop<'_> {
         let mut lengths = Vec::with_capacity(UDP_BATCH_SIZE);
         let mut plaintext = Vec::with_capacity(packet_capacity);
         let mut keepalive = Vec::with_capacity(128);
+        let mut udp_batch = UdpBatch::default();
         while !self.context.stopping.load(Ordering::Relaxed) {
-            match self.transport.receive_batch(&mut packets, &mut lengths) {
+            match self
+                .transport
+                .receive_batch_with(&mut packets, &mut lengths, &mut udp_batch)
+            {
                 Ok(()) => {
                     for (packet, length) in packets.iter().zip(lengths.iter().copied()) {
                         self.process_received(&packet[..length], &mut plaintext)?;
                     }
                 }
                 Err(error) if is_poll_event(&error) => {}
-                Err(error) if is_peer_unavailable(&error) => self.reconnect_needed = true,
+                Err(error) if is_peer_unavailable(&error) => {
+                    if !self.reconnect_needed {
+                        self.context
+                            .metrics
+                            .peer_unreachable
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.reconnect_needed = true;
+                }
                 Err(error) => return Err(error.into()),
             }
             if self.last_sent.elapsed() >= KEEPALIVE {
@@ -265,8 +296,30 @@ impl IncomingLoop<'_> {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Some(Ok(Decoded::Keepalive)) => self.last_received = Instant::now(),
-            Some(Err(_)) | None => {}
+            Some(Ok(Decoded::Keepalive)) => {
+                self.last_received = Instant::now();
+                if let Some(sent_at) = self.keepalive_sent_at.take() {
+                    let rtt_ms = sent_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    self.context
+                        .metrics
+                        .keepalive_responses
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.context
+                        .metrics
+                        .last_keepalive_rtt_ms
+                        .store(rtt_ms, Ordering::Relaxed);
+                    self.context
+                        .metrics
+                        .max_keepalive_rtt_ms
+                        .fetch_max(rtt_ms, Ordering::Relaxed);
+                }
+            }
+            Some(Err(_)) | None => {
+                self.context
+                    .metrics
+                    .invalid_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -274,11 +327,31 @@ impl IncomingLoop<'_> {
     fn send_keepalive(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
         encode_keepalive(&self.outbound, buffer)?;
         match self.transport.send(buffer) {
-            Ok(()) => {}
-            Err(error) if is_peer_unavailable(&error) => self.reconnect_needed = true,
+            Ok(()) => {
+                self.last_sent = Instant::now();
+                self.keepalive_sent_at = Some(self.last_sent);
+                self.context
+                    .metrics
+                    .keepalives_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) if is_peer_unavailable(&error) => {
+                if !self.reconnect_needed {
+                    self.context
+                        .metrics
+                        .peer_unreachable
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.reconnect_needed = true;
+                self.last_sent = Instant::now();
+                self.keepalive_sent_at = None;
+            }
+            Err(error) if is_transient_send(&error) => {
+                self.last_sent = Instant::now();
+                self.keepalive_sent_at = None;
+            }
             Err(error) => return Err(error.into()),
         }
-        self.last_sent = Instant::now();
         Ok(())
     }
 
@@ -292,7 +365,11 @@ impl IncomingLoop<'_> {
             self.reconnect_needed = true;
             self.next_reconnect = now;
         }
-        if self.last_received.elapsed() >= SESSION_TIMEOUT {
+        if self.last_received.elapsed() >= SESSION_TIMEOUT && !self.reconnect_needed {
+            self.context
+                .metrics
+                .session_timeouts
+                .fetch_add(1, Ordering::Relaxed);
             self.reconnect_needed = true;
         }
     }
@@ -329,6 +406,10 @@ impl IncomingLoop<'_> {
             self.finish_reconnect(started);
             return Ok(());
         }
+        self.context
+            .metrics
+            .reconnect_failures
+            .fetch_add(1, Ordering::Relaxed);
         self.next_reconnect = Instant::now() + self.reconnect_backoff;
         self.reconnect_backoff = (self.reconnect_backoff * 2).min(MAX_RECONNECT_RETRY);
         self.finish_reconnect(started);
@@ -390,6 +471,7 @@ impl IncomingLoop<'_> {
             let now = Instant::now();
             self.last_received = now;
             self.last_sent = now;
+            self.keepalive_sent_at = None;
             self.reconnect_needed = false;
             self.reconnect_backoff = MIN_RECONNECT_RETRY;
             return true;
@@ -424,6 +506,7 @@ impl IncomingLoop<'_> {
         self.transport = transport;
         self.last_received = Instant::now();
         self.last_sent = self.last_received;
+        self.keepalive_sent_at = None;
         self.reconnect_needed = false;
         self.reconnect_backoff = MIN_RECONNECT_RETRY;
         Ok(())
@@ -443,6 +526,7 @@ fn send_outgoing(
         .collect();
     let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
     let mut datagram_bytes = [0_u64; UDP_BATCH_SIZE];
+    let mut udp_batch = UdpBatch::default();
     while !context.stopping.load(Ordering::Relaxed)
         && !context.session_stopping.load(Ordering::Relaxed)
     {
@@ -492,7 +576,9 @@ fn send_outgoing(
                 datagram_count += 1;
             }
         }
-        let sent = outbound.transport.send_batch(&datagrams[..datagram_count]);
+        let sent = outbound
+            .transport
+            .send_batch_with(&datagrams[..datagram_count], &mut udp_batch);
         drop(outbound);
         match sent {
             Ok(sent_count) => {
@@ -511,8 +597,19 @@ fn send_outgoing(
                 );
             }
             Err(error) if is_peer_unavailable(&error) => {
-                context.reconnect_requested.store(true, Ordering::Release);
-                signal(context.wake);
+                if !context.reconnect_requested.swap(true, Ordering::AcqRel) {
+                    context
+                        .metrics
+                        .peer_unreachable
+                        .fetch_add(1, Ordering::Relaxed);
+                    signal(context.wake);
+                }
+            }
+            Err(error) if is_transient_send(&error) => {
+                context
+                    .metrics
+                    .udp_send_drops
+                    .fetch_add(datagram_count as u64, Ordering::Relaxed);
             }
             Err(error) => return Err(error.into()),
         }
@@ -584,6 +681,16 @@ fn is_poll_event(error: &io::Error) -> bool {
     )
 }
 
+fn is_transient_send(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) || matches!(
+        error.raw_os_error(),
+        Some(nix::libc::ENOBUFS | nix::libc::ENOMEM)
+    )
+}
+
 fn write_packet_nonblocking(tun: &mut File, packet: &[u8]) -> Result<bool> {
     loop {
         match tun.write(packet) {
@@ -596,5 +703,28 @@ fn write_packet_nonblocking(tun: &mut File, packet: &[u8]) -> Result<bool> {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::is_transient_send;
+
+    #[test]
+    fn treats_udp_queue_pressure_as_transient() {
+        assert!(is_transient_send(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(is_transient_send(&io::Error::from_raw_os_error(
+            nix::libc::ENOBUFS
+        )));
+        assert!(is_transient_send(&io::Error::from_raw_os_error(
+            nix::libc::ENOMEM
+        )));
+        assert!(!is_transient_send(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
     }
 }

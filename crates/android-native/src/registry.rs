@@ -74,6 +74,10 @@ pub(crate) fn network_changed(handle: i64) {
         return;
     };
     if let Some(Entry::Running(session)) = map.get(&handle) {
+        session
+            .metrics
+            .network_changes
+            .fetch_add(1, Ordering::Relaxed);
         session.reconnect_requested.store(true, Ordering::Release);
         crate::session::signal(&session.wake);
     }
@@ -110,6 +114,15 @@ pub(crate) fn metrics(handle: i64) -> String {
         "udpSendDrops": metrics.udp_send_drops.load(Ordering::Relaxed),
         "reconnects": metrics.reconnects.load(Ordering::Relaxed),
         "lastReconnectMs": metrics.last_reconnect_ms.load(Ordering::Relaxed),
+        "networkChanges": metrics.network_changes.load(Ordering::Relaxed),
+        "sessionTimeouts": metrics.session_timeouts.load(Ordering::Relaxed),
+        "peerUnreachable": metrics.peer_unreachable.load(Ordering::Relaxed),
+        "reconnectFailures": metrics.reconnect_failures.load(Ordering::Relaxed),
+        "invalidDatagrams": metrics.invalid_datagrams.load(Ordering::Relaxed),
+        "keepalivesSent": metrics.keepalives_sent.load(Ordering::Relaxed),
+        "keepaliveResponses": metrics.keepalive_responses.load(Ordering::Relaxed),
+        "lastKeepaliveRttMs": metrics.last_keepalive_rtt_ms.load(Ordering::Relaxed),
+        "maxKeepaliveRttMs": metrics.max_keepalive_rtt_ms.load(Ordering::Relaxed),
     })
     .to_string()
 }

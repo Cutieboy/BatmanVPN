@@ -10,7 +10,7 @@ use std::{
 
 use mousevpn_data_plane::{PacketDevice, TunnelSender};
 use mousevpn_linux_platform::LinuxTun;
-use mousevpn_transport::UdpTransport;
+use mousevpn_transport::{UdpBatch, UdpTransport};
 use nix::poll::{poll, PollFd, PollFlags};
 
 use crate::{
@@ -46,6 +46,7 @@ pub(crate) fn run(
         .map(|_| Vec::with_capacity(PACKET_BUFFER_LEN))
         .collect();
     let mut drops = Drops::default();
+    let mut udp_batch = UdpBatch::default();
 
     while !stopping.load(Ordering::Relaxed) {
         // A connected UDP socket can retain its pre-suspend source address and
@@ -101,7 +102,7 @@ pub(crate) fn run(
         if encoded == 0 {
             continue;
         }
-        match transport.send_batch(&datagrams[..encoded]) {
+        match transport.send_batch_with(&datagrams[..encoded], &mut udp_batch) {
             Ok(sent) if sent == encoded => {}
             Ok(sent) => drops.record(&format_args!(
                 "UDP send queue accepted {sent} of {encoded} batched packets"

@@ -13,7 +13,7 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, PacketDevice, TunnelReceiver, TunnelSender};
 use mousevpn_linux_platform::{DnsGuard, LinuxTun, RouteGuard};
 use mousevpn_protocol::{Datagram, SessionParameters};
-use mousevpn_transport::{DatagramTransport, UdpTransport};
+use mousevpn_transport::{DatagramTransport, UdpBatch, UdpTransport};
 
 use crate::{
     error::is_peer_unavailable,
@@ -68,10 +68,11 @@ impl PacketLoop<'_> {
         let mut keepalive = Vec::with_capacity(128);
         let mut liveness = Liveness::new(Instant::now());
         let mut next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
+        let mut udp_batch = UdpBatch::default();
 
         while !self.stopping.load(Ordering::Relaxed) {
             check_worker(&self.worker, &self.stopping)?;
-            match self.receive(&mut datagrams, &mut lengths)? {
+            match self.receive(&mut datagrams, &mut lengths, &mut udp_batch)? {
                 ReceiveEvent::Packets => {
                     for (datagram, &length) in datagrams.iter().zip(&lengths) {
                         if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
@@ -118,8 +119,9 @@ impl PacketLoop<'_> {
         &mut self,
         datagrams: &mut [Vec<u8>],
         lengths: &mut Vec<usize>,
+        batch: &mut UdpBatch,
     ) -> Result<ReceiveEvent, ClientError> {
-        match self.transport.receive_batch(datagrams, lengths) {
+        match self.transport.receive_batch_with(datagrams, lengths, batch) {
             Ok(()) => Ok(ReceiveEvent::Packets),
             Err(error)
                 if error.kind() == io::ErrorKind::Interrupted
