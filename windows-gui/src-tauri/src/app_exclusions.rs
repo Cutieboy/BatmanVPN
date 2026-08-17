@@ -35,7 +35,27 @@ function Add-DesktopApp([string]$name,[string]$path) {
   $stem=[IO.Path]::GetFileNameWithoutExtension($path)
   if ($stem -match '^(unins\d*|uninstall)$' -or $stem -ieq 'mousevpn-windows-gui') { return }
   if ($name -match '^(Uninstall|Деинсталлировать)\b') { return }
-  $apps.Add([pscustomobject]@{id=('desktop:'+$path);name=$name;path=$path;paths=@($path);source='desktop';packageName=$null;relativePaths=@()})
+  $desktopPaths=[System.Collections.Generic.List[string]]::new()
+  $desktopPaths.Add($path)
+  $fileName=[IO.Path]::GetFileName($path)
+  $parent=[IO.Path]::GetDirectoryName($path)
+  $squirrelRoot=$null
+  if (Test-Path -LiteralPath (Join-Path $parent 'Update.exe') -PathType Leaf) {
+    $squirrelRoot=$parent
+  } elseif ([IO.Path]::GetFileName($parent).StartsWith('app-',[StringComparison]::OrdinalIgnoreCase)) {
+    $candidateRoot=[IO.Path]::GetDirectoryName($parent)
+    if (Test-Path -LiteralPath (Join-Path $candidateRoot 'Update.exe') -PathType Leaf) {$squirrelRoot=$candidateRoot}
+  }
+  if ($squirrelRoot) {
+    $stable=Join-Path $squirrelRoot $fileName
+    if (Test-Path -LiteralPath $stable -PathType Leaf) {$desktopPaths.Add($stable)}
+    Get-ChildItem -LiteralPath $squirrelRoot -Directory -Filter 'app-*' | ForEach-Object {
+      $versioned=Join-Path $_.FullName $fileName
+      if (Test-Path -LiteralPath $versioned -PathType Leaf) {$desktopPaths.Add($versioned)}
+    }
+  }
+  [string[]]$paths=@($desktopPaths | Select-Object -Unique)
+  $apps.Add([pscustomobject]@{id=('desktop:'+$path);name=$name;path=$path;paths=$paths;source='desktop';packageName=$null;relativePaths=@()})
 }
 
 Get-AppxPackage | Where-Object {-not $_.IsFramework -and $_.InstallLocation} | ForEach-Object {
@@ -292,6 +312,7 @@ fn validate_executable(path: &Path) -> Result<PathBuf, String> {
 
 fn load_resolved() -> Result<StoredSettings, String> {
     let mut settings = load()?;
+    let mut changed = resolve_squirrel_paths(&mut settings.apps);
     if settings
         .apps
         .iter()
@@ -301,12 +322,98 @@ fn load_resolved() -> Result<StoredSettings, String> {
         // AppX registration must not prevent MouseVPN from opening.
         if let Ok(installed) = discover_installed_apps() {
             if resolve_packaged_paths(&mut settings.apps, &installed) {
-                sort_and_deduplicate(&mut settings.apps);
-                save(&settings)?;
+                changed = true;
             }
         }
     }
+    if changed {
+        sort_and_deduplicate(&mut settings.apps);
+        save(&settings)?;
+    }
     Ok(settings)
+}
+
+fn resolve_squirrel_paths(paths: &mut Vec<PathBuf>) -> bool {
+    let original_keys = paths
+        .iter()
+        .map(|path| normalized_key(path))
+        .collect::<Vec<_>>();
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths.iter() {
+        let Some((root, file_name)) = squirrel_identity(path) else {
+            continue;
+        };
+        let key = format!(
+            "{}|{}",
+            normalized_key(&root),
+            file_name.to_string_lossy().to_lowercase()
+        );
+        if seen.insert(key) {
+            identities.push((root, file_name));
+        }
+    }
+
+    for (root, file_name) in &identities {
+        let stable = root.join(file_name);
+        if stable.is_file() {
+            paths.push(normalize_windows_path(&stable));
+        }
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let directory = entry.path();
+                let is_version = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.to_ascii_lowercase().starts_with("app-"));
+                if is_version && directory.is_dir() {
+                    let versioned = directory.join(file_name);
+                    if versioned.is_file() {
+                        paths.push(normalize_windows_path(&versioned));
+                    }
+                }
+            }
+        }
+    }
+
+    // Squirrel removes old app-* directories during updates. Once a stable
+    // launcher identifies the installation, stale versioned paths are safe to
+    // discard and the currently installed version above replaces them.
+    paths.retain(|path| {
+        if path.is_file() {
+            return true;
+        }
+        !identities.iter().any(|(root, file_name)| {
+            path.file_name()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(file_name))
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().starts_with("app-"))
+                && path.parent().and_then(Path::parent) == Some(root.as_path())
+        })
+    });
+    sort_and_deduplicate(paths);
+    let resolved_keys = paths
+        .iter()
+        .map(|path| normalized_key(path))
+        .collect::<Vec<_>>();
+    original_keys != resolved_keys
+}
+
+fn squirrel_identity(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
+    let file_name = path.file_name()?.to_owned();
+    let parent = path.parent()?;
+    if parent.join("Update.exe").is_file() {
+        return Some((parent.to_owned(), file_name));
+    }
+    let is_version = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("app-"));
+    let root = parent.parent()?;
+    (is_version && root.join("Update.exe").is_file()).then(|| (root.to_owned(), file_name))
 }
 
 fn discover_installed_apps() -> Result<Vec<InstalledApp>, String> {
@@ -553,13 +660,14 @@ fn display_error(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
     use super::{
-        migrate, normalize, normalized_key, resolve_packaged_paths, sort_and_deduplicate,
-        windowsapps_identity, InstalledApp, StoredSettings,
+        migrate, normalize, normalized_key, resolve_packaged_paths, resolve_squirrel_paths,
+        sort_and_deduplicate, windowsapps_identity, InstalledApp, StoredSettings,
     };
     use mousevpn_windows_client::AppRoutingMode;
+    use uuid::Uuid;
 
     #[test]
     fn windows_paths_are_deduplicated_case_insensitively() {
@@ -628,6 +736,27 @@ mod tests {
                 r"C:\Program Files\WindowsApps\OpenAI.Codex_2.0.0.0_x64__publisher\app\ChatGPT.exe"
             )
         );
+    }
+
+    #[test]
+    fn expands_and_refreshes_squirrel_application_paths() {
+        let root = std::env::temp_dir().join(format!("mousevpn-squirrel-{}", Uuid::new_v4()));
+        let current = root.join("app-2.0.0");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(root.join("Update.exe"), []).unwrap();
+        fs::write(root.join("Claude.exe"), []).unwrap();
+        fs::write(current.join("Claude.exe"), []).unwrap();
+
+        let stale_version_path = root.join("app-1.0.0").join("Claude.exe");
+        let launcher_path = root.join("Claude.exe");
+        let current_executable = current.join("Claude.exe");
+        let mut paths = vec![launcher_path.clone(), stale_version_path];
+        assert!(resolve_squirrel_paths(&mut paths));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&launcher_path));
+        assert!(paths.contains(&current_executable));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
