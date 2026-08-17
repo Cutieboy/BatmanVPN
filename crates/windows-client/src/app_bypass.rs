@@ -10,22 +10,23 @@ use std::{
 use windows_sys::{
     core::GUID,
     Win32::{
-        Foundation::HANDLE,
+        Foundation::{LocalFree, HANDLE},
         NetworkManagement::WindowsFilteringPlatform::{
             FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFreeMemory0,
             FwpmGetAppIdFromFileName0, FwpmProviderAdd0, FwpmProviderContextAdd0, FwpmSubLayerAdd0,
             FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
             FWPM_ACTION0_0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
-            FWPM_CONDITION_ALE_APP_ID, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER0_0,
-            FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
-            FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT, FWPM_GENERAL_CONTEXT,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_DISPLAY_DATA0,
+            FWPM_FILTER0, FWPM_FILTER0_0, FWPM_FILTER_CONDITION0,
+            FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT,
+            FWPM_GENERAL_CONTEXT, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
             FWPM_LAYER_ALE_BIND_REDIRECT_V4, FWPM_LAYER_ALE_BIND_REDIRECT_V6, FWPM_PROVIDER0,
             FWPM_PROVIDER_CONTEXT0, FWPM_PROVIDER_CONTEXT0_0, FWPM_SESSION0,
             FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_CALLOUT_TERMINATING,
             FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-            FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL,
+            FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
         },
+        Security::{Authorization::ConvertStringSidToSidW, PSID},
         System::Rpc::RPC_C_AUTHN_WINNT,
     },
 };
@@ -65,7 +66,10 @@ struct BypassState {
 
 impl AppBypassGuard {
     pub(crate) fn install(policy: &AppRoutingPolicy) -> Result<Option<Self>, ClientError> {
-        if policy.apps.is_empty() && policy.mode == AppRoutingMode::Exclude {
+        if policy.apps.is_empty()
+            && policy.package_sids.is_empty()
+            && policy.mode == AppRoutingMode::Exclude
+        {
             return Ok(None);
         }
         for app in &policy.apps {
@@ -265,14 +269,38 @@ unsafe fn configure_transaction(
         AppRoutingMode::Exclude => {
             for path in &policy.apps {
                 let app_id = AppId::from_path(path)?;
-                add_excluded_app_filters(engine, app_id.blob, addresses.ipv6.is_some())?;
+                add_excluded_identity_filters(
+                    engine,
+                    FilterIdentity::Application(app_id.blob),
+                    addresses.ipv6.is_some(),
+                )?;
+            }
+            for sid in &policy.package_sids {
+                let package_sid = PackageSid::from_string(sid)?;
+                add_excluded_identity_filters(
+                    engine,
+                    FilterIdentity::Package(package_sid.sid),
+                    addresses.ipv6.is_some(),
+                )?;
             }
         }
         AppRoutingMode::Include => {
             add_default_bypass_filters(engine, addresses.ipv6.is_some())?;
             for path in &policy.apps {
                 let app_id = AppId::from_path(path)?;
-                add_vpn_app_filters(engine, app_id.blob, addresses.ipv6.is_some())?;
+                add_vpn_identity_filters(
+                    engine,
+                    FilterIdentity::Application(app_id.blob),
+                    addresses.ipv6.is_some(),
+                )?;
+            }
+            for sid in &policy.package_sids {
+                let package_sid = PackageSid::from_string(sid)?;
+                add_vpn_identity_filters(
+                    engine,
+                    FilterIdentity::Package(package_sid.sid),
+                    addresses.ipv6.is_some(),
+                )?;
             }
         }
     }
@@ -309,32 +337,32 @@ fn add_redirect_context(
     )
 }
 
-fn add_excluded_app_filters(
+fn add_excluded_identity_filters(
     engine: HANDLE,
-    app_id: *mut FWP_BYTE_BLOB,
+    identity: FilterIdentity,
     ipv6: bool,
 ) -> Result<(), ClientError> {
     add_redirect_filter(
         engine,
-        Some(app_id),
+        Some(identity),
         FWPM_LAYER_ALE_BIND_REDIRECT_V4,
         BIND_CALLOUT_KEY,
         IPV4_CONTEXT_KEY,
         15,
         "MouseVPN excluded application",
     )?;
-    add_permit_filter(engine, app_id)?;
+    add_permit_filter(engine, identity)?;
     if ipv6 {
         add_redirect_filter(
             engine,
-            Some(app_id),
+            Some(identity),
             FWPM_LAYER_ALE_BIND_REDIRECT_V6,
             BIND_V6_CALLOUT_KEY,
             IPV6_CONTEXT_KEY,
             15,
             "MouseVPN excluded IPv6 application",
         )?;
-        add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
+        add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?;
     }
     Ok(())
 }
@@ -363,14 +391,14 @@ fn add_default_bypass_filters(engine: HANDLE, ipv6: bool) -> Result<(), ClientEr
     Ok(())
 }
 
-fn add_vpn_app_filters(
+fn add_vpn_identity_filters(
     engine: HANDLE,
-    app_id: *mut FWP_BYTE_BLOB,
+    identity: FilterIdentity,
     ipv6: bool,
 ) -> Result<(), ClientError> {
-    add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_BIND_REDIRECT_V4)?;
+    add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_BIND_REDIRECT_V4)?;
     if ipv6 {
-        add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_BIND_REDIRECT_V6)?;
+        add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_BIND_REDIRECT_V6)?;
     }
     Ok(())
 }
@@ -399,7 +427,7 @@ fn add_callout(
 
 fn add_redirect_filter(
     engine: HANDLE,
-    app_id: Option<*mut FWP_BYTE_BLOB>,
+    identity: Option<FilterIdentity>,
     layer: GUID,
     callout: GUID,
     context_key: GUID,
@@ -407,8 +435,8 @@ fn add_redirect_filter(
     name: &str,
 ) -> Result<(), ClientError> {
     let mut conditions = Vec::with_capacity(1);
-    if let Some(app_id) = app_id {
-        conditions.push(app_condition(app_id));
+    if let Some(identity) = identity {
+        conditions.push(identity.condition());
     }
     let mut name = wide(name);
     let mut provider_key = PROVIDER_KEY;
@@ -450,16 +478,16 @@ fn add_redirect_filter(
     )
 }
 
-fn add_permit_filter(engine: HANDLE, app_id: *mut FWP_BYTE_BLOB) -> Result<(), ClientError> {
-    add_permit_filter_for_layer(engine, app_id, FWPM_LAYER_ALE_AUTH_CONNECT_V4)
+fn add_permit_filter(engine: HANDLE, identity: FilterIdentity) -> Result<(), ClientError> {
+    add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_AUTH_CONNECT_V4)
 }
 
 fn add_permit_filter_for_layer(
     engine: HANDLE,
-    app_id: *mut FWP_BYTE_BLOB,
+    identity: FilterIdentity,
     layer: GUID,
 ) -> Result<(), ClientError> {
-    let mut condition = app_condition(app_id);
+    let mut condition = identity.condition();
     let mut name = wide("MouseVPN application permit");
     let mut provider_key = PROVIDER_KEY;
     let mut weight = 15_u64;
@@ -490,14 +518,34 @@ fn add_permit_filter_for_layer(
     )
 }
 
-fn app_condition(app_id: *mut FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 {
-    FWPM_FILTER_CONDITION0 {
-        fieldKey: FWPM_CONDITION_ALE_APP_ID,
-        matchType: FWP_MATCH_EQUAL,
-        conditionValue: FWP_CONDITION_VALUE0 {
-            r#type: FWP_BYTE_BLOB_TYPE,
-            Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
-        },
+#[derive(Clone, Copy)]
+enum FilterIdentity {
+    Application(*mut FWP_BYTE_BLOB),
+    Package(PSID),
+}
+
+impl FilterIdentity {
+    fn condition(self) -> FWPM_FILTER_CONDITION0 {
+        let (field_key, value_type, value) = match self {
+            Self::Application(app_id) => (
+                FWPM_CONDITION_ALE_APP_ID,
+                FWP_BYTE_BLOB_TYPE,
+                FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+            ),
+            Self::Package(sid) => (
+                FWPM_CONDITION_ALE_PACKAGE_ID,
+                FWP_SID,
+                FWP_CONDITION_VALUE0_0 { sid: sid.cast() },
+            ),
+        };
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: field_key,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: value_type,
+                Anonymous: value,
+            },
+        }
     }
 }
 
@@ -522,6 +570,32 @@ impl Drop for AppId {
     fn drop(&mut self) {
         unsafe {
             FwpmFreeMemory0(ptr::from_mut(&mut self.blob).cast::<*mut c_void>());
+        }
+    }
+}
+
+struct PackageSid {
+    sid: PSID,
+}
+
+impl PackageSid {
+    fn from_string(value: &str) -> Result<Self, ClientError> {
+        let value = wide(value);
+        let mut sid = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut sid) } == 0 || sid.is_null() {
+            return Err(ClientError::Platform(format!(
+                "invalid Windows application package SID: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self { sid })
+    }
+}
+
+impl Drop for PackageSid {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.sid.cast());
         }
     }
 }

@@ -40,6 +40,80 @@ pub enum AppRoutingMode {
 pub struct AppRoutingPolicy {
     pub mode: AppRoutingMode,
     pub apps: Vec<PathBuf>,
+    pub package_sids: Vec<String>,
+}
+
+#[cfg(windows)]
+/// Derives the `AppContainer` SID string used by WFP and Windows Firewall.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Platform`] when Windows cannot derive or format the
+/// package identity.
+pub fn app_container_sid_string(package_family_name: &str) -> Result<String, ClientError> {
+    use std::ptr;
+
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::ConvertSidToStringSidW, FreeSid,
+            Isolation::DeriveAppContainerSidFromAppContainerName, PSID,
+        },
+    };
+
+    let package_family_name = package_family_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut sid: PSID = ptr::null_mut();
+    let result = unsafe {
+        DeriveAppContainerSidFromAppContainerName(package_family_name.as_ptr(), &raw mut sid)
+    };
+    if result < 0 || sid.is_null() {
+        return Err(ClientError::Platform(format!(
+            "failed to derive the package SID (HRESULT 0x{:08X})",
+            u32::from_ne_bytes(result.to_ne_bytes())
+        )));
+    }
+
+    let mut sid_string = ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut sid_string) };
+    if converted == 0 || sid_string.is_null() {
+        unsafe {
+            FreeSid(sid);
+        }
+        return Err(ClientError::Platform(format!(
+            "failed to format the package SID: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let Some(length) = (0..256).find(|&index| unsafe { *sid_string.add(index) == 0 }) else {
+        unsafe {
+            LocalFree(sid_string.cast());
+            FreeSid(sid);
+        }
+        return Err(ClientError::Platform(
+            "Windows returned an invalid package SID string".to_owned(),
+        ));
+    };
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_string, length) });
+    unsafe {
+        LocalFree(sid_string.cast());
+        FreeSid(sid);
+    }
+    Ok(value)
+}
+
+#[cfg(not(windows))]
+/// Reports that AppContainer identities are unavailable outside Windows.
+///
+/// # Errors
+///
+/// Always returns [`ClientError::Platform`] outside Windows.
+pub fn app_container_sid_string(_package_family_name: &str) -> Result<String, ClientError> {
+    Err(ClientError::Platform(
+        "Windows application package identities are unavailable on this platform".to_owned(),
+    ))
 }
 
 /// Converts Rust's extended-length canonical Windows paths into the regular
@@ -82,5 +156,12 @@ mod tests {
             normalize_windows_path(Path::new(r"\\?\UNC\server\share\Browser.exe")),
             Path::new(r"\\server\share\Browser.exe")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derives_an_app_container_sid_from_a_package_family() {
+        let sid = super::app_container_sid_string("OpenAI.Codex_2p2nqsd0c76g0").unwrap();
+        assert!(sid.starts_with("S-1-15-2-"));
     }
 }
