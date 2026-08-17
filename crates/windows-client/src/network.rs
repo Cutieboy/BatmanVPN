@@ -412,7 +412,10 @@ pub(crate) fn runtime_dir() -> Result<PathBuf, ClientError> {
 }
 
 fn powershell_path(path: &Path) -> String {
-    path.display().to_string().replace('\'', "''")
+    crate::normalize_windows_path(path)
+        .display()
+        .to_string()
+        .replace('\'', "''")
 }
 
 pub(crate) fn run_powershell(script: &str, operation: &str) -> Result<(), ClientError> {
@@ -575,6 +578,19 @@ mod tests {
         );
         assert!(script.contains("-Program $app"));
         assert!(script.contains("Mouse''s Browser.exe"));
+    }
+
+    #[test]
+    fn allowlist_firewall_uses_regular_windows_paths() {
+        let script = firewall_script(
+            &AppRoutingPolicy {
+                mode: AppRoutingMode::Include,
+                apps: vec![PathBuf::from(r"\\?\C:\Program Files\Browser\browser.exe")],
+            },
+            false,
+        );
+        assert!(script.contains(r"'C:\Program Files\Browser\browser.exe'"));
+        assert!(!script.contains(r"\\?\"));
     }
 
     #[test]

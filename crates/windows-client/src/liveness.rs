@@ -2,8 +2,11 @@
 
 use std::time::{Duration, Instant};
 
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+// Windows does not consistently surface an ICMP error when the UDP peer goes
+// away. Three missed lightweight probes bound passive recovery to nine seconds
+// without treating one delayed response as a dead session.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(9);
 const MIN_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(16);
 
@@ -87,14 +90,14 @@ mod tests {
     fn schedules_keepalive_and_reconnect() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        assert_eq!(state.action(start + Duration::from_secs(9)), Action::None);
+        assert_eq!(state.action(start + Duration::from_secs(2)), Action::None);
         assert_eq!(
-            state.action(start + Duration::from_secs(10)),
+            state.action(start + Duration::from_secs(3)),
             Action::Keepalive
         );
-        state.keepalive_sent(start + Duration::from_secs(10));
+        state.keepalive_sent(start + Duration::from_secs(3));
         assert_eq!(
-            state.action(start + Duration::from_secs(20)),
+            state.action(start + Duration::from_secs(9)),
             Action::Reconnect
         );
     }

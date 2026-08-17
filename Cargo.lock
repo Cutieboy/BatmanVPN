@@ -2457,13 +2457,14 @@ dependencies = [
 
 [[package]]
 name = "mousevpn-windows-gui"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "dirs",
  "mousevpn-config",
  "mousevpn-profile-cli",
  "mousevpn-windows-client",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "toml 1.1.4+spec-1.1.0",

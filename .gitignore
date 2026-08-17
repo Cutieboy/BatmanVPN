@@ -13,3 +13,6 @@
 *.jks
 *.keystore
 local.toml
+/windows-driver/x64/
+/windows-driver/MouseVpn.*/
+/windows-gui/src-tauri/friend-test-installer.generated.nsh

@@ -252,6 +252,22 @@ textarea:focus, input:focus { border-color: #42d9d0; box-shadow: 0 0 0 3px rgba(
 .exclusion-row.unavailable .exclusion-copy strong { color: #ff8a80; }
 .remove-exclusion { width: 34px; height: 34px; border-radius: 9px; background: transparent; color: #71869b; cursor: pointer; font-size: 19px; }
 .remove-exclusion:hover { background: #35222a; color: #ff8a80; }
+.app-picker-actions { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, .75fr); gap: 10px; }
+.app-picker-actions .primary-button { width: auto; }
+.app-picker-actions .secondary-button { height: 50px; }
+.installed-apps-backdrop { z-index: 12; }
+.installed-apps-modal { width: min(720px, 100%); }
+.installed-apps-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-bottom: 12px; }
+.installed-apps-tools input { height: 44px; padding: 0 13px; }
+.selection-count { color: #8fa3b8; font-size: 11px; white-space: nowrap; }
+.installed-apps-list { display: flex; min-height: 250px; max-height: min(460px, 52vh); flex-direction: column; gap: 8px; overflow-y: auto; }
+.installed-app-row { display: grid; grid-template-columns: 22px 38px minmax(0, 1fr); align-items: center; gap: 11px; margin: 0; padding: 10px 12px; border: 1px solid #283d54; border-radius: 13px; background: #0c1726; cursor: pointer; }
+.installed-app-row:hover { border-color: #3a566f; background: #101f31; }
+.installed-app-row:has(input:checked) { border-color: #42d9d0; background: #112b32; }
+.installed-app-row input { width: 18px; height: 18px; margin: 0; padding: 0; accent-color: #42d9d0; }
+.installed-app-source { display: inline-flex; margin-left: 7px; padding: 2px 6px; border-radius: 999px; background: #172b41; color: #8fa3b8; font-size: 8px; font-weight: 800; text-transform: uppercase; vertical-align: 1px; }
+.installed-app-row:has(input:checked) .installed-app-source { background: #174047; color: #73ebe4; }
+.apply-installed-apps { width: auto; flex: 1; }
 
 @keyframes pulse { 50% { opacity: .42; } }
 
@@ -264,4 +280,5 @@ textarea:focus, input:focus { border-color: #42d9d0; box-shadow: 0 0 0 3px rgba(
 @media (max-width: 620px) {
   .routing-modes { grid-template-columns: 1fr; }
   .app-routing-tools { grid-template-columns: 1fr; }
+  .app-picker-actions, .installed-apps-tools { grid-template-columns: 1fr; }
 }

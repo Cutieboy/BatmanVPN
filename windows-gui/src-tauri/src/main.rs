@@ -109,6 +109,11 @@ fn choose_executable() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+fn list_installed_apps() -> Result<Vec<app_exclusions::InstalledApp>, String> {
+    app_exclusions::installed_apps()
+}
+
+#[tauri::command]
 fn add_routed_app(path: String) -> Result<app_exclusions::AppRoutingSettings, String> {
     app_exclusions::add(path)
 }
@@ -128,6 +133,14 @@ fn set_app_routing_mode(
 #[tauri::command]
 fn clear_routed_apps() -> Result<app_exclusions::AppRoutingSettings, String> {
     app_exclusions::clear()
+}
+
+#[tauri::command]
+fn set_installed_app_selection(
+    selected_paths: Vec<String>,
+    discovered_paths: Vec<String>,
+) -> Result<app_exclusions::AppRoutingSettings, String> {
+    app_exclusions::set_installed_selection(selected_paths, discovered_paths)
 }
 
 #[tauri::command]
@@ -427,10 +440,7 @@ fn read_helper_status(
 fn run_helper(path: &Path) -> Result<(), String> {
     let config: ClientConfig = load_toml(path).map_err(display_error)?;
     let config = config.validate().map_err(display_error)?;
-    // The standalone Windows build intentionally runs as a full tunnel. Saved
-    // per-app settings from earlier builds must not silently require an
-    // unavailable kernel driver after the UI control has been hidden.
-    let app_routing = mousevpn_windows_client::AppRoutingPolicy::default();
+    let app_routing = app_exclusions::policy()?;
     let stopping = Arc::new(AtomicBool::new(false));
     let stdin_stopping = Arc::clone(&stopping);
     thread::spawn(move || {
@@ -506,10 +516,12 @@ fn run_gui(minimized: bool) {
             delete_profile,
             get_app_routing,
             choose_executable,
+            list_installed_apps,
             add_routed_app,
             remove_routed_app,
             set_app_routing_mode,
             clear_routed_apps,
+            set_installed_app_selection,
             autostart_enabled,
             set_autostart,
             connect_profile,
