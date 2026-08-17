@@ -18,6 +18,8 @@ protocol implementation.
   callout driver;
 - discovers Start-menu and Microsoft Store applications for multi-select and
   refreshes versioned `WindowsApps` executable paths after package updates;
+- matches Microsoft Store applications by both executable path and package SID
+  so MSIX network processes follow the selected split-tunnel policy;
 - groups Squirrel desktop applications such as Claude with their versioned
   `app-*` executable and refreshes that path automatically after updates;
 - journals every network mutation before applying it and repairs stale state on

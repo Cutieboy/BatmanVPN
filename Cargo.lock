@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "mousevpn-windows-gui"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "dirs",
  "mousevpn-config",

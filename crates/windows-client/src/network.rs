@@ -249,13 +249,19 @@ fn firewall_script(policy: &AppRoutingPolicy, only_missing: bool) -> String {
                 .map(|path| format!("'{}'", powershell_path(path)))
                 .collect::<Vec<_>>()
                 .join(",");
+            let packages = policy
+                .package_sids
+                .iter()
+                .map(|sid| format!("'{}'", sid.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
             let guard = if only_missing {
                 "if (-not (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue))"
             } else {
                 "if ($true)"
             };
             format!(
-                "$vpnApps=@({apps}); foreach ($adapter in $physical) {{ $i=0; foreach ($app in $vpnApps) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-app IPv4 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-app IPv6 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $i++ }} }}"
+                "$vpnApps=@({apps}); $vpnPackages=@({packages}); foreach ($adapter in $physical) {{ $i=0; foreach ($app in $vpnApps) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-app IPv4 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-app IPv6 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $i++ }}; foreach ($package in $vpnPackages) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-package IPv4 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-package IPv6 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $i++ }} }}"
             )
         }
     }
@@ -573,6 +579,7 @@ mod tests {
             &AppRoutingPolicy {
                 mode: AppRoutingMode::Include,
                 apps: vec![PathBuf::from(r"C:\Apps\Mouse's Browser.exe")],
+                package_sids: Vec::new(),
             },
             false,
         );
@@ -586,6 +593,7 @@ mod tests {
             &AppRoutingPolicy {
                 mode: AppRoutingMode::Include,
                 apps: vec![PathBuf::from(r"\\?\C:\Program Files\Browser\browser.exe")],
+                package_sids: Vec::new(),
             },
             false,
         );
@@ -598,6 +606,20 @@ mod tests {
         let script = firewall_script(&AppRoutingPolicy::default(), false);
         assert!(!script.contains("-Program"));
         assert!(script.contains("MouseVPN-KS-v4-"));
+    }
+
+    #[test]
+    fn allowlist_firewall_targets_selected_store_packages() {
+        let script = firewall_script(
+            &AppRoutingPolicy {
+                mode: AppRoutingMode::Include,
+                apps: Vec::new(),
+                package_sids: vec!["S-1-15-2-123".to_owned()],
+            },
+            false,
+        );
+        assert!(script.contains("-Package $package"));
+        assert!(script.contains("'S-1-15-2-123'"));
     }
 
     fn contains_any(prefixes: &[String], address: Ipv4Addr) -> bool {

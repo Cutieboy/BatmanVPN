@@ -168,9 +168,25 @@ pub(crate) fn policy() -> Result<mousevpn_windows_client::AppRoutingPolicy, Stri
     settings
         .apps
         .retain(|path| path.is_absolute() && path.is_file());
+    let mut package_families = settings
+        .apps
+        .iter()
+        .filter_map(|path| windowsapps_package_family(path))
+        .collect::<Vec<_>>();
+    package_families.sort_by_key(|family| family.to_lowercase());
+    package_families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let package_sids = package_families
+        .iter()
+        .map(|family| {
+            mousevpn_windows_client::app_container_sid_string(family).map_err(|error| {
+                format!("Не удалось определить пакет Microsoft Store {family}: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(mousevpn_windows_client::AppRoutingPolicy {
         mode: settings.mode,
         apps: settings.apps,
+        package_sids,
     })
 }
 
@@ -530,6 +546,24 @@ fn windowsapps_identity(path: &Path) -> Option<(String, String)> {
         .then(|| (package_name, normalized_relative_path(relative_path)))
 }
 
+fn windowsapps_package_family(path: &Path) -> Option<String> {
+    let value = normalize_windows_path(path)
+        .to_string_lossy()
+        .replace('/', "\\");
+    let lowercase = value.to_lowercase();
+    let marker = r"\windowsapps\";
+    let start = lowercase.find(marker)? + marker.len();
+    let package_directory = value[start..].split_once('\\')?.0;
+    let parts = package_directory.split('_').collect::<Vec<_>>();
+    if parts.len() < 5 {
+        return None;
+    }
+    let package_name = parts[..parts.len() - 4].join("_");
+    let publisher_id = parts.last()?;
+    (!package_name.is_empty() && !publisher_id.is_empty())
+        .then(|| format!("{package_name}_{publisher_id}"))
+}
+
 fn normalized_relative_path(path: &str) -> String {
     path.replace('/', "\\")
         .trim_start_matches('\\')
@@ -664,7 +698,8 @@ mod tests {
 
     use super::{
         migrate, normalize, normalized_key, resolve_packaged_paths, resolve_squirrel_paths,
-        sort_and_deduplicate, windowsapps_identity, InstalledApp, StoredSettings,
+        sort_and_deduplicate, windowsapps_identity, windowsapps_package_family, InstalledApp,
+        StoredSettings,
     };
     use mousevpn_windows_client::AppRoutingMode;
     use uuid::Uuid;
@@ -707,6 +742,16 @@ mod tests {
                     .as_path()
             ),
             Some(("Vendor_App".to_owned(), r"app\client.exe".to_owned()))
+        );
+    }
+
+    #[test]
+    fn extracts_package_family_from_windowsapps_path() {
+        assert_eq!(
+            windowsapps_package_family(PathBuf::from(
+                r"C:\Program Files\WindowsApps\Claude_1.30096.5.0_x64__pz87srrgttv7p\app\claude.exe"
+            ).as_path()),
+            Some("Claude_pz87srrgttv7p".to_owned())
         );
     }
 
