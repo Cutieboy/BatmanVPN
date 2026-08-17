@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mousevpn_windows_client::AppRoutingMode;
+use mousevpn_windows_client::{normalize_windows_path, AppRoutingMode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -55,6 +55,15 @@ pub(crate) fn get() -> Result<AppRoutingSettings, String> {
             .iter()
             .map(|path| AppEntry::from_path(path))
             .collect(),
+    })
+}
+
+pub(crate) fn policy() -> Result<mousevpn_windows_client::AppRoutingPolicy, String> {
+    let mut settings = load()?;
+    normalize(&mut settings);
+    Ok(mousevpn_windows_client::AppRoutingPolicy {
+        mode: settings.mode,
+        apps: settings.apps,
     })
 }
 
@@ -158,7 +167,9 @@ fn validate_executable(path: &Path) -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err("Файл приложения не найден".to_owned());
     }
-    path.canonicalize().map_err(display_error)
+    path.canonicalize()
+        .map(|path| normalize_windows_path(&path))
+        .map_err(display_error)
 }
 
 fn load() -> Result<StoredSettings, String> {
@@ -258,6 +269,9 @@ fn settings_path() -> Result<PathBuf, String> {
 fn normalize(settings: &mut StoredSettings) {
     settings.version = SETTINGS_VERSION;
     settings.excluded_apps.clear();
+    for path in &mut settings.apps {
+        *path = normalize_windows_path(path);
+    }
     sort_and_deduplicate(&mut settings.apps);
 }
 
@@ -267,7 +281,9 @@ fn sort_and_deduplicate(paths: &mut Vec<PathBuf>) {
 }
 
 fn normalized_key(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "\\").to_lowercase()
+    normalize_windows_path(path)
+        .to_string_lossy()
+        .to_lowercase()
 }
 
 const fn settings_version() -> u8 {
@@ -282,7 +298,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{migrate, normalized_key, sort_and_deduplicate, StoredSettings};
+    use super::{migrate, normalize, normalized_key, sort_and_deduplicate, StoredSettings};
     use mousevpn_windows_client::AppRoutingMode;
 
     #[test]
@@ -301,6 +317,18 @@ mod tests {
             normalized_key(PathBuf::from("C:/Apps/Game.exe").as_path()),
             r"c:\apps\game.exe"
         );
+    }
+
+    #[test]
+    fn normalizing_settings_removes_extended_path_prefixes() {
+        let mut settings = StoredSettings {
+            version: 2,
+            mode: AppRoutingMode::Include,
+            apps: vec![PathBuf::from(r"\\?\C:\Apps\Browser.exe")],
+            excluded_apps: Vec::new(),
+        };
+        normalize(&mut settings);
+        assert_eq!(settings.apps, [PathBuf::from(r"C:\Apps\Browser.exe")]);
     }
 
     #[test]

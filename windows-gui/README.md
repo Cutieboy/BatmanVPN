@@ -14,9 +14,8 @@ protocol implementation.
 - marks the dedicated tunnel as a Public network for Store/UWP network
   isolation compatibility;
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
-- currently ships as a full-tunnel client; application denylist/allowlist UI is
-  hidden until the WFP callout driver has production signing and is included in
-  the complete installer;
+- supports application denylist/allowlist routing through the bundled WFP
+  callout driver;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving
@@ -49,7 +48,8 @@ real Windows test matrix in `WINDOWS-TESTING.md` passes.
 - Windows 10 or 11 x64;
 - Rust 1.85 or newer with the MSVC target;
 - Visual Studio Build Tools with the Desktop C++ workload;
-- Windows SDK/WDK and a release-signing setup for the split-tunnel driver;
+- Windows SDK/WDK and either a test- or release-signing setup for the
+  split-tunnel driver;
 - WebView2 Runtime;
 - the official signed x64 Wintun library is embedded into the application;
 - an Administrator terminal for tunnel tests.
@@ -71,6 +71,28 @@ The artifact is written to `windows-gui/dist/MouseVPN-windows-x64.exe`.
 Release builds contain a `requireAdministrator` application manifest. The
 NSIS/MSI configuration downloads the Microsoft WebView2 bootstrapper when the
 runtime is missing.
+
+## Friends test installer
+
+The locally test-signed split-tunnel package is intentionally separate from a
+release build. Build it on Windows with:
+
+```powershell
+.\windows-gui\build-installer.ps1 -UseTestSignedDriver
+```
+
+The resulting `MouseVPN_<version>_x64-friends-test-setup.exe` contains the WFP
+driver and the public test certificate. Its installer requires administrator
+rights, displays an explicit consent page, refuses to continue while Secure
+Boot is enabled, imports the certificate, enables `TESTSIGNING`, and requests
+a reboot. Silent or passive installation is refused unless the caller also
+passes `/ALLOWTESTMODE`.
+
+On uninstall, the package stops and removes the driver and deletes its test
+certificate. It disables `TESTSIGNING` only when the installer recorded that
+it was previously off. Secure Boot is never changed automatically. This build
+is suitable only for trusted test machines; public distribution requires a
+Microsoft dashboard-signed driver and a publicly trusted installer signature.
 
 For a headless Wine smoke test that does not initialize WebView2:
 

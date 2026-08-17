@@ -427,10 +427,7 @@ fn read_helper_status(
 fn run_helper(path: &Path) -> Result<(), String> {
     let config: ClientConfig = load_toml(path).map_err(display_error)?;
     let config = config.validate().map_err(display_error)?;
-    // The standalone Windows build intentionally runs as a full tunnel. Saved
-    // per-app settings from earlier builds must not silently require an
-    // unavailable kernel driver after the UI control has been hidden.
-    let app_routing = mousevpn_windows_client::AppRoutingPolicy::default();
+    let app_routing = app_exclusions::policy()?;
     let stopping = Arc::new(AtomicBool::new(false));
     let stdin_stopping = Arc::clone(&stopping);
     thread::spawn(move || {

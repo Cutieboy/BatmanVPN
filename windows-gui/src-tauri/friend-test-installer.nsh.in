@@ -1,0 +1,182 @@
+!include "nsDialogs.nsh"
+!include "LogicLib.nsh"
+
+!define MOUSEVPN_TEST_STATE_KEY "Software\MouseVPN\FriendsTest"
+!define MOUSEVPN_TEST_CERT_FILE "MouseVpnSplitTunnel-Test.cer"
+!define MOUSEVPN_TEST_CERT_ID "@CERT_THUMBPRINT@"
+
+Var MouseVpnConsentCheckbox
+Var MouseVpnConsentAccepted
+Var MouseVpnSecureBootEnabled
+
+Page custom MouseVpnTestConsentCreate MouseVpnTestConsentLeave
+
+Function MouseVpnTestConsentCreate
+  StrCpy $MouseVpnConsentAccepted 0
+
+  IfSilent mousevpn_consent_skip 0
+  ClearErrors
+  ${GetOptions} $CMDLINE "/P" $0
+  ${IfNot} ${Errors}
+    Goto mousevpn_consent_skip
+  ${EndIf}
+
+  nsDialogs::Create 1018
+  Pop $0
+  ${If} $0 == error
+    Abort
+  ${EndIf}
+
+  !insertmacro MUI_HEADER_TEXT "Тестовый драйвер MouseVPN" "Перед установкой внимательно прочитайте предупреждение"
+
+  ${NSD_CreateLabel} 0 0 100% 58u "Раздельное туннелирование использует тестовый драйвер. Установщик добавит локальный сертификат в доверенные, включит TESTSIGNING и попросит перезагрузить Windows. На рабочем столе появится надпись «Тестовый режим». Используйте эту сборку только на личном тестовом компьютере."
+  Pop $1
+
+  StrCpy $MouseVpnSecureBootEnabled 0
+  ClearErrors
+  ReadRegDWORD $2 HKLM "SYSTEM\CurrentControlSet\Control\SecureBoot\State" "UEFISecureBootEnabled"
+  ${IfNot} ${Errors}
+  ${AndIf} $2 = 1
+    StrCpy $MouseVpnSecureBootEnabled 1
+  ${EndIf}
+
+  ${If} $MouseVpnSecureBootEnabled = 1
+    ${NSD_CreateLabel} 0 65u 100% 45u "Secure Boot сейчас включён. Windows не разрешит включить TESTSIGNING. Отмените установку, приостановите BitLocker (если он включён), отключите Secure Boot в UEFI и запустите установщик снова."
+    Pop $1
+  ${Else}
+    ${NSD_CreateLabel} 0 65u 100% 30u "После удаления MouseVPN установщик удалит сертификат и выключит TESTSIGNING, только если он был включён именно этой установкой."
+    Pop $1
+  ${EndIf}
+
+  ${NSD_CreateCheckbox} 0 120u 100% 24u "Я понимаю последствия и разрешаю включить тестовый режим Windows"
+  Pop $MouseVpnConsentCheckbox
+
+  ${If} $MouseVpnSecureBootEnabled = 1
+    EnableWindow $MouseVpnConsentCheckbox 0
+  ${EndIf}
+
+  nsDialogs::Show
+  Return
+
+  mousevpn_consent_skip:
+    Abort
+FunctionEnd
+
+Function MouseVpnTestConsentLeave
+  ${If} $MouseVpnSecureBootEnabled = 1
+    MessageBox MB_ICONSTOP|MB_OK "Установка остановлена: сначала отключите Secure Boot в UEFI. MouseVPN не изменял настройки загрузки."
+    Abort
+  ${EndIf}
+
+  ${NSD_GetState} $MouseVpnConsentCheckbox $0
+  ${If} $0 != ${BST_CHECKED}
+    MessageBox MB_ICONEXCLAMATION|MB_OK "Чтобы продолжить, подтвердите согласие галочкой."
+    Abort
+  ${EndIf}
+
+  StrCpy $MouseVpnConsentAccepted 1
+FunctionEnd
+
+!macro NSIS_HOOK_PREINSTALL
+  ${If} $MouseVpnConsentAccepted != 1
+    ClearErrors
+    ${GetOptions} $CMDLINE "/ALLOWTESTMODE" $R0
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP|MB_OK "Для тихой установки тестовой сборки требуется явный параметр /ALLOWTESTMODE."
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+  ${EndIf}
+
+  ; Migrate the older per-user package before installing this elevated,
+  ; per-machine friends build. Application data and VPN profiles are kept.
+  ReadRegStr $R2 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MouseVPN" "UninstallString"
+  ${If} $R2 != ""
+    DetailPrint "Удаление предыдущей пользовательской версии MouseVPN..."
+    ExecWait '$R2 /S' $R3
+    ${If} $R3 != 0
+      MessageBox MB_ICONSTOP|MB_OK "Не удалось удалить предыдущую версию MouseVPN (код $R3). Профили не затронуты. Закройте MouseVPN и повторите установку."
+      SetErrorLevel 6
+      Quit
+    ${EndIf}
+  ${EndIf}
+
+  ClearErrors
+  ReadRegDWORD $R0 HKLM "${MOUSEVPN_TEST_STATE_KEY}" "Configured"
+  ${If} ${Errors}
+    ReadRegStr $R0 HKLM "SYSTEM\CurrentControlSet\Control" "SystemStartOptions"
+    ${StrLoc} $R1 $R0 "TESTSIGNING" ">"
+    ${If} $R1 == ""
+      WriteRegDWORD HKLM "${MOUSEVPN_TEST_STATE_KEY}" "ChangedTestSigning" 1
+    ${Else}
+      WriteRegDWORD HKLM "${MOUSEVPN_TEST_STATE_KEY}" "ChangedTestSigning" 0
+    ${EndIf}
+  ${EndIf}
+
+  ${DisableX64FSRedirection}
+  nsExec::ExecToLog '"$SYSDIR\bcdedit.exe" /set testsigning on'
+  Pop $R0
+  ${EnableX64FSRedirection}
+  ${If} $R0 != 0
+    DeleteRegKey HKLM "${MOUSEVPN_TEST_STATE_KEY}"
+    MessageBox MB_ICONSTOP|MB_OK "Windows не разрешила включить TESTSIGNING (код $R0). Проверьте Secure Boot и повторите установку."
+    SetErrorLevel 3
+    Quit
+  ${EndIf}
+
+  WriteRegDWORD HKLM "${MOUSEVPN_TEST_STATE_KEY}" "Configured" 1
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f Root "$INSTDIR\${MOUSEVPN_TEST_CERT_FILE}"'
+  Pop $R0
+  ${If} $R0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "Не удалось добавить тестовый сертификат MouseVPN в корневое хранилище (код $R0). Удалите MouseVPN и повторите установку."
+    SetErrorLevel 4
+    SetRebootFlag true
+    Return
+  ${EndIf}
+
+  nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f TrustedPublisher "$INSTDIR\${MOUSEVPN_TEST_CERT_FILE}"'
+  Pop $R0
+  ${If} $R0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "Не удалось добавить издателя тестового драйвера MouseVPN (код $R0). Удалите MouseVPN и повторите установку."
+    SetErrorLevel 5
+    SetRebootFlag true
+    Return
+  ${EndIf}
+
+  WriteRegDWORD HKLM "${MOUSEVPN_TEST_STATE_KEY}" "CertificateInstalled" 1
+  SetRebootFlag true
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  ${If} $UpdateMode <> 1
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" stop MouseVpnSplitTunnel'
+    Pop $R0
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" delete MouseVpnSplitTunnel'
+    Pop $R0
+
+    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -delstore Root "${MOUSEVPN_TEST_CERT_ID}"'
+    Pop $R0
+    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -delstore TrustedPublisher "${MOUSEVPN_TEST_CERT_ID}"'
+    Pop $R0
+
+    ClearErrors
+    ReadRegDWORD $R0 HKLM "${MOUSEVPN_TEST_STATE_KEY}" "ChangedTestSigning"
+    ${IfNot} ${Errors}
+    ${AndIf} $R0 = 1
+      ${DisableX64FSRedirection}
+      nsExec::ExecToLog '"$SYSDIR\bcdedit.exe" /set testsigning off'
+      Pop $R0
+      ${EnableX64FSRedirection}
+      ${If} $R0 = 0
+        SetRebootFlag true
+      ${Else}
+        MessageBox MB_ICONEXCLAMATION|MB_OK "MouseVPN удалён, но Windows не разрешила выключить TESTSIGNING (код $R0). Выполните от администратора: bcdedit /set testsigning off"
+      ${EndIf}
+    ${EndIf}
+
+    DeleteRegKey HKLM "${MOUSEVPN_TEST_STATE_KEY}"
+  ${EndIf}
+!macroend

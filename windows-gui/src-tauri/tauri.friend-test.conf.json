@@ -1,0 +1,15 @@
+{
+  "bundle": {
+    "resources": {
+      "../../windows-driver/dist/MouseVpnSplitTunnel.sys": "MouseVpnSplitTunnel.sys",
+      "../../windows-driver/dist/MouseVpnSplitTunnel-Test.cer": "MouseVpnSplitTunnel-Test.cer"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "friend-test-installer.generated.nsh",
+        "languages": ["Russian", "English"]
+      }
+    }
+  }
+}

@@ -55,9 +55,10 @@ let connection = { state: "disconnected", message: "VPN выключен", profi
 let connectedAt = null;
 const isWindows = navigator.userAgent.includes("Windows");
 
-// Windows application routing requires a production-signed WFP callout driver.
-// Keep the control hidden until the complete signed package is available.
-if (isWindows) elements.autostartSetting.classList.remove("hidden");
+if (isWindows) {
+  elements.appExclusions.classList.remove("hidden");
+  elements.autostartSetting.classList.remove("hidden");
+}
 
 async function refreshAutostart() {
   if (!isWindows) return;

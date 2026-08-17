@@ -1,6 +1,6 @@
 {
   "productName": "MouseVPN",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "identifier": "dev.mousevpn.windows",
   "build": {
     "frontendDist": "../../linux-gui/ui"

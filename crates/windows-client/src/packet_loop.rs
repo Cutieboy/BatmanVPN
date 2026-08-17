@@ -18,7 +18,7 @@ use windows_sys::Win32::{
 use wintun::Session;
 
 use crate::{
-    handshake::negotiate,
+    handshake::connect,
     liveness::{Action, Liveness},
     network::NetworkGuard,
     network_events::NetworkEventGuard,
@@ -45,6 +45,7 @@ pub(crate) fn run(
     let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (transport_tx, transport_rx) = mpsc::sync_channel(1);
     let _network_events =
         NetworkEventGuard::subscribe(&session.get_adapter(), Arc::clone(&reconnect_requested))?;
     let outgoing_worker = spawn_outgoing(
@@ -54,6 +55,7 @@ pub(crate) fn run(
         Arc::clone(stopping),
         Arc::clone(&reconnecting),
         Arc::clone(&reconnect_requested),
+        transport_rx,
         result_tx,
     );
     let _policy_worker = PeriodicWorker::spawn(POLICY_REFRESH_INTERVAL, {
@@ -76,6 +78,7 @@ pub(crate) fn run(
         stopping,
         reconnecting,
         reconnect_requested,
+        outgoing_transport: transport_tx,
         worker: result_rx,
         network,
         wintun_send_drops: 0,
@@ -98,6 +101,7 @@ struct IncomingLoop<'a> {
     stopping: &'a AtomicBool,
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
+    outgoing_transport: mpsc::SyncSender<UdpTransport>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a mut NetworkGuard,
     wintun_send_drops: u64,
@@ -181,53 +185,60 @@ impl IncomingLoop<'_> {
                 }
                 Ok(())
             }
-            Action::Reconnect => self.reconnect(liveness, now),
+            Action::Reconnect => {
+                self.reconnect(liveness, now);
+                Ok(())
+            }
         }
     }
 
-    fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) -> Result<(), ClientError> {
+    fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) {
         liveness.reconnect_attempted(now);
         self.reconnecting.store(true, Ordering::Release);
         eprintln!("MOUSEVPN_STATE=reconnecting");
-        if let Err(error) = self.network.refresh() {
-            self.reconnecting.store(false, Ordering::Release);
-            eprintln!("MOUSEVPN_RECONNECT_ERROR={error}");
-            return Ok(());
-        }
-        let result = negotiate(&mut self.transport, self.config);
-        let timeout_result = self.transport.set_read_timeout(Some(UDP_POLL));
+        let result = self.establish_replacement();
         self.reconnecting.store(false, Ordering::Release);
-        timeout_result?;
         match result {
-            Ok((replacement, parameters)) => {
-                if parameters != self.parameters {
-                    let adapter = self.session.get_adapter();
-                    let previous = self.parameters;
-                    adapter
-                        .set_mtu(usize::from(parameters.mtu))
-                        .map_err(|error| {
-                            ClientError::Platform(format!("failed to update Wintun MTU: {error}"))
-                        })?;
-                    if let Err(error) = self.network.update_parameters(parameters) {
-                        let rollback = adapter.set_mtu(usize::from(previous.mtu));
-                        return match rollback {
-                            Ok(()) => Err(error),
-                            Err(rollback) => Err(ClientError::Platform(format!(
-                                "updating Windows tunnel parameters failed: {error}; MTU rollback failed: {rollback}"
-                            ))),
-                        };
-                    }
-                    self.parameters = parameters;
-                    eprintln!("MOUSEVPN_STATE=parameters_updated");
-                }
-                let (sender, receiver) = replacement.split();
-                *self.sender.lock().map_err(|_| poisoned_sender())? = sender;
-                self.receiver = receiver;
+            Ok(()) => {
                 liveness.reconnected(Instant::now());
                 eprintln!("MOUSEVPN_STATE=reconnected");
             }
             Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),
         }
+    }
+
+    fn establish_replacement(&mut self) -> Result<(), ClientError> {
+        self.network.refresh()?;
+        let (replacement_transport, replacement, parameters) = connect(self.config)?;
+        replacement_transport.set_read_timeout(Some(UDP_POLL))?;
+        let replacement_outgoing = replacement_transport.try_clone()?;
+        if parameters != self.parameters {
+            let adapter = self.session.get_adapter();
+            let previous = self.parameters;
+            adapter
+                .set_mtu(usize::from(parameters.mtu))
+                .map_err(|error| {
+                    ClientError::Platform(format!("failed to update Wintun MTU: {error}"))
+                })?;
+            if let Err(error) = self.network.update_parameters(parameters) {
+                let rollback = adapter.set_mtu(usize::from(previous.mtu));
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(ClientError::Platform(format!(
+                        "updating Windows tunnel parameters failed: {error}; MTU rollback failed: {rollback}"
+                    ))),
+                };
+            }
+            self.parameters = parameters;
+            eprintln!("MOUSEVPN_STATE=parameters_updated");
+        }
+        let (sender, receiver) = replacement.split();
+        *self.sender.lock().map_err(|_| poisoned_sender())? = sender;
+        self.receiver = receiver;
+        self.outgoing_transport
+            .send(replacement_outgoing)
+            .map_err(|_| ClientError::Platform("Wintun packet worker stopped".to_owned()))?;
+        self.transport = replacement_transport;
         Ok(())
     }
 }
@@ -280,6 +291,7 @@ fn spawn_outgoing(
     stopping: Arc<AtomicBool>,
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
+    transport_replacements: mpsc::Receiver<UdpTransport>,
     result_tx: mpsc::SyncSender<Result<(), ClientError>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -289,6 +301,9 @@ fn spawn_outgoing(
         let mut dropped_packets = 0_u64;
         let result = (|| {
             while !stopping.load(Ordering::Acquire) {
+                while let Ok(replacement) = transport_replacements.try_recv() {
+                    transport = replacement;
+                }
                 if reconnecting.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(10));
                     continue;
