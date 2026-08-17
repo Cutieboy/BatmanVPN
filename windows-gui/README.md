@@ -16,6 +16,8 @@ protocol implementation.
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
 - supports application denylist/allowlist routing through the bundled WFP
   callout driver;
+- discovers Start-menu and Microsoft Store applications for multi-select and
+  refreshes versioned `WindowsApps` executable paths after package updates;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving

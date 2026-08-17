@@ -43,12 +43,23 @@ const elements = {
   appRoutingHint: document.querySelector("#appRoutingHint"),
   appRoutingSearch: document.querySelector("#appRoutingSearch"),
   clearRoutedApps: document.querySelector("#clearRoutedApps"),
+  openInstalledApps: document.querySelector("#openInstalledApps"),
+  installedAppsModal: document.querySelector("#installedAppsModal"),
+  installedAppsList: document.querySelector("#installedAppsList"),
+  installedAppsSearch: document.querySelector("#installedAppsSearch"),
+  installedAppsSelectionCount: document.querySelector("#installedAppsSelectionCount"),
+  installedAppsError: document.querySelector("#installedAppsError"),
+  closeInstalledApps: document.querySelector("#closeInstalledApps"),
+  cancelInstalledApps: document.querySelector("#cancelInstalledApps"),
+  applyInstalledApps: document.querySelector("#applyInstalledApps"),
   autostartSetting: document.querySelector("#autostartSetting"),
   autostartEnabled: document.querySelector("#autostartEnabled"),
 };
 
 let profiles = [];
 let appRouting = { mode: "exclude", apps: [] };
+let installedApps = [];
+let installedAppSelection = new Set();
 let selectedId = localStorage.getItem("mousevpn.selectedProfile");
 let pendingDeleteId = null;
 let connection = { state: "disconnected", message: "VPN выключен", profileId: null };
@@ -72,6 +83,10 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function windowsPathKey(path) {
+  return String(path).replaceAll("/", "\\").toLocaleLowerCase("en-US");
 }
 
 function selectedProfile() {
@@ -178,6 +193,52 @@ function renderAppExclusions() {
         <button class="remove-exclusion" type="button" data-exclusion-path="${escapeHtml(app.path)}" aria-label="Удалить исключение">×</button>
       </div>`).join("")
     : `<div class="exclusions-empty">${query ? "По вашему запросу ничего не найдено" : includeMode ? "Ни одно приложение не выбрано для VPN" : "Нет приложений в обход VPN"}</div>`;
+}
+
+function renderInstalledApps() {
+  const query = elements.installedAppsSearch.value.trim().toLocaleLowerCase("ru");
+  const visibleApps = installedApps.filter((app) =>
+    !query || `${app.name}\n${app.path}`.toLocaleLowerCase("ru").includes(query));
+  elements.installedAppsSelectionCount.textContent = `Выбрано: ${installedAppSelection.size}`;
+  elements.applyInstalledApps.disabled = installedApps.length === 0;
+  elements.installedAppsList.innerHTML = visibleApps.length
+    ? visibleApps.map((app) => `
+      <label class="installed-app-row">
+        <input type="checkbox" data-installed-app-id="${escapeHtml(app.id)}" ${installedAppSelection.has(app.id) ? "checked" : ""} />
+        <span class="exclusion-icon">${app.source === "store" ? "▦" : "◇"}</span>
+        <span class="exclusion-copy">
+          <strong>${escapeHtml(app.name)}<span class="installed-app-source">${app.source === "store" ? "Microsoft Store" : "Desktop"}</span></strong>
+          <small title="${escapeHtml(app.path)}">${escapeHtml(app.path)}</small>
+        </span>
+      </label>`).join("")
+    : `<div class="exclusions-empty">${query ? "По вашему запросу ничего не найдено" : "Установленные приложения не найдены"}</div>`;
+}
+
+async function openInstalledApps() {
+  elements.installedAppsModal.classList.remove("hidden");
+  elements.installedAppsError.classList.add("hidden");
+  elements.installedAppsSearch.value = "";
+  elements.installedAppsList.innerHTML = '<div class="exclusions-empty">Собираем список приложений…</div>';
+  elements.applyInstalledApps.disabled = true;
+  try {
+    installedApps = await invoke("list_installed_apps");
+    const routed = new Set(appRouting.apps.map((app) => windowsPathKey(app.path)));
+    installedAppSelection = new Set(installedApps
+      .filter((app) => app.paths.some((path) => routed.has(windowsPathKey(path))))
+      .map((app) => app.id));
+    renderInstalledApps();
+    setTimeout(() => elements.installedAppsSearch.focus(), 50);
+  } catch (error) {
+    installedApps = [];
+    installedAppSelection = new Set();
+    elements.installedAppsList.innerHTML = '<div class="exclusions-empty">Не удалось получить список приложений</div>';
+    elements.installedAppsError.textContent = String(error);
+    elements.installedAppsError.classList.remove("hidden");
+  }
+}
+
+function closeInstalledApps() {
+  elements.installedAppsModal.classList.add("hidden");
 }
 
 async function refreshAppExclusions() {
@@ -289,7 +350,38 @@ elements.appExclusions.addEventListener("click", async () => {
     elements.appExclusionsError.classList.remove("hidden");
   }
 });
-elements.closeAppExclusions.addEventListener("click", () => elements.appExclusionsModal.classList.add("hidden"));
+elements.closeAppExclusions.addEventListener("click", () => {
+  closeInstalledApps();
+  elements.appExclusionsModal.classList.add("hidden");
+});
+elements.openInstalledApps.addEventListener("click", openInstalledApps);
+elements.closeInstalledApps.addEventListener("click", closeInstalledApps);
+elements.cancelInstalledApps.addEventListener("click", closeInstalledApps);
+elements.installedAppsSearch.addEventListener("input", renderInstalledApps);
+elements.installedAppsList.addEventListener("change", (event) => {
+  const checkbox = event.target.closest("[data-installed-app-id]");
+  if (!checkbox) return;
+  if (checkbox.checked) installedAppSelection.add(checkbox.dataset.installedAppId);
+  else installedAppSelection.delete(checkbox.dataset.installedAppId);
+  elements.installedAppsSelectionCount.textContent = `Выбрано: ${installedAppSelection.size}`;
+});
+elements.applyInstalledApps.addEventListener("click", async () => {
+  elements.applyInstalledApps.disabled = true;
+  elements.installedAppsError.classList.add("hidden");
+  try {
+    const selectedPaths = installedApps
+      .filter((app) => installedAppSelection.has(app.id))
+      .flatMap((app) => app.paths);
+    const discoveredPaths = installedApps.flatMap((app) => app.paths);
+    appRouting = await invoke("set_installed_app_selection", { selectedPaths, discoveredPaths });
+    renderAppExclusions();
+    closeInstalledApps();
+  } catch (error) {
+    elements.installedAppsError.textContent = String(error);
+    elements.installedAppsError.classList.remove("hidden");
+    elements.applyInstalledApps.disabled = false;
+  }
+});
 elements.addAppExclusion.addEventListener("click", async () => {
   elements.addAppExclusion.disabled = true;
   elements.appExclusionsError.classList.add("hidden");
@@ -375,6 +467,10 @@ elements.power.addEventListener("click", async () => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (!elements.installedAppsModal.classList.contains("hidden")) {
+    closeInstalledApps();
+    return;
+  }
   if (!elements.profileModal.classList.contains("hidden")) closeProfileModal();
   if (!elements.deleteModal.classList.contains("hidden")) elements.cancelDelete.click();
   if (!elements.appExclusionsModal.classList.contains("hidden")) elements.closeAppExclusions.click();

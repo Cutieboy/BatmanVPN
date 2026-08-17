@@ -167,7 +167,33 @@
         </div>
         <div id="appExclusionsList" class="exclusions-list"></div>
         <p id="appExclusionsError" class="form-error hidden"></p>
-        <button id="addAppExclusion" class="primary-button" type="button">+  Выбрать .exe</button>
+        <div class="app-picker-actions">
+          <button id="openInstalledApps" class="primary-button" type="button">✓  Установленные приложения</button>
+          <button id="addAppExclusion" class="secondary-button" type="button">+  Выбрать .exe</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="installedAppsModal" class="modal-backdrop installed-apps-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="installedAppsModalTitle">
+      <div class="modal-card installed-apps-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">ПРИЛОЖЕНИЯ WINDOWS</span>
+            <h2 id="installedAppsModalTitle">Выберите приложения</h2>
+          </div>
+          <button id="closeInstalledApps" type="button" class="close-button" aria-label="Закрыть">×</button>
+        </div>
+        <p class="modal-description">Программы из меню «Пуск» и Microsoft Store. Для Store-приложений MouseVPN сам найдёт защищённую папку WindowsApps.</p>
+        <div class="installed-apps-tools">
+          <input id="installedAppsSearch" type="search" placeholder="Claude, ChatGPT, Telegram…" aria-label="Поиск установленных приложений" />
+          <span id="installedAppsSelectionCount" class="selection-count">Выбрано: 0</span>
+        </div>
+        <div id="installedAppsList" class="installed-apps-list"></div>
+        <p id="installedAppsError" class="form-error hidden"></p>
+        <div class="dialog-actions">
+          <button id="cancelInstalledApps" class="secondary-button" type="button">Отмена</button>
+          <button id="applyInstalledApps" class="primary-button apply-installed-apps" type="button">Применить</button>
+        </div>
       </div>
     </div>
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -16,6 +17,73 @@ use std::process::Command;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SETTINGS_VERSION: u8 = 2;
+
+#[cfg(windows)]
+const INSTALLED_APPS_SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$ProgressPreference='SilentlyContinue'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$apps=[System.Collections.Generic.List[object]]::new()
+$startNames=@{}
+Get-StartApps | ForEach-Object {$startNames[[string]$_.AppID]=[string]$_.Name}
+
+function Add-DesktopApp([string]$name,[string]$path) {
+  if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($path)) { return }
+  $path=[Environment]::ExpandEnvironmentVariables($path.Trim().Trim('"'))
+  if (-not $path.EndsWith('.exe',[StringComparison]::OrdinalIgnoreCase)) { return }
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+  $stem=[IO.Path]::GetFileNameWithoutExtension($path)
+  if ($stem -match '^(unins\d*|uninstall)$' -or $stem -ieq 'mousevpn-windows-gui') { return }
+  if ($name -match '^(Uninstall|Деинсталлировать)\b') { return }
+  $apps.Add([pscustomobject]@{id=('desktop:'+$path);name=$name;path=$path;paths=@($path);source='desktop';packageName=$null;relativePaths=@()})
+}
+
+Get-AppxPackage | Where-Object {-not $_.IsFramework -and $_.InstallLocation} | ForEach-Object {
+  $pkg=$_
+  $manifest=Get-AppxPackageManifest -Package $pkg.PackageFullName
+  foreach($application in @($manifest.Package.Applications.Application)) {
+    $exe=[string]$application.Executable
+    if (-not $exe -or -not $exe.EndsWith('.exe',[StringComparison]::OrdinalIgnoreCase)) { continue }
+    $primary=Join-Path $pkg.InstallLocation $exe
+    if (-not (Test-Path -LiteralPath $primary -PathType Leaf)) { continue }
+    $aumid="$($pkg.PackageFamilyName)!$($application.Id)"
+    $name=$startNames[$aumid]
+    if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('ms-resource:')) {$name=[string]$pkg.Name}
+    $packageToken=([string]$pkg.Name -split '\.')[-1]
+    $primaryStem=[IO.Path]::GetFileNameWithoutExtension($exe)
+    $packagePaths=[System.Collections.Generic.List[string]]::new()
+    $packagePaths.Add($primary)
+    Get-ChildItem -LiteralPath $pkg.InstallLocation -Filter *.exe -File -Recurse | Where-Object {
+      $_.BaseName -ieq $primaryStem -or $_.BaseName -ieq $packageToken
+    } | ForEach-Object {$packagePaths.Add($_.FullName)}
+    [string[]]$paths=@($packagePaths | Select-Object -Unique)
+    [string[]]$relativePaths=@($paths | ForEach-Object {$_.Substring($pkg.InstallLocation.Length).TrimStart('\')})
+    $apps.Add([pscustomobject]@{id=('store:'+$aumid);name=$name;path=$primary;paths=$paths;source='store';packageName=[string]$pkg.Name;relativePaths=$relativePaths})
+  }
+}
+
+$shell=New-Object -ComObject WScript.Shell
+$startRoots=@([Environment]::GetFolderPath('StartMenu'),[Environment]::GetFolderPath('CommonStartMenu'))
+foreach($root in $startRoots) {
+  if ([string]::IsNullOrWhiteSpace($root)) { continue }
+  Get-ChildItem -LiteralPath $root -Filter *.lnk -File -Recurse | ForEach-Object {
+    $shortcut=$shell.CreateShortcut($_.FullName)
+    Add-DesktopApp $_.BaseName ([string]$shortcut.TargetPath)
+  }
+}
+
+$uninstallKeys=@(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+Get-ItemProperty $uninstallKeys | ForEach-Object {
+  $icon=[Environment]::ExpandEnvironmentVariables(([string]$_.DisplayIcon).Trim().Trim('"'))
+  if ($icon -match '^(.*?\.exe)(?:,\s*-?\d+)?$') { Add-DesktopApp ([string]$_.DisplayName) $Matches[1] }
+}
+
+ConvertTo-Json -InputObject @($apps) -Depth 4 -Compress
+"#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +114,7 @@ struct StoredSettings {
 }
 
 pub(crate) fn get() -> Result<AppRoutingSettings, String> {
-    let mut settings = load()?;
+    let mut settings = load_resolved()?;
     normalize(&mut settings);
     Ok(AppRoutingSettings {
         mode: settings.mode,
@@ -58,13 +126,63 @@ pub(crate) fn get() -> Result<AppRoutingSettings, String> {
     })
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstalledApp {
+    id: String,
+    name: String,
+    path: String,
+    paths: Vec<String>,
+    source: String,
+    #[serde(default)]
+    package_name: Option<String>,
+    #[serde(default)]
+    relative_paths: Vec<String>,
+}
+
 pub(crate) fn policy() -> Result<mousevpn_windows_client::AppRoutingPolicy, String> {
-    let mut settings = load()?;
+    let mut settings = load_resolved()?;
     normalize(&mut settings);
+    // An uninstalled or updating application cannot produce traffic. Keep its
+    // entry visible in the UI, but do not let it block the entire VPN session.
+    settings
+        .apps
+        .retain(|path| path.is_absolute() && path.is_file());
     Ok(mousevpn_windows_client::AppRoutingPolicy {
         mode: settings.mode,
         apps: settings.apps,
     })
+}
+
+pub(crate) fn installed_apps() -> Result<Vec<InstalledApp>, String> {
+    discover_installed_apps()
+}
+
+pub(crate) fn set_installed_selection(
+    selected_paths: Vec<String>,
+    discovered_paths: Vec<String>,
+) -> Result<AppRoutingSettings, String> {
+    let selected = selected_paths
+        .iter()
+        .map(|path| validate_executable(Path::new(path.trim())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_keys = selected
+        .iter()
+        .map(|path| normalized_key(path))
+        .collect::<HashSet<_>>();
+    let discovered_keys = discovered_paths
+        .iter()
+        .map(|path| normalized_key(Path::new(path.trim())))
+        .collect::<HashSet<_>>();
+    let mut settings = load_resolved()?;
+    settings.apps.retain(|path| {
+        let key = normalized_key(path);
+        !discovered_keys.contains(&key) || selected_keys.contains(&key)
+    });
+    settings.apps.extend(selected);
+    sort_and_deduplicate(&mut settings.apps);
+    save(&settings)?;
+    get()
 }
 
 pub(crate) fn set_mode(mode: AppRoutingMode) -> Result<AppRoutingSettings, String> {
@@ -170,6 +288,145 @@ fn validate_executable(path: &Path) -> Result<PathBuf, String> {
     path.canonicalize()
         .map(|path| normalize_windows_path(&path))
         .map_err(display_error)
+}
+
+fn load_resolved() -> Result<StoredSettings, String> {
+    let mut settings = load()?;
+    if settings
+        .apps
+        .iter()
+        .any(|path| !path.is_file() && windowsapps_identity(path).is_some())
+    {
+        // Discovery is a repair aid, not a connection prerequisite. A damaged
+        // AppX registration must not prevent MouseVPN from opening.
+        if let Ok(installed) = discover_installed_apps() {
+            if resolve_packaged_paths(&mut settings.apps, &installed) {
+                sort_and_deduplicate(&mut settings.apps);
+                save(&settings)?;
+            }
+        }
+    }
+    Ok(settings)
+}
+
+fn discover_installed_apps() -> Result<Vec<InstalledApp>, String> {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                INSTALLED_APPS_SCRIPT,
+            ])
+            .output()
+            .map_err(display_error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Не удалось получить список установленных приложений: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let json = String::from_utf8(output.stdout).map_err(display_error)?;
+        let json = json.trim().trim_start_matches('\u{feff}');
+        let mut apps: Vec<InstalledApp> = serde_json::from_str(json).map_err(display_error)?;
+        let mut seen = HashSet::new();
+        for app in &mut apps {
+            app.path = normalize_windows_path(Path::new(&app.path))
+                .display()
+                .to_string();
+            let original_paths = std::mem::take(&mut app.paths);
+            let original_relative_paths = std::mem::take(&mut app.relative_paths);
+            let mut seen_paths = HashSet::new();
+            for (index, path) in original_paths.iter().enumerate() {
+                let path = normalize_windows_path(Path::new(path))
+                    .display()
+                    .to_string();
+                if Path::new(&path).is_file() && seen_paths.insert(normalized_key(Path::new(&path)))
+                {
+                    app.paths.push(path);
+                    if let Some(relative) = original_relative_paths.get(index) {
+                        app.relative_paths.push(relative.clone());
+                    }
+                }
+            }
+        }
+        apps.retain(|app| {
+            !app.name.trim().is_empty()
+                && !app.paths.is_empty()
+                && seen.insert(app.id.to_lowercase())
+        });
+        apps.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+        });
+        Ok(apps)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("Список установленных приложений доступен только в Windows".to_owned())
+    }
+}
+
+fn resolve_packaged_paths(paths: &mut [PathBuf], installed: &[InstalledApp]) -> bool {
+    let mut changed = false;
+    for path in paths {
+        let Some((package_name, relative_path)) = windowsapps_identity(path) else {
+            continue;
+        };
+        let replacement = installed.iter().find_map(|app| {
+            if app.source != "store"
+                || !app
+                    .package_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&package_name))
+            {
+                return None;
+            }
+            app.relative_paths
+                .iter()
+                .zip(&app.paths)
+                .find(|(relative, _)| normalized_relative_path(relative) == relative_path)
+                .map(|(_, path)| PathBuf::from(path))
+        });
+        if let Some(replacement) = replacement {
+            if normalized_key(path) != normalized_key(&replacement) {
+                *path = replacement;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn windowsapps_identity(path: &Path) -> Option<(String, String)> {
+    let value = normalize_windows_path(path)
+        .to_string_lossy()
+        .replace('/', "\\");
+    let lowercase = value.to_lowercase();
+    let marker = r"\windowsapps\";
+    let start = lowercase.find(marker)? + marker.len();
+    let (package_directory, relative_path) = value[start..].split_once('\\')?;
+    let parts = package_directory.split('_').collect::<Vec<_>>();
+    if parts.len() < 5 {
+        return None;
+    }
+    let package_name = parts[..parts.len() - 4].join("_");
+    (!package_name.is_empty() && !relative_path.is_empty())
+        .then(|| (package_name, normalized_relative_path(relative_path)))
+}
+
+fn normalized_relative_path(path: &str) -> String {
+    path.replace('/', "\\")
+        .trim_start_matches('\\')
+        .to_lowercase()
 }
 
 fn load() -> Result<StoredSettings, String> {
@@ -298,7 +555,10 @@ fn display_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{migrate, normalize, normalized_key, sort_and_deduplicate, StoredSettings};
+    use super::{
+        migrate, normalize, normalized_key, resolve_packaged_paths, sort_and_deduplicate,
+        windowsapps_identity, InstalledApp, StoredSettings,
+    };
     use mousevpn_windows_client::AppRoutingMode;
 
     #[test]
@@ -329,6 +589,45 @@ mod tests {
         };
         normalize(&mut settings);
         assert_eq!(settings.apps, [PathBuf::from(r"C:\Apps\Browser.exe")]);
+    }
+
+    #[test]
+    fn extracts_stable_identity_from_windowsapps_path() {
+        assert_eq!(
+            windowsapps_identity(
+                PathBuf::from(r"D:\WindowsApps\Vendor_App_1.2.3.0_x64__publisher\app\Client.exe")
+                    .as_path()
+            ),
+            Some(("Vendor_App".to_owned(), r"app\client.exe".to_owned()))
+        );
+    }
+
+    #[test]
+    fn refreshes_a_store_path_after_package_update() {
+        let mut paths = [PathBuf::from(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__publisher\app\ChatGPT.exe",
+        )];
+        let installed = [InstalledApp {
+            id: "store:OpenAI.Codex_publisher!App".to_owned(),
+            name: "ChatGPT".to_owned(),
+            path:
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_2.0.0.0_x64__publisher\app\ChatGPT.exe"
+                    .to_owned(),
+            paths: vec![
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_2.0.0.0_x64__publisher\app\ChatGPT.exe"
+                    .to_owned(),
+            ],
+            source: "store".to_owned(),
+            package_name: Some("OpenAI.Codex".to_owned()),
+            relative_paths: vec![r"app\ChatGPT.exe".to_owned()],
+        }];
+        assert!(resolve_packaged_paths(&mut paths, &installed));
+        assert_eq!(
+            paths[0],
+            PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_2.0.0.0_x64__publisher\app\ChatGPT.exe"
+            )
+        );
     }
 
     #[test]
