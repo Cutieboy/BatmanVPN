@@ -26,6 +26,13 @@ final class VPNController: ObservableObject {
         status == .connecting || status == .reconnecting || status == .disconnecting
     }
 
+    var hasRunningHelper: Bool {
+        guard let paths = try? helperPaths(),
+              let pid = readHelperPID(paths.pidFile)
+        else { return false }
+        return processExists(pid)
+    }
+
     var statusTitle: String {
         switch status {
         case .disconnected: return "Отключено"

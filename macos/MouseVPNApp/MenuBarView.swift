@@ -54,7 +54,7 @@ struct MenuBarView: View {
         }
         .keyboardShortcut("o")
 
-        Button("Выйти из интерфейса") {
+        Button("Завершить MouseVPN") {
             NSApp.terminate(nil)
         }
         .keyboardShortcut("q")
