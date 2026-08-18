@@ -1,0 +1,5 @@
+/Build/
+/MouseVPN.xcodeproj/
+/DerivedData*/
+*.xcuserstate
+xcuserdata/

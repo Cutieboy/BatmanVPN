@@ -11,6 +11,8 @@ members = [
     "crates/server",
     "crates/admin-api",
     "crates/android-native",
+    "crates/apple-native",
+    "crates/macos-client",
     "crates/profile-cli",
     "crates/device-cli",
     "crates/proxy-client",

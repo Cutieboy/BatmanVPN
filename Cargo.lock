@@ -2296,6 +2296,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mousevpn-apple-native"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "mousevpn-config",
+ "mousevpn-crypto",
+ "mousevpn-data-plane",
+ "mousevpn-protocol",
+ "mousevpn-transport",
+ "serde_json",
+]
+
+[[package]]
 name = "mousevpn-client-core"
 version = "0.1.0"
 dependencies = [
@@ -2384,6 +2397,19 @@ dependencies = [
  "mousevpn-data-plane",
  "route_manager",
  "tun-rs",
+]
+
+[[package]]
+name = "mousevpn-macos-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mousevpn-apple-native",
+ "mousevpn-profile-cli",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "zeroize",
 ]
 
 [[package]]

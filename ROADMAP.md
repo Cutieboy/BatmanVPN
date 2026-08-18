@@ -1,7 +1,7 @@
 # MouseVPN Roadmap
 
 MouseVPN — экспериментальный VPN с собственным wire-протоколом, общим ядром на
-Rust и платформенными оболочками для Linux и Android.
+Rust и платформенными оболочками для Linux, Android, Windows и macOS.
 
 > Собственный протокол не означает собственную криптографию. Для обмена ключами,
 > шифрования и аутентификации используются только проверенные примитивы и
@@ -29,9 +29,12 @@ crates/client-core    platform-independent tunnel session
 crates/linux-client   TUN, routes, DNS and kill switch on Linux
 crates/server         session handling and packet forwarding
 crates/android-native Android JNI adapter and TUN packet loop
+crates/apple-native   batched C ABI, handshake and UDP packet engine
+crates/macos-client   privileged utun, routes and DNS for entitlement-free macOS
 crates/profile-cli    encrypted MV1 portable-profile generator
 crates/device-cli     one-key-per-device provisioning utility
 android/app           Kotlin UI + VpnService; Rust core through JNI
+macos                 SwiftUI app + bundled privileged helper
 ```
 
 Платформенный код владеет TUN и жизненным циклом приложения. `client-core`
@@ -111,6 +114,24 @@ android/app           Kotlin UI + VpnService; Rust core through JNI
 Критерий готовности: один и тот же протокол и session core работают на Linux и
 Android; платформенные различия остаются в Kotlin/JNI слое.
 
+## Этап 4a — macOS
+
+- [x] SwiftUI-приложение и `NETunnelProviderManager`.
+- [x] `NEPacketTunnelProvider` с полным IPv4-маршрутом и DNS.
+- [x] Альтернативный root-helper с `utun`, DNS и откатом маршрутов для
+  разработки без платного Apple Developer Program.
+- [x] Пакетный C ABI Swift ↔ Rust без изменения wire-протокола.
+- [x] Хранение приватного ключа через общую Keychain-группу.
+- [x] Блокировка IPv6 bypass, пока протокол переносит только IPv4.
+- [x] Импорт зашифрованных профилей `MV1.…` с паролем без вывода ключей в UI.
+- [x] Несколько профилей и хранение их паролей в macOS Keychain.
+- [x] Автоматический повторный handshake без снятия маршрутов и kill switch.
+- [ ] Немедленная реакция на смену сети и восстановление после сна.
+- [ ] Подписанная проверка утечек и end-to-end benchmark на Intel и Apple Silicon.
+
+Критерий готовности: подписанное приложение устанавливает системный VPN,
+переносит IPv4 через существующий сервер и не выпускает IPv6/DNS в обход.
+
 ## Этап 5 — сменные транспорты
 
 - [ ] Стабильный trait транспорта, не связанный с handshake.
@@ -145,7 +166,7 @@ encrypt + decrypt с текущими аллокациями): около 2.15 �
 ## Не входит в первый MVP
 
 - аккаунты и платежи;
-- iOS и macOS;
+- iOS;
 - mesh/multi-hop;
 - обещания анонимности или обхода любой блокировки;
 - собственные шифры или неподтверждённые криптографические конструкции.

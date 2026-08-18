@@ -1,7 +1,8 @@
 # MouseVPN
 
 Experimental personal VPN protocol and implementation written primarily in
-Rust, with Linux and Android clients. It carries IPv4 through an authenticated
+Rust, with Linux, Android and Windows clients plus a native macOS client in
+development. It carries IPv4 through an authenticated
 encrypted UDP tunnel and supports several independently revocable device keys.
 
 MouseVPN is an early MVP. It has not received an independent security audit and
@@ -29,6 +30,9 @@ Production readiness and draft network policy are tracked in
 - `server`: multi-device Linux TUN/NAT server;
 - `android-native`: Rust JNI adapter, keepalive and in-place reconnect;
 - `android`: Kotlin `VpnService`, profile manager and Android Keystore storage;
+- `apple-native`: batched C ABI over the shared handshake and data plane;
+- `macos` / `macos-client`: SwiftUI app and a root-owned `utun` helper that
+  works without the Network Extension entitlement;
 - `device-cli` / `profile-cli`: per-device provisioning and encrypted `MV1.…`
   copy/paste profiles.
 

@@ -1,0 +1,28 @@
+[package]
+name = "mousevpn-macos-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mousevpn-macos-helper"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+mousevpn-apple-native = { path = "../apple-native" }
+mousevpn-profile-cli = { path = "../profile-cli" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = "0.3"
+zeroize = "1.8"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+# Opening an Apple utun control socket and wrapping its file descriptor requires
+# a small, reviewed FFI boundary. All packet and protocol processing stays safe Rust.
+[lints.rust]
+unsafe_code = "allow"
