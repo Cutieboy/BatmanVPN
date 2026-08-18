@@ -47,6 +47,7 @@ pub struct AppleSession {
     parameters: TunnelParameters,
     outbound: Mutex<Outbound>,
     inbound: Mutex<Inbound>,
+    interrupt: UdpTransport,
 }
 
 impl AppleSession {
@@ -100,6 +101,7 @@ impl AppleSession {
     ) -> Result<Self, AppleClientError> {
         let (transport, plane, negotiated) = handshake::connect(config, local_address)?;
         let outbound_transport = transport.try_clone()?;
+        let interrupt_transport = transport.try_clone()?;
         let (sender, receiver) = plane.split();
         let parameters = tunnel_parameters(negotiated, config.server.ip());
         let packet_capacity = usize::from(parameters.mtu) + TUNNEL_OVERHEAD;
@@ -116,6 +118,7 @@ impl AppleSession {
                 datagram: vec![0_u8; packet_capacity],
                 plaintext: Vec::with_capacity(packet_capacity),
             }),
+            interrupt: interrupt_transport,
         })
     }
 
@@ -233,6 +236,11 @@ impl AppleSession {
             .map_err(AppleClientError::from)
             .map_err(|error| error.context("sending keepalive failed"))?;
         Ok(())
+    }
+
+    /// Wakes packet loops so a platform adapter can terminate promptly.
+    pub fn interrupt(&self) {
+        let _ = self.interrupt.shutdown();
     }
 }
 

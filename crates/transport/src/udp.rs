@@ -1,6 +1,10 @@
 use std::{
     io,
-    net::{SocketAddr, UdpSocket},
+    net::{Shutdown, SocketAddr, UdpSocket},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -22,6 +26,7 @@ const SOCKET_BUFFER_LEN: usize = 4 * 1024 * 1024;
 #[derive(Debug)]
 pub struct UdpTransport {
     socket: UdpSocket,
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Thread-local scratch space for Linux/Android `sendmmsg` and `recvmmsg`.
@@ -63,7 +68,10 @@ impl UdpTransport {
         let socket_ref = SockRef::from(&socket);
         socket_ref.set_recv_buffer_size(SOCKET_BUFFER_LEN)?;
         socket_ref.set_send_buffer_size(SOCKET_BUFFER_LEN)?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Sets the receive timeout.
@@ -92,7 +100,18 @@ impl UdpTransport {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             socket: self.socket.try_clone()?,
+            shutdown: Arc::clone(&self.shutdown),
         })
+    }
+
+    /// Interrupts blocking reads and writes on this socket and its clones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operating system cannot shut down the socket.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.shutdown.store(true, Ordering::Release);
+        SockRef::from(&self.socket).shutdown(Shutdown::Both)
     }
 
     /// Sends a group of connected UDP datagrams with one syscall on Linux and Android.
@@ -195,6 +214,12 @@ impl UdpTransport {
 
 impl DatagramTransport for UdpTransport {
     fn send(&mut self, packet: &[u8]) -> io::Result<()> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP transport is shut down",
+            ));
+        }
         let written = self.socket.send(packet)?;
         if written == packet.len() {
             Ok(())
@@ -207,7 +232,53 @@ impl DatagramTransport for UdpTransport {
     }
 
     fn receive(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        self.socket.recv(output)
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP transport is shut down",
+            ));
+        }
+        let received = self.socket.recv(output)?;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP transport was shut down",
+            ));
+        }
+        Ok(received)
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
+
+    use crate::DatagramTransport;
+
+    use super::UdpTransport;
+
+    #[test]
+    fn shutdown_interrupts_a_blocking_receive() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let mut receiver =
+            UdpTransport::from_socket(socket, peer.local_addr().expect("peer address"))
+                .expect("create receiver");
+        let interrupter = receiver.try_clone().expect("clone receiver");
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 16];
+            let result = receiver.receive(&mut buffer);
+            let _ = finished_tx.send(result);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        interrupter.shutdown().expect("interrupt receiver");
+        let result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking receive should wake");
+        assert!(result.is_err());
     }
 }
 

@@ -246,6 +246,11 @@ fn run_tunnel(
     flag::register(SIGTERM, Arc::clone(&stopping))?;
     let sessions = Arc::new(RwLock::new(session));
     let reconnecting = Arc::new(AtomicBool::new(false));
+    spawn_stop_watcher(
+        stop_file.to_path_buf(),
+        Arc::clone(&sessions),
+        Arc::clone(&stopping),
+    );
     let (worker_tx, worker_rx) = mpsc::sync_channel(1);
     let outgoing_tun = Arc::clone(&tun);
     let outgoing_sessions = Arc::clone(&sessions);
@@ -277,6 +282,27 @@ fn run_tunnel(
         stop_file,
     }
     .run()
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_stop_watcher(
+    stop_file: PathBuf,
+    sessions: Arc<RwLock<Arc<AppleSession>>>,
+    stopping: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while !stopping.load(Ordering::Relaxed) {
+            if stop_file.exists() {
+                eprintln!("MOUSEVPN_STOP_REQUESTED=1");
+                stopping.store(true, Ordering::Relaxed);
+                if let Ok(session) = sessions.read() {
+                    session.interrupt();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
