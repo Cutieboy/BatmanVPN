@@ -4,7 +4,6 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var vpnController: VPNController?
-    private var terminationInProgress = false
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
@@ -14,22 +13,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let vpnController, vpnController.hasRunningHelper else {
             return .terminateNow
         }
-        guard !terminationInProgress else {
-            return .terminateLater
+        do {
+            try vpnController.requestStopForTermination()
+            return .terminateNow
+        } catch {
+            vpnController.presentError(error)
+            sender.activate(ignoringOtherApps: true)
+            sender.windows.first(where: { $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
+            return .terminateCancel
         }
-
-        terminationInProgress = true
-        Task { @MainActor [weak self] in
-            await vpnController.disconnect()
-            let disconnected = !vpnController.hasRunningHelper
-            self?.terminationInProgress = false
-            sender.reply(toApplicationShouldTerminate: disconnected)
-            if !disconnected {
-                sender.activate(ignoringOtherApps: true)
-                sender.windows.first(where: { $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
-            }
-        }
-        return .terminateLater
     }
 }
 

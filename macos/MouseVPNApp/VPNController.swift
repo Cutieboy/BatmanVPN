@@ -194,6 +194,21 @@ final class VPNController: ObservableObject {
         }
     }
 
+    func requestStopForTermination() throws {
+        let paths = try helperPaths()
+        try FileManager.default.createDirectory(
+            at: paths.supportDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: paths.stopFile, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: paths.stopFile.path
+        )
+        disconnectRequested = true
+        status = .disconnecting
+    }
+
     func dismissError() {
         errorMessage = nil
         guard status == .error else { return }
