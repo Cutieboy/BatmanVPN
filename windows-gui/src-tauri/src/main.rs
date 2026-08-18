@@ -79,6 +79,11 @@ fn runtime_diagnostics() -> Diagnostics {
 }
 
 #[tauri::command]
+const fn split_tunneling_available() -> bool {
+    !cfg!(feature = "full-tunnel-only")
+}
+
+#[tauri::command]
 fn list_profiles() -> Result<Vec<profiles::ProfileSummary>, String> {
     profiles::list()
 }
@@ -440,7 +445,14 @@ fn read_helper_status(
 fn run_helper(path: &Path) -> Result<(), String> {
     let config: ClientConfig = load_toml(path).map_err(display_error)?;
     let config = config.validate().map_err(display_error)?;
-    let app_routing = app_exclusions::policy()?;
+    let app_routing = if split_tunneling_available() {
+        app_exclusions::policy()?
+    } else {
+        // The family build deliberately ships without a kernel callout
+        // driver. Ignore any settings left by another edition and always use
+        // the regular full tunnel.
+        mousevpn_windows_client::AppRoutingPolicy::default()
+    };
     let stopping = Arc::new(AtomicBool::new(false));
     let stdin_stopping = Arc::clone(&stopping);
     thread::spawn(move || {
@@ -511,6 +523,7 @@ fn run_gui(minimized: bool) {
         })
         .invoke_handler(tauri::generate_handler![
             runtime_diagnostics,
+            split_tunneling_available,
             list_profiles,
             import_profile,
             delete_profile,

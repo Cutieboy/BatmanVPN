@@ -76,8 +76,18 @@ Get-AppxPackage | Where-Object {-not $_.IsFramework -and $_.InstallLocation} | F
     Get-ChildItem -LiteralPath $pkg.InstallLocation -Filter *.exe -File -Recurse | Where-Object {
       $_.BaseName -ieq $primaryStem -or $_.BaseName -ieq $packageToken
     } | ForEach-Object {$packagePaths.Add($_.FullName)}
+    [string[]]$packageOnlyPaths=@($packagePaths | Select-Object -Unique)
+    [string[]]$relativePaths=@($packageOnlyPaths | ForEach-Object {$_.Substring($pkg.InstallLocation.Length).TrimStart('\')})
+    if ([string]$pkg.Name -ieq 'Claude' -or $primaryStem -ieq 'Claude') {
+      $claudeCodeRoot=Join-Path $env:APPDATA 'Claude\claude-code'
+      if (Test-Path -LiteralPath $claudeCodeRoot -PathType Container) {
+        Get-ChildItem -LiteralPath $claudeCodeRoot -Directory | ForEach-Object {
+          $helper=Join-Path $_.FullName 'claude.exe'
+          if (Test-Path -LiteralPath $helper -PathType Leaf) {$packagePaths.Add($helper)}
+        }
+      }
+    }
     [string[]]$paths=@($packagePaths | Select-Object -Unique)
-    [string[]]$relativePaths=@($paths | ForEach-Object {$_.Substring($pkg.InstallLocation.Length).TrimStart('\')})
     $apps.Add([pscustomobject]@{id=('store:'+$aumid);name=$name;path=$primary;paths=$paths;source='store';packageName=[string]$pkg.Name;relativePaths=$relativePaths})
   }
 }
@@ -329,6 +339,9 @@ fn validate_executable(path: &Path) -> Result<PathBuf, String> {
 fn load_resolved() -> Result<StoredSettings, String> {
     let mut settings = load()?;
     let mut changed = resolve_squirrel_paths(&mut settings.apps);
+    if resolve_claude_code_paths(&mut settings.apps) {
+        changed = true;
+    }
     if settings
         .apps
         .iter()
@@ -347,6 +360,60 @@ fn load_resolved() -> Result<StoredSettings, String> {
         save(&settings)?;
     }
     Ok(settings)
+}
+
+fn resolve_claude_code_paths(paths: &mut Vec<PathBuf>) -> bool {
+    dirs::config_dir().is_some_and(|directory| {
+        resolve_claude_code_paths_at(paths, &directory.join("Claude").join("claude-code"))
+    })
+}
+
+fn resolve_claude_code_paths_at(paths: &mut Vec<PathBuf>, root: &Path) -> bool {
+    let selected = paths.iter().any(|path| {
+        windowsapps_identity(path)
+            .is_some_and(|(package_name, _)| package_name.eq_ignore_ascii_case("Claude"))
+            || is_claude_code_helper(path, root)
+    });
+    if !selected {
+        return false;
+    }
+
+    let original_keys = paths
+        .iter()
+        .map(|path| normalized_key(path))
+        .collect::<Vec<_>>();
+
+    // Claude's Store UI launches a separately updated Claude Code helper from
+    // %APPDATA%. Both processes perform network requests, so one Claude card
+    // must route both identities through the same policy.
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let helper = entry.path().join("claude.exe");
+            if entry.path().is_dir() && helper.is_file() {
+                paths.push(normalize_windows_path(&helper));
+            }
+        }
+    }
+
+    // Claude removes old version directories during its own update. Discard
+    // only stale helpers under this exact installation root.
+    paths.retain(|path| !is_claude_code_helper(path, root) || path.is_file());
+    sort_and_deduplicate(paths);
+    let resolved_keys = paths
+        .iter()
+        .map(|path| normalized_key(path))
+        .collect::<Vec<_>>();
+    original_keys != resolved_keys
+}
+
+fn is_claude_code_helper(path: &Path, root: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("claude.exe"))
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|parent| normalized_key(parent) == normalized_key(root))
 }
 
 fn resolve_squirrel_paths(paths: &mut Vec<PathBuf>) -> bool {
@@ -697,9 +764,9 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        migrate, normalize, normalized_key, resolve_packaged_paths, resolve_squirrel_paths,
-        sort_and_deduplicate, windowsapps_identity, windowsapps_package_family, InstalledApp,
-        StoredSettings,
+        migrate, normalize, normalized_key, resolve_claude_code_paths_at, resolve_packaged_paths,
+        resolve_squirrel_paths, sort_and_deduplicate, windowsapps_identity,
+        windowsapps_package_family, InstalledApp, StoredSettings,
     };
     use mousevpn_windows_client::AppRoutingMode;
     use uuid::Uuid;
@@ -800,6 +867,26 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&launcher_path));
         assert!(paths.contains(&current_executable));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn groups_and_refreshes_store_claude_with_its_code_helper() {
+        let root = std::env::temp_dir().join(format!("mousevpn-claude-code-{}", Uuid::new_v4()));
+        let current = root.join("2.1.230").join("claude.exe");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, []).unwrap();
+
+        let store = PathBuf::from(
+            r"C:\Program Files\WindowsApps\Claude_1.30096.5.0_x64__publisher\app\Claude.exe",
+        );
+        let stale = root.join("2.1.229").join("claude.exe");
+        let mut paths = vec![store.clone(), stale];
+        assert!(resolve_claude_code_paths_at(&mut paths, &root));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&store));
+        assert!(paths.contains(&current));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -16,17 +16,26 @@ use windows_sys::{
             FwpmGetAppIdFromFileName0, FwpmProviderAdd0, FwpmProviderContextAdd0, FwpmSubLayerAdd0,
             FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
             FWPM_ACTION0_0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
-            FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_DISPLAY_DATA0,
-            FWPM_FILTER0, FWPM_FILTER0_0, FWPM_FILTER_CONDITION0,
-            FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT,
-            FWPM_GENERAL_CONTEXT, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_ALE_USER_ID,
+            FWPM_CONDITION_IP_LOCAL_ADDRESS, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER0_0,
+            FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+            FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT, FWPM_GENERAL_CONTEXT,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
             FWPM_LAYER_ALE_BIND_REDIRECT_V4, FWPM_LAYER_ALE_BIND_REDIRECT_V6, FWPM_PROVIDER0,
             FWPM_PROVIDER_CONTEXT0, FWPM_PROVIDER_CONTEXT0_0, FWPM_SESSION0,
-            FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_CALLOUT_TERMINATING,
-            FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-            FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
+            FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK,
+            FWP_ACTION_CALLOUT_TERMINATING, FWP_ACTION_PERMIT, FWP_ACTRL_MATCH_FILTER,
+            FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0,
+            FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_SID, FWP_V4_ADDR_AND_MASK,
+            FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
         },
-        Security::{Authorization::ConvertStringSidToSidW, PSID},
+        Security::{
+            Authorization::{
+                BuildExplicitAccessWithNameW, BuildSecurityDescriptorW, ConvertStringSidToSidW,
+                EXPLICIT_ACCESS_W, GRANT_ACCESS,
+            },
+            PSECURITY_DESCRIPTOR, PSID,
+        },
         System::Rpc::RPC_C_AUTHN_WINNT,
     },
 };
@@ -286,12 +295,16 @@ unsafe fn configure_transaction(
         }
         AppRoutingMode::Include => {
             add_default_bypass_filters(engine, addresses.ipv6.is_some())?;
+            // Windows performs DNS lookups for desktop and packaged apps in the
+            // shared DNS Client service. Match its service SID as well as
+            // svchost.exe so unrelated Windows services keep bypassing the VPN.
+            add_dns_client_vpn_filters(engine, addresses.ipv6.is_some())?;
             for path in &policy.apps {
                 let app_id = AppId::from_path(path)?;
                 add_vpn_identity_filters(
                     engine,
                     FilterIdentity::Application(app_id.blob),
-                    addresses.ipv6.is_some(),
+                    addresses,
                 )?;
             }
             for sid in &policy.package_sids {
@@ -299,7 +312,7 @@ unsafe fn configure_transaction(
                 add_vpn_identity_filters(
                     engine,
                     FilterIdentity::Package(package_sid.sid),
-                    addresses.ipv6.is_some(),
+                    addresses,
                 )?;
             }
         }
@@ -394,11 +407,75 @@ fn add_default_bypass_filters(engine: HANDLE, ipv6: bool) -> Result<(), ClientEr
 fn add_vpn_identity_filters(
     engine: HANDLE,
     identity: FilterIdentity,
-    ipv6: bool,
+    addresses: PhysicalAddresses,
 ) -> Result<(), ClientError> {
     add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_BIND_REDIRECT_V4)?;
-    if ipv6 {
+    add_direct_ipv4_block_filter(engine, identity, addresses.ipv4)?;
+    if let Some(ipv6) = addresses.ipv6 {
         add_permit_filter_for_layer(engine, identity, FWPM_LAYER_ALE_BIND_REDIRECT_V6)?;
+        add_direct_ipv6_block_filter(engine, identity, ipv6)?;
+    }
+    Ok(())
+}
+
+fn add_direct_ipv4_block_filter(
+    engine: HANDLE,
+    identity: FilterIdentity,
+    address: Ipv4Addr,
+) -> Result<(), ClientError> {
+    let mut address = FWP_V4_ADDR_AND_MASK {
+        addr: u32::from(address),
+        mask: u32::MAX,
+    };
+    let mut conditions = [identity.condition(), local_ipv4_condition(&mut address)];
+    add_block_filter_for_conditions(
+        engine,
+        &mut conditions,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        "MouseVPN selected application direct IPv4 block",
+    )
+}
+
+fn add_direct_ipv6_block_filter(
+    engine: HANDLE,
+    identity: FilterIdentity,
+    address: Ipv6Addr,
+) -> Result<(), ClientError> {
+    let mut address = FWP_V6_ADDR_AND_MASK {
+        addr: address.octets(),
+        prefixLength: 128,
+    };
+    let mut conditions = [identity.condition(), local_ipv6_condition(&mut address)];
+    add_block_filter_for_conditions(
+        engine,
+        &mut conditions,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        "MouseVPN selected application direct IPv6 block",
+    )
+}
+
+fn add_dns_client_vpn_filters(engine: HANDLE, ipv6: bool) -> Result<(), ClientError> {
+    let system_root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| ClientError::Platform("Windows SystemRoot is unavailable".to_owned()))?;
+    let app_id = AppId::from_path(&PathBuf::from(system_root).join("System32\\svchost.exe"))?;
+    let mut service = UserSecurityDescriptor::for_account("NT SERVICE\\Dnscache")?;
+    let mut conditions = [
+        FilterIdentity::Application(app_id.blob).condition(),
+        service.condition(),
+    ];
+    add_permit_filter_for_conditions(
+        engine,
+        &mut conditions,
+        FWPM_LAYER_ALE_BIND_REDIRECT_V4,
+        "MouseVPN DNS Client permit",
+    )?;
+    if ipv6 {
+        add_permit_filter_for_conditions(
+            engine,
+            &mut conditions,
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6,
+            "MouseVPN DNS Client IPv6 permit",
+        )?;
     }
     Ok(())
 }
@@ -488,7 +565,21 @@ fn add_permit_filter_for_layer(
     layer: GUID,
 ) -> Result<(), ClientError> {
     let mut condition = identity.condition();
-    let mut name = wide("MouseVPN application permit");
+    add_permit_filter_for_conditions(
+        engine,
+        std::slice::from_mut(&mut condition),
+        layer,
+        "MouseVPN application permit",
+    )
+}
+
+fn add_permit_filter_for_conditions(
+    engine: HANDLE,
+    conditions: &mut [FWPM_FILTER_CONDITION0],
+    layer: GUID,
+    name: &str,
+) -> Result<(), ClientError> {
+    let mut name = wide(name);
     let mut provider_key = PROVIDER_KEY;
     let mut weight = 15_u64;
     let filter = FWPM_FILTER0 {
@@ -504,8 +595,8 @@ fn add_permit_filter_for_layer(
                     uint64: ptr::from_mut(&mut weight),
                 },
         },
-        numFilterConditions: 1,
-        filterCondition: ptr::from_mut(&mut condition),
+        numFilterConditions: u32::try_from(conditions.len()).expect("condition count fits u32"),
+        filterCondition: conditions.as_mut_ptr(),
         action: FWPM_ACTION0 {
             r#type: FWP_ACTION_PERMIT,
             ..Default::default()
@@ -516,6 +607,68 @@ fn add_permit_filter_for_layer(
         unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), ptr::null_mut()) },
         "add an application firewall permit",
     )
+}
+
+fn add_block_filter_for_conditions(
+    engine: HANDLE,
+    conditions: &mut [FWPM_FILTER_CONDITION0],
+    layer: GUID,
+    name: &str,
+) -> Result<(), ClientError> {
+    let mut name = wide(name);
+    let mut provider_key = PROVIDER_KEY;
+    let mut weight = 20_u64;
+    let filter = FWPM_FILTER0 {
+        displayData: display_data(&mut name),
+        flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        providerKey: ptr::from_mut(&mut provider_key),
+        layerKey: layer,
+        subLayerKey: SUBLAYER_KEY,
+        weight: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0 {
+            r#type: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
+            Anonymous:
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
+                    uint64: ptr::from_mut(&mut weight),
+                },
+        },
+        numFilterConditions: u32::try_from(conditions.len()).expect("condition count fits u32"),
+        filterCondition: conditions.as_mut_ptr(),
+        action: FWPM_ACTION0 {
+            r#type: FWP_ACTION_BLOCK,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    check_wfp(
+        unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), ptr::null_mut()) },
+        "add a selected-application direct-connection block",
+    )
+}
+
+fn local_ipv4_condition(address: &mut FWP_V4_ADDR_AND_MASK) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_V4_ADDR_MASK,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                v4AddrMask: ptr::from_mut(address),
+            },
+        },
+    }
+}
+
+fn local_ipv6_condition(address: &mut FWP_V6_ADDR_AND_MASK) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_V6_ADDR_MASK,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                v6AddrMask: ptr::from_mut(address),
+            },
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -596,6 +749,76 @@ impl Drop for PackageSid {
     fn drop(&mut self) {
         unsafe {
             LocalFree(self.sid.cast());
+        }
+    }
+}
+
+struct UserSecurityDescriptor {
+    descriptor: PSECURITY_DESCRIPTOR,
+    blob: FWP_BYTE_BLOB,
+}
+
+impl UserSecurityDescriptor {
+    fn for_account(account: &str) -> Result<Self, ClientError> {
+        let mut account = wide(account);
+        let mut access = EXPLICIT_ACCESS_W::default();
+        unsafe {
+            BuildExplicitAccessWithNameW(
+                &raw mut access,
+                account.as_mut_ptr(),
+                FWP_ACTRL_MATCH_FILTER,
+                GRANT_ACCESS,
+                0,
+            );
+        }
+
+        let mut size = 0_u32;
+        let mut descriptor = ptr::null_mut();
+        let result = unsafe {
+            BuildSecurityDescriptorW(
+                ptr::null(),
+                ptr::null(),
+                1,
+                &raw const access,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+                &raw mut size,
+                &raw mut descriptor,
+            )
+        };
+        if result != 0 || descriptor.is_null() {
+            return Err(ClientError::Platform(format!(
+                "failed to resolve the Windows DNS Client service identity: Windows error {result}"
+            )));
+        }
+        Ok(Self {
+            descriptor,
+            blob: FWP_BYTE_BLOB {
+                size,
+                data: descriptor.cast(),
+            },
+        })
+    }
+
+    fn condition(&mut self) -> FWPM_FILTER_CONDITION0 {
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_ALE_USER_ID,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
+                Anonymous: FWP_CONDITION_VALUE0_0 {
+                    sd: &raw mut self.blob,
+                },
+            },
+        }
+    }
+}
+
+impl Drop for UserSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.descriptor.cast());
         }
     }
 }
@@ -725,7 +948,14 @@ fn wide(value: &str) -> Vec<u16> {
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use super::RedirectContext;
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWPM_CONDITION_ALE_USER_ID, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_V4_ADDR_AND_MASK,
+        FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
+    };
+
+    use super::{
+        local_ipv4_condition, local_ipv6_condition, RedirectContext, UserSecurityDescriptor,
+    };
 
     #[test]
     fn redirect_context_matches_the_driver_abi() {
@@ -741,5 +971,43 @@ mod tests {
         let context = RedirectContext::ipv6(address);
         assert_eq!(&context[..4], &[23, 0, 0, 0]);
         assert_eq!(&context[4..], &address.octets());
+    }
+
+    #[test]
+    fn resolves_the_dns_client_service_identity() {
+        let mut descriptor = UserSecurityDescriptor::for_account("NT SERVICE\\Dnscache").unwrap();
+        assert!(!descriptor.descriptor.is_null());
+        assert!(descriptor.blob.size > 0);
+        let condition = descriptor.condition();
+        assert_eq!(condition.fieldKey.data1, FWPM_CONDITION_ALE_USER_ID.data1);
+        assert_eq!(condition.fieldKey.data2, FWPM_CONDITION_ALE_USER_ID.data2);
+        assert_eq!(condition.fieldKey.data3, FWPM_CONDITION_ALE_USER_ID.data3);
+        assert_eq!(condition.fieldKey.data4, FWPM_CONDITION_ALE_USER_ID.data4);
+        assert_eq!(
+            condition.conditionValue.r#type,
+            FWP_SECURITY_DESCRIPTOR_TYPE
+        );
+    }
+
+    #[test]
+    fn physical_address_conditions_are_exact_host_addresses() {
+        let mut ipv4 = FWP_V4_ADDR_AND_MASK {
+            addr: u32::from(Ipv4Addr::new(192, 168, 0, 103)),
+            mask: u32::MAX,
+        };
+        let ipv4_condition = local_ipv4_condition(&mut ipv4);
+        assert_eq!(ipv4_condition.conditionValue.r#type, FWP_V4_ADDR_MASK);
+        assert_eq!(ipv4.addr, 0xc0a8_0067);
+        assert_eq!(ipv4.mask, u32::MAX);
+
+        let address = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
+        let mut ipv6 = FWP_V6_ADDR_AND_MASK {
+            addr: address.octets(),
+            prefixLength: 128,
+        };
+        let ipv6_condition = local_ipv6_condition(&mut ipv6);
+        assert_eq!(ipv6_condition.conditionValue.r#type, FWP_V6_ADDR_MASK);
+        assert_eq!(ipv6.addr, address.octets());
+        assert_eq!(ipv6.prefixLength, 128);
     }
 }

@@ -27,6 +27,7 @@ use crate::{
 
 pub(crate) const UDP_POLL: Duration = Duration::from_millis(250);
 const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const POST_RECONNECT_EVENT_GRACE: Duration = Duration::from_secs(3);
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
 
 #[allow(clippy::too_many_arguments)]
@@ -82,6 +83,7 @@ pub(crate) fn run(
         worker: result_rx,
         network,
         wintun_send_drops: 0,
+        reconnect_event_grace_until: None,
     }
     .run();
     let _ = session.shutdown();
@@ -105,6 +107,7 @@ struct IncomingLoop<'a> {
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a mut NetworkGuard,
     wintun_send_drops: u64,
+    reconnect_event_grace_until: Option<Instant>,
 }
 
 impl IncomingLoop<'_> {
@@ -144,8 +147,13 @@ impl IncomingLoop<'_> {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
             }
-            if self.reconnect_requested.swap(false, Ordering::AcqRel) {
-                liveness.connection_lost(Instant::now());
+            let now = Instant::now();
+            if take_reconnect_request(
+                &self.reconnect_requested,
+                self.reconnect_event_grace_until,
+                now,
+            ) {
+                liveness.connection_lost(now);
             }
             self.maintain_liveness(&mut liveness, &mut keepalive)?;
         }
@@ -200,7 +208,15 @@ impl IncomingLoop<'_> {
         self.reconnecting.store(false, Ordering::Release);
         match result {
             Ok(()) => {
-                liveness.reconnected(Instant::now());
+                let reconnected_at = Instant::now();
+                // A sleep/wake cycle usually produces both a power-resume
+                // notification and several physical-address notifications.
+                // The replacement handshake already used the restored route,
+                // so queued copies must not immediately tear it down again.
+                self.reconnect_requested.store(false, Ordering::Release);
+                self.reconnect_event_grace_until =
+                    Some(reconnected_at + POST_RECONNECT_EVENT_GRACE);
+                liveness.reconnected(reconnected_at);
                 eprintln!("MOUSEVPN_STATE=reconnected");
             }
             Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),
@@ -414,6 +430,14 @@ fn is_timeout(error: &std::io::Error) -> bool {
     )
 }
 
+fn take_reconnect_request(
+    requested: &AtomicBool,
+    grace_until: Option<Instant>,
+    now: Instant,
+) -> bool {
+    requested.swap(false, Ordering::AcqRel) && grace_until.is_none_or(|deadline| now >= deadline)
+}
+
 fn is_peer_unavailable(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -455,13 +479,15 @@ fn poisoned_sender() -> ClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_wintun_send_queue_full, note_packet_drop, PeriodicWorker};
+    use super::{
+        is_wintun_send_queue_full, note_packet_drop, take_reconnect_request, PeriodicWorker,
+    };
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -489,5 +515,22 @@ mod tests {
         let mut counter = u64::MAX;
         note_packet_drop(&mut counter, "test");
         assert_eq!(counter, u64::MAX);
+    }
+
+    #[test]
+    fn coalesces_queued_resume_events_after_a_successful_reconnect() {
+        let requested = AtomicBool::new(true);
+        let now = Instant::now();
+        let grace_until = now + Duration::from_secs(3);
+
+        assert!(!take_reconnect_request(&requested, Some(grace_until), now));
+        assert!(!requested.load(Ordering::Acquire));
+
+        requested.store(true, Ordering::Release);
+        assert!(take_reconnect_request(
+            &requested,
+            Some(grace_until),
+            grace_until
+        ));
     }
 }

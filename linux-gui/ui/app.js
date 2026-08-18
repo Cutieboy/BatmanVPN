@@ -67,8 +67,10 @@ let connectedAt = null;
 const isWindows = navigator.userAgent.includes("Windows");
 
 if (isWindows) {
-  elements.appExclusions.classList.remove("hidden");
   elements.autostartSetting.classList.remove("hidden");
+  invoke("split_tunneling_available")
+    .then((available) => elements.appExclusions.classList.toggle("hidden", !available))
+    .catch(() => elements.appExclusions.classList.add("hidden"));
 }
 
 async function refreshAutostart() {

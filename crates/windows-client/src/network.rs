@@ -261,7 +261,7 @@ fn firewall_script(policy: &AppRoutingPolicy, only_missing: bool) -> String {
                 "if ($true)"
             };
             format!(
-                "$vpnApps=@({apps}); $vpnPackages=@({packages}); foreach ($adapter in $physical) {{ $i=0; foreach ($app in $vpnApps) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-app IPv4 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-app IPv6 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $i++ }}; foreach ($package in $vpnPackages) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-package IPv4 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-package IPv6 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $i++ }} }}"
+                "$vpnApps=@({apps}); $vpnPackages=@({packages}); foreach ($adapter in $physical) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-dnscache'); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN DNS Client kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Service Dnscache -RemoteAddress $blocked | Out-Null }} catch {{ throw ('DNS Client IPv4 firewall rule failed: '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-dnscache'); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN DNS Client kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Service Dnscache -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('DNS Client IPv6 firewall rule failed: '+$_.Exception.Message) }} }}; $i=0; foreach ($app in $vpnApps) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-app IPv4 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected app kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Program $app -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-app IPv6 firewall rule failed for '+$app+': '+$_.Exception.Message) }} }}; $i++ }}; foreach ($package in $vpnPackages) {{ $name=('MouseVPN-KS-v4-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv4 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress $blocked | Out-Null }} catch {{ throw ('Selected-package IPv4 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $name=('MouseVPN-KS-v6-'+$adapter.ifIndex+'-package-'+$i); {guard} {{ try {{ New-NetFirewallRule -Name $name -DisplayName ('MouseVPN selected package kill switch IPv6 '+$adapter.Name) -Group '{FIREWALL_GROUP}' -Direction Outbound -Action Block -Enabled True -Profile Any -InterfaceAlias $adapter.Name -Package $package -RemoteAddress 'Internet6' | Out-Null }} catch {{ throw ('Selected-package IPv6 firewall rule failed for '+$package+': '+$_.Exception.Message) }} }}; $i++ }} }}"
             )
         }
     }
@@ -585,6 +585,21 @@ mod tests {
         );
         assert!(script.contains("-Program $app"));
         assert!(script.contains("Mouse''s Browser.exe"));
+    }
+
+    #[test]
+    fn allowlist_firewall_keeps_dns_client_on_the_tunnel() {
+        let script = firewall_script(
+            &AppRoutingPolicy {
+                mode: AppRoutingMode::Include,
+                apps: Vec::new(),
+                package_sids: Vec::new(),
+            },
+            false,
+        );
+        assert!(script.contains("-Service Dnscache"));
+        assert!(script.contains("-dnscache"));
+        assert!(!script.contains("-Program 'C:\\Windows\\System32\\svchost.exe'"));
     }
 
     #[test]

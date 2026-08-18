@@ -16,16 +16,30 @@ protocol implementation.
 - installs per-interface Windows Firewall kill-switch rules for IPv4 and IPv6;
 - supports application denylist/allowlist routing through the bundled WFP
   callout driver;
+- supports a `full-tunnel-only` family build that omits the test driver, hides
+  application routing, and ignores split-tunnel settings left by another
+  edition;
 - discovers Start-menu and Microsoft Store applications for multi-select and
   refreshes versioned `WindowsApps` executable paths after package updates;
 - matches Microsoft Store applications by both executable path and package SID
   so MSIX network processes follow the selected split-tunnel policy;
+- keeps the Windows DNS Client service on the tunnel in application allowlist
+  mode, with service-specific leak protection that does not capture unrelated
+  `svchost.exe` services;
+- reauthorizes and blocks pre-existing selected-application flows that still
+  use a physical local address, so applications started before MouseVPN fail
+  closed and retry through the tunnel;
 - groups Squirrel desktop applications such as Claude with their versioned
   `app-*` executable and refreshes that path automatically after updates;
+- groups the Microsoft Store Claude client with its separately updated
+  `%APPDATA%\Claude\claude-code\<version>\claude.exe` network helper and
+  refreshes that helper path automatically after updates;
 - journals every network mutation before applying it and repairs stale state on
   the next launch;
 - reconnects timed-out sessions with bounded exponential backoff while leaving
   the kill switch active;
+- coalesces duplicate Windows resume and address-change notifications after a
+  successful reconnect so waking from sleep does not start a second handshake;
 - preserves a fail-closed network policy and restarts the complete Wintun
   runtime after an unexpected fatal packet-path error;
 - keeps running in the Windows notification area when its main window is

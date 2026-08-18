@@ -1,9 +1,13 @@
 [package]
 name = "mousevpn-windows-gui"
-version = "0.1.11"
+version = "0.1.15"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+default = []
+full-tunnel-only = []
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
