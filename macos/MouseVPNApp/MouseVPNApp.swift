@@ -9,19 +9,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let vpnController, vpnController.hasRunningHelper else {
-            return .terminateNow
-        }
-        do {
-            try vpnController.requestStopForTermination()
-            return .terminateNow
-        } catch {
-            vpnController.presentError(error)
-            sender.activate(ignoringOtherApps: true)
-            sender.windows.first(where: { $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
-            return .terminateCancel
-        }
+    func applicationWillTerminate(_ notification: Notification) {
+        guard vpnController?.hasRunningHelper == true else { return }
+        try? vpnController?.requestStopForTermination()
     }
 }
 

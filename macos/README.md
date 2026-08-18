@@ -54,8 +54,9 @@ The helper continues running when the GUI is closed; reopen the app and press
 Closing the main window leaves MouseVPN available from its menu-bar shield.
 The menu shows the current state, switches profiles, connects or disconnects,
 and reopens the main window. Closing the window keeps the tunnel running, while
-**Завершить MouseVPN** or Command-Q writes a stop request, closes the GUI, and
-lets the helper restore routes and DNS in the background.
+**Завершить MouseVPN** or Command-Q closes the GUI normally; its termination
+callback writes a stop request so the helper restores routes and DNS in the
+background.
 
 Runtime files are stored in `~/Library/Application Support/MouseVPN/`:
 
