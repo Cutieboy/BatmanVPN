@@ -51,6 +51,12 @@ name and Android package name; a separate switch shows only selected entries.
 - The Android VPN advertises only IPv4. Android blocks the unconfigured IPv6
   family instead of routing it into the IPv4-only Rust core.
 - The UDP socket is protected with `VpnService.protect()` before connecting.
+- The main screen can run a 30-second TCP port 443 connectivity test against
+  Google and YouTube. Its sockets deliberately remain unprotected, so the
+  result measures end-to-end traffic through the active tunnel in either
+  app-routing mode without presenting TLS setup time as network latency.
 
-This is an experimental MVP. Always-on VPN, network migration, biometric profile
+This is an experimental MVP. The foreground service follows Android's current
+non-VPN network and migrates the protected UDP socket when the device moves
+between Wi-Fi and cellular connectivity. Always-on VPN, biometric profile
 unlock and Play Store packaging remain future work.

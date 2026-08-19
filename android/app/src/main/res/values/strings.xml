@@ -32,7 +32,7 @@
     <string-array name="protocol_mode_hints">
         <item>Обычный MouseVPN для старых клиентов</item>
         <item>Меняющийся тег и лёгкое случайное дополнение</item>
-        <item>Выравнивание размеров и 1–2 маскирующих пакета</item>
+        <item>Пятисекундная ротация и 1–2 маскирующих пакета</item>
         <item>Секундная ротация и 3–5 маскирующих пакетов</item>
     </string-array>
     <string name="plus">+</string>
@@ -63,6 +63,17 @@
     <string name="diagnostics_export">Экспортировать JSON</string>
     <string name="diagnostics_clear">Очистить историю</string>
     <string name="diagnostics_cleared">История диагностики очищена</string>
+
+    <string name="network_test_start">Проверить интернет — 30 с</string>
+    <string name="network_test_running">Тест идёт…</string>
+    <string name="network_test_idle">Проверка TCP 443 до Google и YouTube пойдёт через VPN.</string>
+    <string name="network_test_requires_vpn">Сначала подключите VPN.</string>
+    <string name="network_test_starting">Запускаем 30-секундную проверку через туннель…</string>
+    <string name="network_test_progress">Осталось %1$d с · успешно %2$d/%3$d · среднее TCP-подключение %4$d мс</string>
+    <string name="network_test_finished">Готово: %1$d/%2$d успешно · потери проверок %3$d%% · среднее TCP-подключение %4$d мс</string>
+    <string name="network_test_failed">Нет успешных ответов. Последняя ошибка: %1$s</string>
+    <string name="network_test_interrupted">Тест остановлен: VPN отключён.</string>
+    <string name="network_test_no_attempts">Тест не успел выполнить ни одну проверку.</string>
 
     <string name="exclusions_open">Маршрутизация приложений</string>
     <string name="exclusions_title">Приложения и VPN</string>

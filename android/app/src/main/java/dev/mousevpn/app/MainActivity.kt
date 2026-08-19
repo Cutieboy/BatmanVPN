@@ -20,10 +20,16 @@ import android.view.Window
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.ImageButton
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var store: ProfileStore
@@ -36,10 +42,14 @@ class MainActivity : Activity() {
     private lateinit var statTime: TextView
     private lateinit var protocolMode: Spinner
     private lateinit var protocolHint: TextView
+    private lateinit var networkTestButton: Button
+    private lateinit var networkTestResult: TextView
     private val handler = Handler(Looper.getMainLooper())
-    private var connected = false
+    private val networkTestExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var connected = false
     private var connecting = false
     private var bindingProtocol = true
+    @Volatile private var networkTestRunning = false
 
     private val clock = object : Runnable {
         override fun run() {
@@ -73,6 +83,8 @@ class MainActivity : Activity() {
         statTime = findViewById(R.id.statTimeValue)
         protocolMode = findViewById(R.id.protocolMode)
         protocolHint = findViewById(R.id.protocolHint)
+        networkTestButton = findViewById(R.id.networkTest)
+        networkTestResult = findViewById(R.id.networkTestResult)
         protocolMode.adapter = ArrayAdapter.createFromResource(
             this,
             R.array.protocol_mode_labels,
@@ -99,6 +111,7 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.openDiagnostics).setOnClickListener {
             startActivity(Intent(this, DiagnosticsActivity::class.java))
         }
+        networkTestButton.setOnClickListener { startNetworkTest() }
         powerButton.setOnClickListener {
             if (connected) disconnect() else if (!connecting) requestConnection()
         }
@@ -128,6 +141,11 @@ class MainActivity : Activity() {
         handler.removeCallbacks(clock)
         unregisterReceiver(statusReceiver)
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        networkTestExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun openAddProfile() {
@@ -282,6 +300,7 @@ class MainActivity : Activity() {
         if (!connected) statTime.text = "—"
         updatePowerEnabled()
         updateProtocolUi()
+        updateNetworkTestButton()
     }
 
     private fun updateProtocolUi() {
@@ -298,6 +317,118 @@ class MainActivity : Activity() {
         powerButton.alpha = if (powerButton.isEnabled) 1f else 0.48f
     }
 
+    private fun startNetworkTest() {
+        if (!connected || networkTestRunning) {
+            if (!connected) networkTestResult.setText(R.string.network_test_requires_vpn)
+            return
+        }
+        networkTestRunning = true
+        networkTestButton.setText(R.string.network_test_running)
+        networkTestResult.setText(R.string.network_test_starting)
+        updateNetworkTestButton()
+        networkTestExecutor.execute(::runNetworkTest)
+    }
+
+    private fun runNetworkTest() {
+        val deadline = SystemClock.elapsedRealtime() + NETWORK_TEST_DURATION_MS
+        var attempts = 0
+        var successes = 0
+        var totalLatencyMs = 0L
+        var lastError = ""
+
+        while (connected && !Thread.currentThread().isInterrupted &&
+            SystemClock.elapsedRealtime() < deadline
+        ) {
+            val roundStarted = SystemClock.elapsedRealtime()
+            val result = probeThroughVpn()
+            attempts++
+            if (result.success) {
+                successes++
+                totalLatencyMs += result.latencyMs
+            } else {
+                lastError = result.detail
+            }
+            val remainingSeconds =
+                ((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L) + 999L) / 1_000L
+            val average = if (successes == 0) 0L else totalLatencyMs / successes
+            runOnUiThread {
+                if (!isDestroyed) {
+                    networkTestResult.text = getString(
+                        R.string.network_test_progress,
+                        remainingSeconds,
+                        successes,
+                        attempts,
+                        average,
+                    )
+                }
+            }
+
+            val delay = (NETWORK_TEST_INTERVAL_MS -
+                (SystemClock.elapsedRealtime() - roundStarted)).coerceAtLeast(0L)
+            val available = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            try {
+                Thread.sleep(delay.coerceAtMost(available))
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+
+        val completedWhileConnected = connected && !Thread.currentThread().isInterrupted
+        val average = if (successes == 0) 0L else totalLatencyMs / successes
+        val failedPercent = if (attempts == 0) 100 else (attempts - successes) * 100 / attempts
+        networkTestRunning = false
+        runOnUiThread {
+            if (isDestroyed) return@runOnUiThread
+            networkTestButton.setText(R.string.network_test_start)
+            updateNetworkTestButton()
+            networkTestResult.text = when {
+                !completedWhileConnected -> getString(R.string.network_test_interrupted)
+                attempts == 0 -> getString(R.string.network_test_no_attempts)
+                successes == 0 -> getString(R.string.network_test_failed, lastError)
+                else -> getString(
+                    R.string.network_test_finished,
+                    successes,
+                    attempts,
+                    failedPercent,
+                    average,
+                )
+            }
+        }
+    }
+
+    private fun probeThroughVpn(): ProbeResult {
+        var lastError = getString(R.string.unknown_error)
+        for (target in NETWORK_TEST_TARGETS) {
+            val started = SystemClock.elapsedRealtime()
+            val address = try {
+                InetAddress.getAllByName(target.host).firstOrNull { it is Inet4Address }
+                    ?: error("IPv4 unavailable")
+            } catch (exception: Exception) {
+                lastError = "${target.name}: ${exception.javaClass.simpleName}"
+                continue
+            }
+            try {
+                Socket().use { socket ->
+                    socket.tcpNoDelay = true
+                    socket.connect(InetSocketAddress(address, target.port), NETWORK_TEST_TIMEOUT_MS)
+                }
+                return ProbeResult(
+                    success = true,
+                    latencyMs = SystemClock.elapsedRealtime() - started,
+                    detail = target.name,
+                )
+            } catch (exception: Exception) {
+                lastError = "${target.name}: ${exception.javaClass.simpleName}"
+            }
+        }
+        return ProbeResult(success = false, latencyMs = 0L, detail = lastError)
+    }
+
+    private fun updateNetworkTestButton() {
+        networkTestButton.isEnabled = connected && !networkTestRunning
+        networkTestButton.alpha = if (networkTestButton.isEnabled) 1f else 0.48f
+    }
+
     private fun formatDuration(milliseconds: Long): String {
         val seconds = (milliseconds / 1_000).coerceAtLeast(0)
         val hours = seconds / 3_600
@@ -311,5 +442,20 @@ class MainActivity : Activity() {
 
     private companion object {
         const val VPN_REQUEST = 10
+        const val NETWORK_TEST_DURATION_MS = 30_000L
+        const val NETWORK_TEST_INTERVAL_MS = 1_000L
+        const val NETWORK_TEST_TIMEOUT_MS = 2_000
+        val NETWORK_TEST_TARGETS = listOf(
+            ProbeTarget("Google", "www.google.com", 443),
+            ProbeTarget("YouTube", "www.youtube.com", 443),
+        )
     }
 }
+
+private data class ProbeTarget(val name: String, val host: String, val port: Int)
+
+private data class ProbeResult(
+    val success: Boolean,
+    val latencyMs: Long,
+    val detail: String,
+)

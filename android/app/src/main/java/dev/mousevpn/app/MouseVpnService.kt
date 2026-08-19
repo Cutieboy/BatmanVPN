@@ -11,6 +11,7 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -55,12 +56,17 @@ class MouseVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         diagnostics = DiagnosticStore(this)
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        // Seed the physical route synchronously. NetworkCallback delivers its
+        // initial onAvailable asynchronously; starting the handshake first made
+        // that initial callback look like roaming and needlessly replaced a
+        // healthy UDP socket a few milliseconds after connection setup.
+        connectivity.activeNetwork?.let(::updateUnderlyingNetwork)
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
-        getSystemService(ConnectivityManager::class.java)
-            .registerNetworkCallback(request, networkCallback)
+        connectivity.registerNetworkCallback(request, networkCallback)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -252,20 +258,20 @@ class MouseVpnService : VpnService() {
     private fun applyAppPolicy(builder: Builder): Pair<AppRoutingMode, Int> {
         val policy = ExcludedApps(this).policy()
         var applied = 0
-        policy.packages.forEach { packageName ->
+        policy.packages.filterNot { it == packageName }.forEach { selectedPackage ->
             runCatching {
                 if (policy.mode == AppRoutingMode.EXCLUDE) {
-                    builder.addDisallowedApplication(packageName)
+                    builder.addDisallowedApplication(selectedPackage)
                 } else {
-                    builder.addAllowedApplication(packageName)
+                    builder.addAllowedApplication(selectedPackage)
                 }
             }
                 .onSuccess { applied++ }
         }
-        // Calling addAllowedApplication activates Android's allowlist. With an
-        // empty or temporarily unavailable selection, adding our protected own
-        // process produces the intended "no apps through VPN" behavior.
-        if (policy.mode == AppRoutingMode.INCLUDE && applied == 0) {
+        // Keep the app itself on the TUN in allowlist mode so its explicit
+        // connectivity test measures the VPN path. The transport UDP socket is
+        // still the only socket protected from the VPN by VpnService.protect().
+        if (policy.mode == AppRoutingMode.INCLUDE) {
             builder.addAllowedApplication(packageName)
         }
         return policy.mode to applied
@@ -275,6 +281,9 @@ class MouseVpnService : VpnService() {
         var reconnectingShown = false
         while (!Thread.currentThread().isInterrupted && handle == currentHandle) {
             val nativeStatus = NativeBridge.status(currentHandle)
+            if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                Log.d("MouseVPNMetrics", NativeBridge.metrics(currentHandle))
+            }
             if (nativeStatus == "parameters-changed") {
                 finishDiagnostics("parameters_changed", null, currentHandle)
                 NativeBridge.stop(currentHandle)
@@ -410,14 +419,17 @@ class MouseVpnService : VpnService() {
             ?.key
         selectedUnderlyingState = selectedUnderlyingNetwork?.let(underlyingNetworks::get)
         underlyingNetwork = selectedUnderlyingState?.diagnosticLabel ?: "none"
-        val changed = selectedUnderlyingNetwork != previousNetwork ||
-            selectedUnderlyingState != previousState
-        if (changed) {
+        val networkChanged = selectedUnderlyingNetwork != previousNetwork
+        val stateChanged = selectedUnderlyingState != previousState
+        if (networkChanged || stateChanged) {
             runCatching {
                 setUnderlyingNetworks(selectedUnderlyingNetwork?.let { arrayOf(it) })
             }
         }
-        return changed
+        // Capability updates (most often VALIDATED toggling) do not invalidate
+        // a socket already bound to this Network. Only an identity change means
+        // Wi-Fi/cellular roaming and requires native socket migration.
+        return networkChanged
     }
 
     private fun networkPriority(network: UnderlyingNetworkState): Int =

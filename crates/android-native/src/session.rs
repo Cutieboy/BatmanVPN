@@ -58,6 +58,11 @@ pub(crate) struct SessionMetrics {
     pub(crate) session_timeouts: AtomicU64,
     pub(crate) peer_unreachable: AtomicU64,
     pub(crate) reconnect_failures: AtomicU64,
+    pub(crate) migration_receive_failures: AtomicU64,
+    pub(crate) migration_wire_failures: AtomicU64,
+    pub(crate) migration_datagram_failures: AtomicU64,
+    pub(crate) migration_inner_failures: AtomicU64,
+    pub(crate) migration_successes: AtomicU64,
     pub(crate) invalid_datagrams: AtomicU64,
     pub(crate) keepalives_sent: AtomicU64,
     pub(crate) keepalive_responses: AtomicU64,
@@ -482,22 +487,39 @@ impl IncomingLoop<'_> {
                 continue;
             }
             let Ok(length) = transport.receive(&mut response) else {
+                self.context
+                    .metrics
+                    .migration_receive_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let Ok(true) = self
-                .context
-                .wire
-                .decode(&response[..length], &mut wire_payload)
-            else {
+            if !matches!(
+                self.context
+                    .wire
+                    .decode(&response[..length], &mut wire_payload),
+                Ok(true)
+            ) {
+                self.context
+                    .metrics
+                    .migration_wire_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
-            };
+            }
             let Ok(datagram) = Datagram::decode(&wire_payload) else {
+                self.context
+                    .metrics
+                    .migration_datagram_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             if !matches!(
                 self.receiver.decode_into(datagram, &mut plaintext),
                 Ok(Decoded::Keepalive)
             ) {
+                self.context
+                    .metrics
+                    .migration_inner_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if transport.set_read_timeout(Some(POLL)).is_err() {
@@ -518,6 +540,10 @@ impl IncomingLoop<'_> {
             self.keepalive_sent_at = None;
             self.reconnect_needed = false;
             self.reconnect_backoff = MIN_RECONNECT_RETRY;
+            self.context
+                .metrics
+                .migration_successes
+                .fetch_add(1, Ordering::Relaxed);
             return true;
         }
         false

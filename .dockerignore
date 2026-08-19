@@ -1,4 +1,5 @@
 target
 .git
+.codegraph
 linux-gui/dist/*
 !linux-gui/dist/.gitignore

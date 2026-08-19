@@ -227,10 +227,32 @@
         </LinearLayout>
 
         <Button
-            android:id="@+id/excludedApps"
+            android:id="@+id/networkTest"
             android:layout_width="match_parent"
             android:layout_height="56dp"
             android:layout_marginTop="18dp"
+            android:background="@drawable/bg_primary_button"
+            android:text="@string/network_test_start"
+            android:textAllCaps="false"
+            android:textColor="@color/on_accent"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/networkTestResult"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/network_test_idle"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/excludedApps"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:layout_marginTop="12dp"
             android:background="@drawable/bg_text_button"
             android:text="@string/exclusions_open"
             android:textAllCaps="false"

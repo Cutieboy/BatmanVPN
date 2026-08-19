@@ -21,8 +21,7 @@ const ROUTE_LABEL: &[u8] = b"MouseVPN MouseMorph v2 route";
 pub const MAX_DATAGRAM_LEN: usize = 1_472;
 pub const SAFE_TUN_MTU: u16 = 1_280;
 
-const BALANCED_BUCKETS: &[usize] = &[192, 320, 512, 768, 1_024, 1_280, 1_408, 1_472];
-const PARANOID_BUCKETS: &[usize] = &[256, 384, 576, 832, 1_088, 1_280, 1_408, 1_472];
+const MAX_RANDOM_PADDING: usize = 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -86,21 +85,15 @@ impl Profile {
         }
     }
 
-    fn target_len(self, minimum: usize) -> Result<usize, MorphError> {
+    fn target_len(minimum: usize) -> Result<usize, MorphError> {
         if minimum > MAX_DATAGRAM_LEN {
             return Err(MorphError::FrameTooLarge {
                 actual: minimum,
                 maximum: MAX_DATAGRAM_LEN,
             });
         }
-        match self {
-            Self::Quiet => {
-                let extra = random_inclusive(0, 31)?;
-                Ok(minimum.saturating_add(extra).min(MAX_DATAGRAM_LEN))
-            }
-            Self::Balanced => bucket_target(BALANCED_BUCKETS, minimum, 1),
-            Self::Paranoid => bucket_target(PARANOID_BUCKETS, minimum, 2),
-        }
+        let extra = random_inclusive(0, MAX_RANDOM_PADDING)?;
+        Ok(minimum.saturating_add(extra).min(MAX_DATAGRAM_LEN))
     }
 }
 
@@ -246,7 +239,7 @@ fn encode_frame(
         maximum: u16::MAX as usize,
     })?;
     let minimum = MIN_FRAME_LEN + inner.len();
-    let target = profile.target_len(minimum)?;
+    let target = Profile::target_len(minimum)?;
     let padding_len = target - minimum;
     let epoch = current_epoch(profile)?;
     let route = routing_tag_at(key, profile, direction, epoch);
@@ -406,19 +399,6 @@ fn associated_data(route: [u8; ROUTING_TAG_LEN], direction: Direction) -> [u8; 9
     aad[..ROUTING_TAG_LEN].copy_from_slice(&route);
     aad[ROUTING_TAG_LEN] = direction as u8;
     aad
-}
-
-fn bucket_target(
-    buckets: &[usize],
-    minimum: usize,
-    alternatives: usize,
-) -> Result<usize, MorphError> {
-    let Some(first) = buckets.iter().position(|&bucket| bucket >= minimum) else {
-        return Ok(MAX_DATAGRAM_LEN);
-    };
-    let last = (first + alternatives).min(buckets.len() - 1);
-    let selected = random_inclusive(first, last)?;
-    Ok(buckets[selected])
 }
 
 fn random_inclusive(minimum: usize, maximum: usize) -> Result<usize, MorphError> {

@@ -52,8 +52,8 @@ The three MouseMorph modes change traffic shape, not cryptographic strength.
 | Mode | Data padding | Cover frames before handshake | Handshake jitter |
 | --- | --- | ---: | ---: |
 | `morph_quiet` | 0–31 random bytes | 0 | none |
-| `morph_balanced` | randomized size buckets | 1–2 | 1–4 ms |
-| `morph_paranoid` | wider randomized size buckets | 3–5 | 2–12 ms |
+| `morph_balanced` | 0–31 random bytes | 1–2 | 1–4 ms |
+| `morph_paranoid` | 0–31 random bytes | 3–5 | 2–12 ms |
 
 Cover traffic is deliberately limited to connection establishment in v2.0. It
 must not create a large permanent bandwidth tax or become a more reliable
@@ -106,9 +106,10 @@ route tables.
 
 The server precomputes tags for registered client public keys and performs an
 O(1) lookup before attempting AEAD decryption. Unknown tags receive no response.
-The registry-derived table is rebuilt at least once per second because it also
-contains paranoid routes; newly provisioned devices therefore become
-Morph-routable after at most the next one-second refresh under normal operation.
+The registry-derived table is checked against the current epoch for every
+unresolved datagram. Newly provisioned devices become Morph-routable when the
+table is next rebuilt; the current server refresh cadence remains at least once
+per second.
 
 Tag collisions must fail closed. A tag that maps to more than one client is
 removed from the routing table for that epoch.
@@ -157,10 +158,20 @@ MouseMorph never emits a UDP payload larger than 1472 bytes, which fits a
 1500-byte IPv4 path without fragmentation. The fixed MouseMorph overhead is 42
 bytes: routing tag, nonce, six encrypted control bytes and the AEAD tag.
 
-`quiet` adds a uniformly selected 0–31 bytes when space permits. `balanced` and
-`paranoid` select one of the next fitting profile buckets, rather than padding
-every packet to one constant size. Bucket selection and padding contents use the
-operating system CSPRNG.
+All three profiles add a uniformly selected 0–31 bytes when space permits.
+Padding length and contents use the operating system CSPRNG. Keeping the data
+size policy common prevents the selected mode from becoming a size-based
+classifier of its own. Balanced and paranoid instead spend their additional
+budget on faster routing-tag rotation and authenticated cover frames during
+connection establishment.
+
+Early v2 builds returned one of eight selected bucket boundaries. That produced
+a conspicuous set of exact UDP payload lengths and proved unreliable on at least
+one real cellular path while `quiet` remained healthy. A first attempt at
+continuous but wide in-envelope randomization was still unreliable on that
+path. The common bounded padding policy removes the mode-specific size shape
+without changing the encrypted frame format: old clients accept the new
+lengths, and updated clients continue to accept frames emitted by old servers.
 
 The first implementation caps a Morph session's negotiated tunnel MTU at 1280.
 This leaves room for the existing 37-byte MouseVPN data-plane overhead and for
@@ -203,6 +214,12 @@ Unauthenticated packets therefore cannot redirect a live session. If migration
 does not receive a response, the client performs a complete handshake on the
 new physical network with exponential retry backoff.
 
+The Android service seeds the current non-VPN `Network` synchronously before
+starting a handshake. The callback's initial asynchronous `onAvailable` event
+must not be mistaken for roaming. Later capability changes such as `VALIDATED`
+toggling on the same `Network` update diagnostics and Android's underlying
+network hint, but only a different `Network` identity replaces the UDP socket.
+
 All three GUIs persist the selected value in each stored profile. Profiles that
 predate MouseMorph deserialize without the field and remain `legacy`; changing
 the mode is disabled while that profile is connecting or connected.
@@ -227,6 +244,11 @@ the wire bytes immediately before send and immediately after receive.
 - Size and timing distributions are designed, not measured against real-world
   background traffic yet.
 - The server IP address and existence of sustained encrypted UDP remain visible.
+- A cellular field test rejected MouseMorph on one established server IP while
+  legacy traffic to the same IP and MouseMorph to a second IP both succeeded.
+  This is consistent with endpoint-specific classification or reputation:
+  padding changes raise the cost of a static signature, but address rotation
+  and client failover remain necessary operational controls.
 - Clock skew beyond one epoch prevents Morph routing.
 - There is no fragmentation/reassembly layer in v2.0.
 - Cover frames protect handshake shape only; adaptive cover traffic is deferred.
