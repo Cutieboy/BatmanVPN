@@ -128,6 +128,7 @@ button { border: 0; }
   text-align: left;
 }
 .app-exclusions-button:hover { background: #142338; }
+.app-exclusions-button:disabled { cursor: not-allowed; opacity: .42; }
 .app-exclusions-button > span:first-child { color: #42d9d0; font-size: 22px; }
 .button-copy { min-width: 0; }
 .button-copy strong, .button-copy small { display: block; }
@@ -213,6 +214,25 @@ button { border: 0; }
 .hidden { display: none !important; }
 .modal-card { width: min(580px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; padding: 26px; border: 1px solid #2a4058; border-radius: 22px; background: #111c2d; box-shadow: 0 30px 90px rgba(0,0,0,.48); }
 .small-modal { width: min(440px, 100%); }
+.reliability-modal { width: min(900px, 100%); }
+.reliability-recommendation { margin: 0 0 14px; padding: 13px 15px; border: 1px solid #30445b; border-radius: 14px; background: #0c1726; color: #8fa3b8; font-size: 12px; line-height: 1.45; }
+.reliability-recommendation.ready { border-color: #24635e; background: #112d32; color: #dffbf8; }
+.reliability-recommendation strong, .reliability-recommendation span { display: block; }
+.reliability-recommendation span { margin-top: 3px; color: #82aaa9; font-size: 10px; }
+.reliability-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+.reliability-mode { padding: 14px; border: 1px solid #2a4058; border-radius: 15px; background: #0c1726; }
+.reliability-mode.best { border-color: #42d9d0; box-shadow: 0 0 0 2px rgba(66,217,208,.07); }
+.reliability-mode.insufficient { opacity: .72; }
+.reliability-mode header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.reliability-mode header > div { display: flex; align-items: center; gap: 7px; }
+.current-mode { padding: 2px 6px; border-radius: 999px; background: #173c43; color: #65e2d9; font-size: 8px; font-weight: 800; text-transform: uppercase; }
+.reliability-score { color: #65e2d9; font-size: 17px; font-weight: 800; }
+.reliability-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-top: 12px; }
+.reliability-metrics span { color: #71869b; font-size: 9px; }
+.reliability-metrics strong { display: block; margin-top: 3px; color: #e7eff7; font-size: 11px; }
+.reliability-mode footer { margin-top: 11px; padding-top: 9px; border-top: 1px solid #22344a; color: #71869b; font-size: 9px; }
+.reliability-note { margin: 14px 2px 12px; color: #71869b; font-size: 10px; line-height: 1.45; }
+.reliability-clear { width: 100%; }
 .modal-header { display: flex; justify-content: space-between; gap: 20px; }
 .modal-header h2 { margin: 6px 0 0; font-size: 22px; }
 .close-button { width: 38px; height: 38px; border-radius: 11px; background: #19283b; color: #8fa3b8; cursor: pointer; font-size: 24px; }

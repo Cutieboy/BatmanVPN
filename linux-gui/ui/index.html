@@ -33,6 +33,13 @@
             <small id="appExclusionsCount">Все приложения через VPN</small>
           </span>
         </button>
+        <button id="reliabilityDiagnostics" class="app-exclusions-button hidden" type="button">
+          <span>⌁</span>
+          <span class="button-copy">
+            <strong>Стабильность режимов</strong>
+            <small>Потери, RTT и переподключения</small>
+          </span>
+        </button>
         <label id="autostartSetting" class="autostart-setting hidden">
           <input id="autostartEnabled" type="checkbox" />
           <span class="autostart-switch" aria-hidden="true"></span>
@@ -154,6 +161,23 @@
           <button id="cancelDelete" class="secondary-button" type="button">Отмена</button>
           <button id="confirmDelete" class="danger-button" type="button">Удалить</button>
         </div>
+      </div>
+    </div>
+
+    <div id="reliabilityModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="reliabilityModalTitle">
+      <div class="modal-card reliability-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">ПАССИВНЫЙ МОНИТОР</span>
+            <h2 id="reliabilityModalTitle">Стабильность режимов</h2>
+          </div>
+          <button id="closeReliability" type="button" class="close-button" aria-label="Закрыть">×</button>
+        </div>
+        <p class="modal-description">Статистика выбранного профиля. Монитор использует штатные keepalive и не создаёт дополнительный сетевой трафик.</p>
+        <div id="reliabilityRecommendation" class="reliability-recommendation">Собираем данные…</div>
+        <div id="reliabilityModes" class="reliability-grid"></div>
+        <p class="reliability-note">«Потери» — подтверждённые пропуски ответов keepalive, а не оценка каждого пользовательского пакета. Для рекомендации нужны минимум 5 минут и 20 keepalive в двух режимах.</p>
+        <button id="clearReliability" class="secondary-button reliability-clear" type="button">Сбросить статистику этого профиля</button>
       </div>
     </div>
 

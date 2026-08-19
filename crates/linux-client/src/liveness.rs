@@ -80,13 +80,14 @@ impl Liveness {
     /// Reports that the peer is unreachable, which makes the first attempt due
     /// immediately. Repeated reports before the peer answers again are ignored,
     /// so a stream of ICMP errors cannot bypass the backoff.
-    pub(crate) fn connection_lost(&mut self, now: Instant) {
+    pub(crate) fn connection_lost(&mut self, now: Instant) -> bool {
         if self.lost {
-            return;
+            return false;
         }
         self.peer_activity = now.checked_sub(SESSION_TIMEOUT).unwrap_or(now);
         self.retry = None;
         self.lost = true;
+        true
     }
 
     pub(crate) fn reconnected(&mut self, now: Instant) {
@@ -123,7 +124,7 @@ mod tests {
     fn reconnects_immediately_after_explicit_connection_loss() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start + Duration::from_secs(1));
+        assert!(state.connection_lost(start + Duration::from_secs(1)));
         assert_eq!(
             state.action(start + Duration::from_secs(1)),
             Action::Reconnect
@@ -134,7 +135,7 @@ mod tests {
     fn retries_quickly_at_first_then_backs_off() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         state.reconnect_attempted(start);
 
         // First retry is seconds away, not the old flat ten.
@@ -162,12 +163,12 @@ mod tests {
     fn a_successful_reconnect_resets_the_backoff() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         for step in 0..5 {
             state.reconnect_attempted(start + Duration::from_secs(step * 60));
         }
         state.reconnected(start + Duration::from_secs(600));
-        state.connection_lost(start + Duration::from_secs(601));
+        assert!(state.connection_lost(start + Duration::from_secs(601)));
         state.reconnect_attempted(start + Duration::from_secs(601));
         assert_eq!(
             state.action(start + Duration::from_secs(603)),
@@ -179,10 +180,10 @@ mod tests {
     fn repeated_loss_notifications_do_not_bypass_backoff() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         state.reconnect_attempted(start);
         // A second burst of ICMP errors must not make the retry due again.
-        state.connection_lost(start + Duration::from_millis(500));
+        assert!(!state.connection_lost(start + Duration::from_millis(500)));
         assert_eq!(state.action(start + Duration::from_secs(1)), Action::None);
         assert_eq!(
             state.action(start + Duration::from_secs(2)),
@@ -194,11 +195,11 @@ mod tests {
     fn a_packet_from_the_peer_rearms_loss_reporting() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         state.reconnect_attempted(start);
         state.packet_received(start + Duration::from_secs(1));
         // The peer went away again: the next loss is due at once, not in 2 s.
-        state.connection_lost(start + Duration::from_secs(2));
+        assert!(state.connection_lost(start + Duration::from_secs(2)));
         assert_eq!(
             state.action(start + Duration::from_secs(2)),
             Action::Reconnect
@@ -209,12 +210,12 @@ mod tests {
     fn a_packet_from_the_peer_resets_the_retry_backoff() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         for step in 0..5 {
             state.reconnect_attempted(start + Duration::from_secs(step * 60));
         }
         state.packet_received(start + Duration::from_secs(600));
-        state.connection_lost(start + Duration::from_secs(601));
+        assert!(state.connection_lost(start + Duration::from_secs(601)));
         state.reconnect_attempted(start + Duration::from_secs(601));
         assert_eq!(
             state.action(start + Duration::from_secs(603)),
@@ -226,7 +227,7 @@ mod tests {
     fn missing_physical_route_is_polled_quickly() {
         let start = Instant::now();
         let mut state = Liveness::new(start);
-        state.connection_lost(start);
+        assert!(state.connection_lost(start));
         state.network_unavailable(start);
         assert_eq!(
             state.action(start + Duration::from_millis(999)),

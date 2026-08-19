@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "mousevpn-linux-gui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs",
  "fs2",
@@ -2405,6 +2405,7 @@ dependencies = [
  "mousevpn-linux-client",
  "mousevpn-profile-cli",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "toml 1.1.4+spec-1.1.0",

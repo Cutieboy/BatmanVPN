@@ -17,6 +17,7 @@ use mousevpn_client_wire::ClientWire;
 
 use crate::{
     error::{is_peer_unavailable, is_retryable_network},
+    metrics::RuntimeMetrics,
     ClientError,
 };
 
@@ -41,6 +42,7 @@ pub(crate) fn run(
     stopping: &Arc<AtomicBool>,
     reconnect: &ReconnectControl,
     wire: &ClientWire,
+    metrics: &RuntimeMetrics,
 ) -> Result<(), ClientError> {
     let mut packets: Vec<Vec<u8>> = (0..BATCH_SIZE)
         .map(|_| vec![0_u8; PACKET_BUFFER_LEN])
@@ -99,7 +101,7 @@ pub(crate) fn run(
                 if let Err(error) =
                     sender.encode_ip_into(&packets[index][..length], &mut datagrams[encoded])
                 {
-                    drops.record(&error);
+                    drops.record(&error, metrics, 1);
                     continue;
                 }
                 encoded += 1;
@@ -112,20 +114,28 @@ pub(crate) fn run(
             wire.encode(&datagrams[index], &mut wire_datagrams[index])?;
         }
         match transport.send_batch_with(&wire_datagrams[..encoded], &mut udp_batch) {
-            Ok(sent) if sent == encoded => {}
-            Ok(sent) => drops.record(&format_args!(
-                "UDP send queue accepted {sent} of {encoded} batched packets"
-            )),
+            Ok(sent) if sent == encoded => metrics.record_outgoing_packets(sent),
+            Ok(sent) => {
+                metrics.record_outgoing_packets(sent);
+                drops.record(
+                    &format_args!("UDP send queue accepted {sent} of {encoded} batched packets"),
+                    metrics,
+                    encoded - sent,
+                );
+            }
             // The receive loop owns liveness, but both directions share one
             // kernel socket, so the peer's ICMP error is delivered to whichever
             // syscall runs first. Under load that is almost always this send,
             // and swallowing it here left the receive loop waiting out the full
             // session timeout instead of reconnecting.
             Err(error) if is_peer_unavailable(&error) => {
+                drops.record(&error, metrics, encoded);
                 let generation = reconnect.generation.load(Ordering::Relaxed);
                 reconnect.requested.store(generation, Ordering::Relaxed);
             }
-            Err(error) if is_retryable_network(&error) => {}
+            Err(error) if is_retryable_network(&error) => {
+                drops.record(&error, metrics, encoded);
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -139,8 +149,9 @@ struct Drops {
 }
 
 impl Drops {
-    fn record(&mut self, error: &impl std::fmt::Display) {
-        self.count += 1;
+    fn record(&mut self, error: &impl std::fmt::Display, metrics: &RuntimeMetrics, count: usize) {
+        self.count += count as u64;
+        metrics.record_outgoing_drops(count);
         let now = Instant::now();
         if self
             .last_report

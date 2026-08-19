@@ -28,11 +28,17 @@ Desktop client built with Tauri 2 and the existing MouseVPN Rust runtime.
 - shows reconnect progress in the GUI and keeps a rotated helper log under
   `$XDG_DATA_HOME/MouseVPN/logs` (normally
   `~/.local/share/MouseVPN/logs`);
+- passively records per-profile reliability for every protocol mode: missed
+  keepalive replies, RTT, reconnects, recovery failures, migrations, packet
+  counts and send drops. It reuses the normal ten-second keepalive, adds no
+  probe traffic, and recommends a mode only after at least five minutes and 20
+  keepalives have been observed in two modes. History is stored locally under
+  `$XDG_DATA_HOME/MouseVPN/diagnostics`;
 - keeps running in the system tray when the main window is closed, with tray
   actions to reopen, disconnect or quit;
 - publishes the tray through the freedesktop/KDE StatusNotifier D-Bus protocol,
   so it does not require `libappindicator` at runtime;
-- keeps the Tauri webview and profile management unprivileged.
+- keeps the Tauri webview and profile management unprivileged;
 - ships a small standalone privileged helper in the AppImage and copies it to
   the user's private cache before PolicyKit starts it; root never needs to
   execute a binary through the user's FUSE mount.

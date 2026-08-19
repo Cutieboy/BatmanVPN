@@ -3,6 +3,7 @@
 mod error;
 mod handshake;
 mod liveness;
+mod metrics;
 mod outgoing;
 mod packet_loop;
 mod probe;

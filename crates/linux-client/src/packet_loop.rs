@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     net::SocketAddr,
     sync::{
@@ -20,6 +21,7 @@ use crate::{
     error::is_peer_unavailable,
     handshake::connect,
     liveness::{Action, Liveness},
+    metrics::RuntimeMetrics,
     ClientError,
 };
 
@@ -29,6 +31,8 @@ const MIGRATION_ATTEMPTS: usize = 3;
 const MIGRATION_POLL: Duration = Duration::from_millis(500);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const METRICS_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 enum ReceiveEvent {
     Packets,
@@ -55,6 +59,7 @@ pub(crate) struct PacketLoop<'a> {
     pub(crate) worker: Receiver<Result<(), ClientError>>,
     pub(crate) outgoing_transport: Sender<UdpTransport>,
     pub(crate) wire: ClientWire,
+    pub(crate) metrics: Arc<RuntimeMetrics>,
     pub(crate) routes: Option<&'a mut RouteGuard>,
     pub(crate) dns: Option<&'a mut DnsGuard>,
 }
@@ -71,7 +76,10 @@ impl PacketLoop<'_> {
         let mut keepalive = Vec::with_capacity(128);
         let mut wire_keepalive = Vec::with_capacity(256);
         let mut liveness = Liveness::new(Instant::now());
+        let started = Instant::now();
         let mut next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
+        let mut next_metrics = Instant::now() + METRICS_INTERVAL;
+        let mut pending_keepalives = VecDeque::new();
         let mut udp_batch = UdpBatch::default();
 
         while !self.stopping.load(Ordering::Relaxed) {
@@ -87,6 +95,7 @@ impl PacketLoop<'_> {
                             match self.receiver.decode_into(parsed, &mut plaintext) {
                                 Ok(Decoded::Ip(packet)) => {
                                     liveness.packet_received(Instant::now());
+                                    self.metrics.record_incoming_packet();
                                     // A failed TUN write costs one packet; the
                                     // tunnel itself stays up.
                                     if let Err(error) = self.tun.send(packet) {
@@ -95,22 +104,44 @@ impl PacketLoop<'_> {
                                         }
                                     }
                                 }
-                                Ok(Decoded::Keepalive) => liveness.packet_received(Instant::now()),
+                                Ok(Decoded::Keepalive) => {
+                                    let now = Instant::now();
+                                    liveness.packet_received(now);
+                                    // Keepalive payloads do not carry request
+                                    // IDs. Match a reply to the newest probe:
+                                    // on ordinary links its RTT is far below
+                                    // the ten-second send interval, while an
+                                    // older unanswered probe must remain in the
+                                    // queue so it can be counted as lost.
+                                    if let Some(sent) = pending_keepalives.pop_back() {
+                                        self.metrics.record_keepalive_response(
+                                            now.saturating_duration_since(sent),
+                                        );
+                                    }
+                                }
                                 Err(_) => {}
                             }
                         }
                     }
                 }
                 ReceiveEvent::Idle => {}
-                ReceiveEvent::PeerUnavailable => liveness.connection_lost(Instant::now()),
+                ReceiveEvent::PeerUnavailable => {
+                    if liveness.connection_lost(Instant::now()) {
+                        self.metrics.record_peer_unreachable();
+                    }
+                }
             }
             if self.stopping.load(Ordering::Relaxed) {
-                return Ok(());
+                break;
             }
-            if take_reconnect_request(&self.reconnect_requested, &self.session_generation) {
-                liveness.connection_lost(Instant::now());
+            if take_reconnect_request(&self.reconnect_requested, &self.session_generation)
+                && liveness.connection_lost(Instant::now())
+            {
+                self.metrics.record_peer_unreachable();
             }
-            if Instant::now() >= next_route_refresh {
+            let now = Instant::now();
+            expire_keepalives(&self.metrics, &mut pending_keepalives, now);
+            if now >= next_route_refresh {
                 if let Some(routes) = self.routes.as_deref_mut() {
                     if let Err(error) = routes.refresh_server_route() {
                         eprintln!("MOUSEVPN_POLICY_WARNING=refreshing server route: {error}");
@@ -118,8 +149,18 @@ impl PacketLoop<'_> {
                 }
                 next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
             }
-            self.maintain_liveness(&mut liveness, &mut keepalive, &mut wire_keepalive)?;
+            self.maintain_liveness(
+                &mut liveness,
+                &mut keepalive,
+                &mut wire_keepalive,
+                &mut pending_keepalives,
+            )?;
+            if now >= next_metrics {
+                self.metrics.emit(started.elapsed());
+                next_metrics = now + METRICS_INTERVAL;
+            }
         }
+        self.metrics.emit(started.elapsed());
         Ok(())
     }
 
@@ -152,22 +193,29 @@ impl PacketLoop<'_> {
         liveness: &mut Liveness,
         keepalive: &mut Vec<u8>,
         wire_keepalive: &mut Vec<u8>,
+        pending_keepalives: &mut VecDeque<Instant>,
     ) -> Result<(), ClientError> {
         let now = Instant::now();
         match liveness.action(now) {
             Action::None => Ok(()),
             Action::Keepalive => {
                 match self.send_keepalive(keepalive, wire_keepalive) {
-                    Ok(()) => liveness.keepalive_sent(now),
+                    Ok(()) => {
+                        liveness.keepalive_sent(now);
+                        pending_keepalives.push_back(now);
+                        self.metrics.record_keepalive_sent();
+                    }
                     Err(ClientError::Io(error)) if is_peer_unavailable(&error) => {
-                        liveness.connection_lost(now);
+                        if liveness.connection_lost(now) {
+                            self.metrics.record_peer_unreachable();
+                        }
                     }
                     Err(error) => return Err(error),
                 }
                 Ok(())
             }
             Action::Reconnect => {
-                self.reconnect(liveness, now);
+                self.reconnect(liveness, pending_keepalives, now);
                 Ok(())
             }
         }
@@ -187,13 +235,23 @@ impl PacketLoop<'_> {
         Ok(())
     }
 
-    fn reconnect(&mut self, liveness: &mut Liveness, now: Instant) {
+    fn reconnect(
+        &mut self,
+        liveness: &mut Liveness,
+        pending_keepalives: &mut VecDeque<Instant>,
+        now: Instant,
+    ) {
+        self.metrics.record_reconnect();
+        self.metrics
+            .record_keepalive_timeouts(pending_keepalives.len());
+        pending_keepalives.clear();
         self.reconnecting.store(true, Ordering::Relaxed);
         eprintln!("MOUSEVPN_STATE=reconnecting");
         eprintln!("MouseVPN session timed out; reconnecting");
         if let Some(routes) = self.routes.as_deref_mut() {
             if let Err(error) = routes.refresh_server_route() {
                 liveness.network_unavailable(now);
+                self.metrics.record_reconnect_failure();
                 self.reconnecting.store(false, Ordering::Relaxed);
                 eprintln!("MOUSEVPN_RECONNECT_ERROR=refreshing server route: {error}");
                 return;
@@ -209,7 +267,10 @@ impl PacketLoop<'_> {
                 eprintln!("MOUSEVPN_STATE=reconnected");
                 eprintln!("MouseVPN reconnected");
             }
-            Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),
+            Err(error) => {
+                self.metrics.record_reconnect_failure();
+                eprintln!("MOUSEVPN_RECONNECT_ERROR={error}");
+            }
         }
         self.reconnecting.store(false, Ordering::Relaxed);
     }
@@ -283,6 +344,7 @@ impl PacketLoop<'_> {
                     self.transport = replacement;
                     self.session_generation.fetch_add(1, Ordering::Relaxed);
                     self.reconnect_requested.store(0, Ordering::Relaxed);
+                    self.metrics.record_migration();
                     eprintln!("MOUSEVPN_STATE=migrated");
                     return Ok(());
                 }
@@ -328,6 +390,18 @@ impl PacketLoop<'_> {
     }
 }
 
+fn expire_keepalives(metrics: &RuntimeMetrics, pending: &mut VecDeque<Instant>, now: Instant) {
+    let mut expired = 0;
+    while pending
+        .front()
+        .is_some_and(|sent| now.saturating_duration_since(*sent) >= KEEPALIVE_RESPONSE_TIMEOUT)
+    {
+        pending.pop_front();
+        expired += 1;
+    }
+    metrics.record_keepalive_timeouts(expired);
+}
+
 fn check_worker(
     receiver: &Receiver<Result<(), ClientError>>,
     stopping: &AtomicBool,
@@ -360,13 +434,17 @@ fn is_recoverable(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
     };
 
-    use super::{check_worker, take_reconnect_request};
-    use crate::ClientError;
+    use super::{check_worker, expire_keepalives, take_reconnect_request};
+    use crate::{metrics::RuntimeMetrics, ClientError};
 
     #[test]
     fn a_clean_worker_exit_is_normal_during_shutdown() {
@@ -399,5 +477,20 @@ mod tests {
             &AtomicU64::new(4),
             &AtomicU64::new(4)
         ));
+    }
+
+    #[test]
+    fn expires_only_keepalives_past_the_response_budget() {
+        let now = Instant::now();
+        let mut pending = VecDeque::from([
+            now.checked_sub(Duration::from_secs(21)).unwrap(),
+            now.checked_sub(Duration::from_secs(19)).unwrap(),
+        ]);
+        let metrics = RuntimeMetrics::default();
+
+        expire_keepalives(&metrics, &mut pending, now);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(metrics.keepalive_timeouts(), 1);
     }
 }

@@ -19,6 +19,7 @@ use zeroize::Zeroize;
 
 mod helper_log;
 mod helper_runtime;
+mod reliability;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,10 +84,20 @@ impl Default for ConnectionSnapshot {
     }
 }
 
-#[derive(Default)]
 struct AppState {
     child: Mutex<Option<Child>>,
     snapshot: Arc<Mutex<ConnectionSnapshot>>,
+    reliability: Arc<Mutex<reliability::ReliabilityMonitor>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            snapshot: Arc::new(Mutex::new(ConnectionSnapshot::default())),
+            reliability: Arc::new(Mutex::new(reliability::ReliabilityMonitor::load())),
+        }
+    }
 }
 
 #[tauri::command]
@@ -183,10 +194,11 @@ fn delete_profile(id: String, state: State<'_, AppState>) -> Result<(), String> 
     }
     let path = profile_path(&id)?;
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(display_error(error)),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(display_error(error)),
     }
+    lock(&state.reliability)?.clear_profile(&id)
 }
 
 #[tauri::command]
@@ -194,6 +206,7 @@ fn connect_profile(id: String, state: State<'_, AppState>) -> Result<ConnectionS
     let id = normalized_id(&id)?;
     let path = profile_path(&id)?;
     let config: ClientConfig = load_toml(&path).map_err(display_error)?;
+    let protocol = config.protocol;
     config.validate().map_err(display_error)?;
 
     let mut child_slot = lock(&state.child)?;
@@ -226,12 +239,16 @@ fn connect_profile(id: String, state: State<'_, AppState>) -> Result<ConnectionS
     let snapshot = ConnectionSnapshot {
         state: "connecting".to_owned(),
         message: "Ожидание разрешения PolicyKit…".to_owned(),
-        profile_id: Some(id),
+        profile_id: Some(id.clone()),
     };
     *lock(&state.snapshot)? = snapshot.clone();
     let shared_snapshot = Arc::clone(&state.snapshot);
+    let reliability = Arc::clone(&state.reliability);
+    lock(&reliability)?.begin(id.clone(), protocol);
     let log = helper_log::HelperLog::open().ok();
-    thread::spawn(move || read_helper_status(stderr, &shared_snapshot, log));
+    thread::spawn(move || {
+        read_helper_status(stderr, &shared_snapshot, &reliability, &id, protocol, log);
+    });
     *child_slot = Some(child);
     Ok(snapshot)
 }
@@ -305,9 +322,32 @@ fn connection_status(state: State<'_, AppState>) -> Result<ConnectionSnapshot, S
     Ok(lock(&state.snapshot)?.clone())
 }
 
+#[tauri::command]
+fn reliability_diagnostics(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<reliability::ReliabilitySummary, String> {
+    let profile_id = normalized_id(&profile_id)?;
+    Ok(lock(&state.reliability)?.summary(&profile_id))
+}
+
+#[tauri::command]
+fn clear_reliability_diagnostics(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<reliability::ReliabilitySummary, String> {
+    let profile_id = normalized_id(&profile_id)?;
+    let mut monitor = lock(&state.reliability)?;
+    monitor.clear_profile(&profile_id)?;
+    Ok(monitor.summary(&profile_id))
+}
+
 fn read_helper_status(
     stderr: impl std::io::Read,
     snapshot: &Arc<Mutex<ConnectionSnapshot>>,
+    reliability: &Arc<Mutex<reliability::ReliabilityMonitor>>,
+    profile_id: &str,
+    protocol: ClientProtocol,
     mut log: Option<helper_log::HelperLog>,
 ) {
     let log_path = log.as_ref().map(|log| log.path().display().to_string());
@@ -317,6 +357,25 @@ fn read_helper_status(
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         if let Some(log) = log.as_mut() {
             log.write(&line);
+        }
+        if let Some(payload) = line.strip_prefix("MOUSEVPN_METRICS=") {
+            match serde_json::from_str::<reliability::RuntimeMetrics>(payload) {
+                Ok(metrics) => {
+                    if let Ok(mut monitor) = reliability.lock() {
+                        if let Err(error) = monitor.observe(profile_id, protocol, metrics) {
+                            if let Some(log) = log.as_mut() {
+                                log.write(&format!("MOUSEVPN_DIAGNOSTICS_WARNING={error}"));
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(log) = log.as_mut() {
+                        log.write(&format!("MOUSEVPN_DIAGNOSTICS_WARNING={error}"));
+                    }
+                }
+            }
+            continue;
         }
         let Ok(mut current) = snapshot.lock() else {
             return;
@@ -536,6 +595,8 @@ fn run_gui() {
             connect_profile,
             disconnect,
             connection_status,
+            reliability_diagnostics,
+            clear_reliability_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MouseVPN GUI");

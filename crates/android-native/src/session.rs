@@ -35,8 +35,6 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Delay before the first retry, doubling up to [`MAX_RECONNECT_RETRY`].
 const MIN_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_RETRY: Duration = Duration::from_secs(16);
-const MIGRATION_ATTEMPTS: usize = 3;
-const MIGRATION_TIMEOUT: Duration = Duration::from_millis(500);
 const UDP_BATCH_SIZE: usize = 32;
 
 struct OutboundState {
@@ -417,11 +415,11 @@ impl IncomingLoop<'_> {
             .metrics
             .reconnects
             .fetch_add(1, Ordering::Relaxed);
-        if self.try_migrate() {
-            self.finish_reconnect(started);
-            return Ok(());
-        }
-
+        // A keepalive-only migration can be a false positive on mobile carriers: the
+        // small authenticated probe is echoed through the new NAT mapping while the
+        // existing data-plane session remains unable to carry IP packets. Establish a
+        // fresh Noise session for every Android reconnect so Wi-Fi/cellular roaming is
+        // confirmed by the same handshake that will protect subsequent user traffic.
         let result = reconnect(
             &self.context.protector,
             &self.context.config,
@@ -449,104 +447,6 @@ impl IncomingLoop<'_> {
         self.reconnect_backoff = (self.reconnect_backoff * 2).min(MAX_RECONNECT_RETRY);
         self.record_reconnect_duration(started);
         Ok(())
-    }
-
-    fn try_migrate(&mut self) -> bool {
-        let Ok(socket) = crate::handshake::bind_socket(self.context.config.server) else {
-            return false;
-        };
-        if self.context.protector.protect(&socket).is_err() {
-            return false;
-        }
-        let Ok(mut transport) = UdpTransport::from_socket(socket, self.context.config.server)
-        else {
-            return false;
-        };
-        if transport.set_read_timeout(Some(MIGRATION_TIMEOUT)).is_err() {
-            return false;
-        }
-
-        let capacity = usize::from(self.context.parameters.mtu) + 128;
-        let mut request = Vec::with_capacity(128);
-        let mut wire_request = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
-        let mut response = vec![0_u8; MAX_WIRE_DATAGRAM_LEN];
-        let mut wire_payload = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
-        let mut plaintext = Vec::with_capacity(capacity);
-        for _ in 0..MIGRATION_ATTEMPTS {
-            if self.context.stopping.load(Ordering::Relaxed) {
-                return false;
-            }
-            if encode_keepalive(&self.outbound, &mut request).is_err()
-                || self
-                    .context
-                    .wire
-                    .encode(&request, &mut wire_request)
-                    .is_err()
-                || transport.send(&wire_request).is_err()
-            {
-                continue;
-            }
-            let Ok(length) = transport.receive(&mut response) else {
-                self.context
-                    .metrics
-                    .migration_receive_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if !matches!(
-                self.context
-                    .wire
-                    .decode(&response[..length], &mut wire_payload),
-                Ok(true)
-            ) {
-                self.context
-                    .metrics
-                    .migration_wire_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let Ok(datagram) = Datagram::decode(&wire_payload) else {
-                self.context
-                    .metrics
-                    .migration_datagram_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if !matches!(
-                self.receiver.decode_into(datagram, &mut plaintext),
-                Ok(Decoded::Keepalive)
-            ) {
-                self.context
-                    .metrics
-                    .migration_inner_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            if transport.set_read_timeout(Some(POLL)).is_err() {
-                return false;
-            }
-            let Ok(outgoing_transport) = transport.try_clone() else {
-                return false;
-            };
-            let Ok(mut outbound) = self.outbound.lock() else {
-                return false;
-            };
-            outbound.transport = outgoing_transport;
-            drop(outbound);
-            self.transport = transport;
-            let now = Instant::now();
-            self.last_received = now;
-            self.last_sent = now;
-            self.keepalive_sent_at = None;
-            self.reconnect_needed = false;
-            self.reconnect_backoff = MIN_RECONNECT_RETRY;
-            self.context
-                .metrics
-                .migration_successes
-                .fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        false
     }
 
     fn finish_reconnect(&self, started: Instant) {

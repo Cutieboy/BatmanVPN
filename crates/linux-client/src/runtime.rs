@@ -21,6 +21,7 @@ use signal_hook::{
 
 use crate::{
     handshake::connect,
+    metrics::RuntimeMetrics,
     outgoing::{self, ReconnectControl},
     packet_loop::{PacketLoop, POLL_INTERVAL},
     proxy::ProxyServerGuard,
@@ -119,6 +120,7 @@ fn run_mode(
     let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicU64::new(0));
     let session_generation = Arc::new(AtomicU64::new(1));
+    let metrics = Arc::new(RuntimeMetrics::default());
     flag::register(SIGINT, Arc::clone(&stopping))?;
     flag::register(SIGTERM, Arc::clone(&stopping))?;
     let mut network = match mode {
@@ -148,6 +150,7 @@ fn run_mode(
     let outgoing_requested = Arc::clone(&reconnect_requested);
     let outgoing_generation = Arc::clone(&session_generation);
     let outgoing_wire = wire.clone();
+    let outgoing_metrics = Arc::clone(&metrics);
     let (worker_sender, worker_receiver) = mpsc::sync_channel(1);
     let (transport_sender, transport_receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -164,6 +167,7 @@ fn run_mode(
             &outgoing_stopping,
             &reconnect,
             &outgoing_wire,
+            &outgoing_metrics,
         );
         let _ = worker_sender.send(result);
     });
@@ -187,6 +191,7 @@ fn run_mode(
         worker: worker_receiver,
         outgoing_transport: transport_sender,
         wire,
+        metrics,
         routes,
         dns,
     }

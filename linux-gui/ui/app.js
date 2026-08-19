@@ -23,6 +23,12 @@ const elements = {
   protocolSelector: document.querySelector("#protocolSelector"),
   protocolMode: document.querySelector("#protocolMode"),
   protocolHint: document.querySelector("#protocolHint"),
+  reliabilityDiagnostics: document.querySelector("#reliabilityDiagnostics"),
+  reliabilityModal: document.querySelector("#reliabilityModal"),
+  reliabilityRecommendation: document.querySelector("#reliabilityRecommendation"),
+  reliabilityModes: document.querySelector("#reliabilityModes"),
+  closeReliability: document.querySelector("#closeReliability"),
+  clearReliability: document.querySelector("#clearReliability"),
   profileModal: document.querySelector("#profileModal"),
   profileForm: document.querySelector("#profileForm"),
   token: document.querySelector("#profileToken"),
@@ -75,6 +81,8 @@ if (isWindows) {
   invoke("split_tunneling_available")
     .then((available) => elements.appExclusions.classList.toggle("hidden", !available))
     .catch(() => elements.appExclusions.classList.add("hidden"));
+} else {
+  elements.reliabilityDiagnostics.classList.remove("hidden");
 }
 
 async function refreshAutostart() {
@@ -130,6 +138,7 @@ function renderActiveProfile() {
     ? `${active.name} · ${active.endpoint}`
     : (profile?.name ?? "—");
   elements.power.disabled = !profile || ["connecting", "disconnecting"].includes(connection.state);
+  elements.reliabilityDiagnostics.disabled = !profile;
 
   const showConnection = active && ["connecting", "connected", "disconnecting"].includes(connection.state);
   elements.connectedServer.classList.toggle("hidden", !showConnection);
@@ -144,13 +153,63 @@ function renderProtocol() {
   const descriptions = {
     legacy: "Обычный MouseVPN для старых клиентов",
     morph_quiet: "Меняющийся тег и лёгкое случайное дополнение",
-    morph_balanced: "Выравнивание размеров и 1–2 маскирующих пакета",
+    morph_balanced: "Пятисекундная ротация и 1–2 маскирующих пакета",
     morph_paranoid: "Секундная ротация и 3–5 маскирующих пакетов",
   };
   elements.protocolMode.value = protocol;
   elements.protocolMode.disabled = !profile
     || ["connecting", "connected", "disconnecting"].includes(connection.state);
   elements.protocolHint.textContent = descriptions[protocol] ?? descriptions.legacy;
+}
+
+function formatObservedTime(seconds) {
+  if (!seconds) return "нет данных";
+  if (seconds < 60) return `${seconds} сек`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours) return `${hours} ч ${minutes} мин`;
+  return `${Math.max(1, minutes)} мин`;
+}
+
+function renderReliability(summary) {
+  const best = summary.modes.find((mode) => mode.protocol === summary.bestProtocol);
+  if (best) {
+    elements.reliabilityRecommendation.className = "reliability-recommendation ready";
+    elements.reliabilityRecommendation.innerHTML = `<strong>Лучший по стабильности: ${escapeHtml(best.label)}</strong><span>Оценка ${best.stabilityScore.toFixed(1)} из 100 · сравниваются потери и восстановления</span>`;
+  } else {
+    elements.reliabilityRecommendation.className = "reliability-recommendation";
+    elements.reliabilityRecommendation.innerHTML = summary.eligibleModes === 1
+      ? "Один режим уже набрал достаточно данных. Используйте ещё один не менее 5 минут для честного сравнения."
+      : "Пока недостаточно данных для рекомендации. Статистика накапливается во время обычной работы VPN.";
+  }
+  const selectedProtocol = selectedProfile()?.protocol;
+  elements.reliabilityModes.innerHTML = summary.modes.map((mode) => `
+    <article class="reliability-mode ${mode.protocol === summary.bestProtocol ? "best" : ""} ${mode.enoughData ? "" : "insufficient"}">
+      <header>
+        <div><strong>${escapeHtml(mode.label)}</strong>${mode.protocol === selectedProtocol ? '<span class="current-mode">выбран</span>' : ""}</div>
+        <span class="reliability-score">${mode.enoughData ? mode.stabilityScore.toFixed(1) : "—"}</span>
+      </header>
+      <div class="reliability-metrics">
+        <span>Наблюдение<strong>${formatObservedTime(mode.observedSeconds)}</strong></span>
+        <span>Keepalive<strong>${mode.keepaliveResponses}/${mode.keepalivesSent}</strong></span>
+        <span>Потери<strong>${mode.lossPercent.toFixed(2)}% (${mode.keepaliveTimeouts})</strong></span>
+        <span>Средний / макс. RTT<strong>${mode.averageRttMs || "—"} / ${mode.maxRttMs || "—"} мс</strong></span>
+        <span>Переподключения<strong>${mode.reconnects} · ${mode.reconnectsPerHour.toFixed(2)}/ч</strong></span>
+        <span>Ошибки восстановления<strong>${mode.reconnectFailures}</strong></span>
+        <span>Drops отправки<strong>${mode.outgoingDrops}</strong></span>
+        <span>Пакеты ↑ / ↓<strong>${mode.outgoingPackets} / ${mode.incomingPackets}</strong></span>
+        <span>Сигналы недоступности<strong>${mode.peerUnreachable}</strong></span>
+        <span>Быстрые миграции<strong>${mode.migrations}</strong></span>
+      </div>
+      <footer>${mode.enoughData ? `${mode.sessions} сесс.` : "Нужно 5 минут и 20 keepalive"}</footer>
+    </article>
+  `).join("");
+}
+
+async function refreshReliability() {
+  const profile = selectedProfile();
+  if (!profile || isWindows) return;
+  renderReliability(await invoke("reliability_diagnostics", { profileId: profile.id }));
 }
 
 function renderConnection(next) {
@@ -360,6 +419,31 @@ elements.protocolMode.addEventListener("change", async () => {
   }
 });
 
+elements.reliabilityDiagnostics.addEventListener("click", async () => {
+  if (!selectedProfile() || isWindows) return;
+  elements.reliabilityModal.classList.remove("hidden");
+  elements.reliabilityRecommendation.textContent = "Собираем данные…";
+  elements.reliabilityModes.innerHTML = "";
+  try {
+    await refreshReliability();
+  } catch (error) {
+    elements.reliabilityRecommendation.textContent = `Не удалось открыть диагностику: ${String(error)}`;
+  }
+});
+elements.closeReliability.addEventListener("click", () => elements.reliabilityModal.classList.add("hidden"));
+elements.clearReliability.addEventListener("click", async () => {
+  const profile = selectedProfile();
+  if (!profile || !window.confirm(`Сбросить статистику режимов для «${profile.name}»?`)) return;
+  elements.clearReliability.disabled = true;
+  try {
+    renderReliability(await invoke("clear_reliability_diagnostics", { profileId: profile.id }));
+  } catch (error) {
+    elements.reliabilityRecommendation.textContent = `Не удалось очистить статистику: ${String(error)}`;
+  } finally {
+    elements.clearReliability.disabled = false;
+  }
+});
+
 elements.cancelDelete.addEventListener("click", () => {
   pendingDeleteId = null;
   elements.deleteModal.classList.add("hidden");
@@ -512,12 +596,18 @@ document.addEventListener("keydown", (event) => {
   }
   if (!elements.profileModal.classList.contains("hidden")) closeProfileModal();
   if (!elements.deleteModal.classList.contains("hidden")) elements.cancelDelete.click();
+  if (!elements.reliabilityModal.classList.contains("hidden")) elements.closeReliability.click();
   if (!elements.appExclusionsModal.classList.contains("hidden")) elements.closeAppExclusions.click();
 });
 
 setInterval(async () => {
   try { renderConnection(await invoke("connection_status")); } catch (_) { /* retry on next tick */ }
 }, 1000);
+
+setInterval(async () => {
+  if (isWindows || elements.reliabilityModal.classList.contains("hidden")) return;
+  try { await refreshReliability(); } catch (_) { /* retry on next tick */ }
+}, 5000);
 
 setInterval(() => {
   if (!connectedAt) return;

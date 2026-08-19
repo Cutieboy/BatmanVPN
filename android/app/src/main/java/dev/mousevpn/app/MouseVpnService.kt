@@ -16,6 +16,7 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 class MouseVpnService : VpnService() {
@@ -25,6 +26,7 @@ class MouseVpnService : VpnService() {
     private var task: Future<*>? = null
     @Volatile private var stopRequested = false
     private val connectionGeneration = AtomicLong()
+    private val networkRestartRequested = AtomicBoolean()
     @Volatile private var handle = 0L
     @Volatile private var diagnosticSessionId = 0L
     @Volatile private var underlyingNetwork = "unknown"
@@ -49,8 +51,10 @@ class MouseVpnService : VpnService() {
         }
     }
     private val signalNetworkChange = Runnable {
-        val current = handle
-        if (current != 0L) NativeBridge.networkChanged(current)
+        if (handle != 0L) {
+            networkRestartRequested.set(true)
+            Log.i(LOG_TAG, "physical network changed to $underlyingNetwork; rebuilding VPN")
+        }
     }
 
     override fun onCreate() {
@@ -91,7 +95,12 @@ class MouseVpnService : VpnService() {
                 return
             }
             if (result.connectedForMs >= RECONNECT_BACKOFF_RESET_MS) backoff.reset()
-            val delay = if (result.outcome == AttemptOutcome.PARAMETERS_CHANGED) 0L else backoff.nextDelayMs()
+            val delay = when (result.outcome) {
+                AttemptOutcome.PARAMETERS_CHANGED,
+                AttemptOutcome.NETWORK_CHANGED,
+                -> 0L
+                else -> backoff.nextDelayMs()
+            }
             if (delay > 0L) {
                 val status = "Подключение… повтор через ${delay / 1_000} с"
                 broadcast(status)
@@ -107,6 +116,10 @@ class MouseVpnService : VpnService() {
         var connectedAt = 0L
         try {
             ensureAttemptActive(generation)
+            // This attempt will bind its outer socket to the currently selected
+            // physical network. A later callback sets the flag again if the route
+            // changes while setup is in flight.
+            networkRestartRequested.set(false)
             broadcast("Подключение…")
             val profile = requireNotNull(ProfileStore(this).selected()) { "Сначала вставьте профиль" }
             diagnosticSessionId = runCatching {
@@ -280,6 +293,20 @@ class MouseVpnService : VpnService() {
     private fun monitor(currentHandle: Long, connectedAt: Long, connectedSummary: String): AttemptResult {
         var reconnectingShown = false
         while (!Thread.currentThread().isInterrupted && handle == currentHandle) {
+            if (networkRestartRequested.getAndSet(false)) {
+                val status = "Смена сети… обновление VPN"
+                broadcast(status)
+                getSystemService(android.app.NotificationManager::class.java)
+                    .notify(VpnNotification.ID, VpnNotification.create(this, status))
+                finishDiagnostics("network_changed", null, currentHandle)
+                NativeBridge.stop(currentHandle)
+                if (handle == currentHandle) handle = 0L
+                connectedSinceElapsedRealtime = 0L
+                return AttemptResult(
+                    AttemptOutcome.NETWORK_CHANGED,
+                    connectedForMs = elapsedSince(connectedAt),
+                )
+            }
             val nativeStatus = NativeBridge.status(currentHandle)
             if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
                 Log.d("MouseVPNMetrics", NativeBridge.metrics(currentHandle))
@@ -519,6 +546,7 @@ class MouseVpnService : VpnService() {
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
         private const val DIAGNOSTIC_CHECKPOINT_MS = 60_000L
         private const val RECONNECT_BACKOFF_RESET_MS = 60_000L
+        private const val LOG_TAG = "MouseVpnService"
 
         const val ACTION_CONNECT = "dev.mousevpn.app.CONNECT"
         const val ACTION_DISCONNECT = "dev.mousevpn.app.DISCONNECT"
@@ -543,6 +571,7 @@ class MouseVpnService : VpnService() {
         SETUP_FAILED,
         CONNECTION_LOST,
         PARAMETERS_CHANGED,
+        NETWORK_CHANGED,
         STOPPED,
     }
 
