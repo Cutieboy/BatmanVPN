@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 getrandom = "0.3"
 jni = "0.21"
+mousevpn-client-wire = { path = "../client-wire" }
 mousevpn-config = { path = "../config" }
 mousevpn-crypto = { path = "../crypto" }
 mousevpn-data-plane = { path = "../data-plane" }

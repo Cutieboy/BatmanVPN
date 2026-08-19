@@ -18,7 +18,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.ImageButton
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 
@@ -31,9 +34,12 @@ class MainActivity : Activity() {
     private lateinit var powerButton: ImageButton
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
+    private lateinit var protocolMode: Spinner
+    private lateinit var protocolHint: TextView
     private val handler = Handler(Looper.getMainLooper())
     private var connected = false
     private var connecting = false
+    private var bindingProtocol = true
 
     private val clock = object : Runnable {
         override fun run() {
@@ -65,6 +71,24 @@ class MainActivity : Activity() {
         powerButton = findViewById(R.id.powerButton)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
+        protocolMode = findViewById(R.id.protocolMode)
+        protocolHint = findViewById(R.id.protocolHint)
+        protocolMode.adapter = ArrayAdapter.createFromResource(
+            this,
+            R.array.protocol_mode_labels,
+            R.layout.item_protocol_spinner,
+        ).apply { setDropDownViewResource(R.layout.item_protocol_dropdown) }
+        protocolMode.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (bindingProtocol) return
+                val profile = store.selected() ?: return
+                val protocol = VpnProtocol.entries.getOrNull(position) ?: VpnProtocol.LEGACY
+                if (profile.protocol != protocol) store.save(profile.copy(protocol = protocol), select = false)
+                updateProtocolUi()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
 
         findViewById<View>(R.id.addProfile).setOnClickListener { openAddProfile() }
         findViewById<View>(R.id.profileChooser).setOnClickListener { showProfileChooser() }
@@ -124,6 +148,10 @@ class MainActivity : Activity() {
             endpoint.text = profile.endpoint
             statServer.text = profile.name
         }
+        bindingProtocol = true
+        protocolMode.setSelection(profile?.protocol?.ordinal ?: VpnProtocol.LEGACY.ordinal, false)
+        bindingProtocol = false
+        updateProtocolUi()
         updatePowerEnabled()
     }
 
@@ -253,6 +281,16 @@ class MainActivity : Activity() {
         powerButton.setBackgroundResource(if (connected) R.drawable.bg_power_on else R.drawable.bg_power_off)
         if (!connected) statTime.text = "—"
         updatePowerEnabled()
+        updateProtocolUi()
+    }
+
+    private fun updateProtocolUi() {
+        val profile = runCatching { store.selected() }.getOrNull()
+        val protocol = profile?.protocol ?: VpnProtocol.LEGACY
+        val hints = resources.getStringArray(R.array.protocol_mode_hints)
+        protocolHint.text = hints.getOrElse(protocol.ordinal) { hints[0] }
+        protocolMode.isEnabled = profile != null && !connected && !connecting
+        protocolMode.alpha = if (protocolMode.isEnabled) 1f else 0.48f
     }
 
     private fun updatePowerEnabled() {

@@ -10,7 +10,6 @@ mod app_bypass;
 #[path = "app_bypass_stub.rs"]
 mod app_bypass;
 mod error;
-#[cfg(windows)]
 mod handshake;
 mod liveness;
 mod network;
@@ -27,6 +26,20 @@ mod platform_stub;
 mod runtime;
 
 pub use error::ClientError;
+
+/// Performs only the authenticated UDP handshake without creating `Wintun`,
+/// routes, DNS policy or firewall state.
+///
+/// # Errors
+///
+/// Returns an error when key derivation, UDP transport or the handshake fails.
+pub fn probe(
+    config: &mousevpn_config::ValidatedClientConfig,
+) -> Result<mousevpn_protocol::SessionParameters, ClientError> {
+    let wire = mousevpn_client_wire::ClientWire::from_config(config)?;
+    let (_, _, parameters) = handshake::connect(config, &wire)?;
+    Ok(parameters)
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,7 +118,7 @@ pub fn app_container_sid_string(package_family_name: &str) -> Result<String, Cli
 }
 
 #[cfg(not(windows))]
-/// Reports that AppContainer identities are unavailable outside Windows.
+/// Reports that `AppContainer` identities are unavailable outside Windows.
 ///
 /// # Errors
 ///

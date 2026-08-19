@@ -7,6 +7,7 @@ use std::{
     thread,
 };
 
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_linux_platform::{
     ensure_no_competing_full_tunnel, repair_stale_network as repair_platform_state, DnsGuard,
@@ -95,7 +96,8 @@ fn run_mode(
     let server_ip = ipv4_server(config)?;
     repair_platform_state(server_ip)
         .map_err(|error| context("repairing stale MouseVPN network state", &error))?;
-    let (incoming, plane, parameters) = connect(config)?;
+    let wire = ClientWire::from_config(config)?;
+    let (incoming, plane, parameters) = connect(config, &wire)?;
     incoming.set_read_timeout(Some(POLL_INTERVAL))?;
     let mut outgoing = incoming.try_clone()?;
     let tun = Arc::new(
@@ -145,6 +147,7 @@ fn run_mode(
     let outgoing_reconnecting = Arc::clone(&reconnecting);
     let outgoing_requested = Arc::clone(&reconnect_requested);
     let outgoing_generation = Arc::clone(&session_generation);
+    let outgoing_wire = wire.clone();
     let (worker_sender, worker_receiver) = mpsc::sync_channel(1);
     let (transport_sender, transport_receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -160,18 +163,11 @@ fn run_mode(
             &mut outgoing,
             &outgoing_stopping,
             &reconnect,
+            &outgoing_wire,
         );
         let _ = worker_sender.send(result);
     });
-    match mode {
-        Mode::FullTunnel => {
-            eprintln!("MOUSEVPN_STATE=connected");
-            eprintln!("MouseVPN connected; press Ctrl+C to disconnect safely");
-        }
-        Mode::Proxy(listen) => {
-            eprintln!("MouseVPN SOCKS5 proxy listening on {listen}; press Ctrl+C to stop");
-        }
-    }
+    log_connected(mode, &wire);
 
     let (routes, dns) = match &mut network {
         NetworkGuard::Full { routes, dns, .. } => (Some(routes), Some(dns)),
@@ -190,10 +186,28 @@ fn run_mode(
         session_generation,
         worker: worker_receiver,
         outgoing_transport: transport_sender,
+        wire,
         routes,
         dns,
     }
     .run()
+}
+
+fn log_connected(mode: Mode, wire: &ClientWire) {
+    match mode {
+        Mode::FullTunnel => {
+            eprintln!("MOUSEVPN_STATE=connected");
+            if let Some(profile) = wire.profile() {
+                eprintln!("MOUSEVPN_PROTOCOL=morph_{}", profile.name());
+            } else {
+                eprintln!("MOUSEVPN_PROTOCOL=legacy");
+            }
+            eprintln!("MouseVPN connected; press Ctrl+C to disconnect safely");
+        }
+        Mode::Proxy(listen) => {
+            eprintln!("MouseVPN SOCKS5 proxy listening on {listen}; press Ctrl+C to stop");
+        }
+    }
 }
 
 /// Removes crash leftovers for a known server without touching unrelated

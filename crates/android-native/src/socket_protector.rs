@@ -28,7 +28,7 @@ impl SocketProtector {
         let protected = env
             .call_method(
                 service.as_obj(),
-                "protect",
+                "protectAndBindSocket",
                 "(I)Z",
                 &[JValue::Int(socket.as_raw_fd())],
             )?
@@ -36,7 +36,7 @@ impl SocketProtector {
         if protected {
             Ok(())
         } else {
-            Err(anyhow!("Android refused to protect the UDP socket"))
+            Err(anyhow!("Android refused to protect or bind the UDP socket"))
         }
     }
 }

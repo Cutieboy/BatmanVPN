@@ -10,6 +10,7 @@ object NativeBridge {
         endpoint: String,
         serverPublicKey: String,
         clientPrivateKey: String,
+        protocol: String,
     ): String
 
     external fun start(handle: Long, tunFd: Int): Boolean

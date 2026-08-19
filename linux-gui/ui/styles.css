@@ -18,7 +18,7 @@ body {
     #08111f;
 }
 
-button, textarea, input { font: inherit; }
+button, textarea, input, select { font: inherit; }
 button { border: 0; }
 
 .app-shell {
@@ -189,6 +189,16 @@ button { border: 0; }
 .connected-server span { color: #64d8d0; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
 .connected-server strong { margin-top: 3px; color: #edfdfc; font-size: 15px; }
 .connected-server small { margin-top: 1px; color: #8faeb4; font-size: 12px; }
+
+.protocol-card { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 12px; padding: 14px 18px; border: 1px solid #283a50; border-radius: 17px; background: #111c2d; }
+.protocol-copy { min-width: 0; }
+.protocol-copy strong, .protocol-copy small { display: block; }
+.protocol-copy strong { margin-top: 4px; font-size: 14px; }
+.protocol-copy small { margin-top: 3px; color: #71869b; font-size: 10px; }
+.protocol-select-label { flex: 0 0 min(320px, 48%); margin: 0; }
+.protocol-select-label select { width: 100%; height: 42px; padding: 0 38px 0 12px; border: 1px solid #30445b; border-radius: 12px; outline: 0; background: #0c1726; color: #f4f8fc; cursor: pointer; }
+.protocol-select-label select:focus { border-color: #42d9d0; box-shadow: 0 0 0 3px rgba(66,217,208,.08); }
+.protocol-select-label select:disabled { cursor: not-allowed; opacity: .45; }
 
 .stats-card { display: grid; grid-template-columns: 1fr 1px 1fr 1px 1fr; align-items: center; padding: 17px 20px; border: 1px solid #283a50; border-radius: 17px; background: #111c2d; }
 .divider { width: 1px; height: 42px; background: #26374c; }

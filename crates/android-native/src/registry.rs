@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::TunnelDataPlane;
 use mousevpn_protocol::SessionParameters;
@@ -17,6 +18,7 @@ use crate::session::SpawnedSession;
 pub(crate) struct PendingSession {
     pub transport: UdpTransport,
     pub plane: TunnelDataPlane,
+    pub wire: ClientWire,
     pub config: ValidatedClientConfig,
     pub parameters: SessionParameters,
     pub protector: crate::socket_protector::SocketProtector,
@@ -92,8 +94,12 @@ pub(crate) fn status(handle: i64) -> &'static str {
         Some(Entry::Running(session)) if session.parameters_changed.load(Ordering::Acquire) => {
             "parameters-changed"
         }
-        Some(Entry::Running(session)) if session.alive.load(Ordering::Relaxed) => "running",
-        Some(Entry::Running(_)) | None => "stopped",
+        Some(Entry::Running(session)) if !session.alive.load(Ordering::Relaxed) => "stopped",
+        Some(Entry::Running(session)) if session.reconnecting.load(Ordering::Acquire) => {
+            "reconnecting"
+        }
+        Some(Entry::Running(_)) => "running",
+        None => "stopped",
     }
 }
 

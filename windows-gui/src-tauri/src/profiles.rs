@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mousevpn_config::ClientConfig;
+use mousevpn_config::{ClientConfig, ClientProtocol};
 use mousevpn_profile_cli::decrypt_profile;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +16,7 @@ pub(crate) struct ProfileSummary {
     id: String,
     name: String,
     endpoint: String,
+    protocol: ClientProtocol,
 }
 
 impl ProfileSummary {
@@ -32,6 +33,8 @@ struct StoredProfile {
     server_public_key: String,
     client_private_key: String,
     tun_name: String,
+    #[serde(default)]
+    protocol: ClientProtocol,
 }
 
 impl StoredProfile {
@@ -40,6 +43,7 @@ impl StoredProfile {
             id: self.id.clone(),
             name: self.name.clone(),
             endpoint: self.server.clone(),
+            protocol: self.protocol,
         }
     }
 
@@ -52,6 +56,7 @@ impl StoredProfile {
             server_public_key: self.server_public_key.clone(),
             client_private_key: self.client_private_key.clone(),
             tun_name: self.tun_name.clone(),
+            protocol: self.protocol,
         })
     }
 }
@@ -90,6 +95,7 @@ pub(crate) fn import(token: String, mut password: String) -> Result<ProfileSumma
         server_public_key,
         client_private_key,
         tun_name: "MouseVPN".to_owned(),
+        protocol: ClientProtocol::Legacy,
     };
     if profile.name.is_empty() {
         return Err("В конфигурации отсутствует название".to_owned());
@@ -99,6 +105,21 @@ pub(crate) fn import(token: String, mut password: String) -> Result<ProfileSumma
     fs::create_dir_all(&directory).map_err(display_error)?;
     write_atomic(
         &profile_path(&profile.id)?,
+        toml::to_string_pretty(&profile)
+            .map_err(display_error)?
+            .as_bytes(),
+    )?;
+    Ok(profile.summary())
+}
+
+pub(crate) fn set_protocol(id: &str, protocol: ClientProtocol) -> Result<ProfileSummary, String> {
+    let path = profile_path(id)?;
+    let contents = fs::read_to_string(&path).map_err(display_error)?;
+    let mut profile: StoredProfile = toml::from_str(&contents).map_err(display_error)?;
+    profile.protocol = protocol;
+    profile.client_config()?.validate().map_err(display_error)?;
+    write_atomic(
+        &path,
         toml::to_string_pretty(&profile)
             .map_err(display_error)?
             .as_bytes(),

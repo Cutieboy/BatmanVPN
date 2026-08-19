@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+use mousevpn_client_wire::ClientWireError;
 use mousevpn_crypto::CryptoError;
 use mousevpn_data_plane::DataPlaneError;
 use mousevpn_protocol::{DecodeError, SessionParametersError};
@@ -37,6 +38,7 @@ pub enum ClientError {
     Outer(DecodeError),
     Parameters(SessionParametersError),
     DataPlane(DataPlaneError),
+    Wire(ClientWireError),
     HandshakeTimeout,
     InvalidHandshakeResponse,
     SessionParametersChanged,
@@ -52,6 +54,7 @@ impl fmt::Display for ClientError {
             Self::Outer(error) => write!(formatter, "protocol error: {error}"),
             Self::Parameters(error) => write!(formatter, "session parameters error: {error}"),
             Self::DataPlane(error) => write!(formatter, "data-plane error: {error}"),
+            Self::Wire(error) => write!(formatter, "wire protocol error: {error}"),
             Self::HandshakeTimeout => formatter.write_str("VPN handshake timed out"),
             Self::InvalidHandshakeResponse => formatter.write_str("invalid handshake response"),
             Self::SessionParametersChanged => {
@@ -92,6 +95,12 @@ impl From<SessionParametersError> for ClientError {
 impl From<DataPlaneError> for ClientError {
     fn from(error: DataPlaneError) -> Self {
         Self::DataPlane(error)
+    }
+}
+
+impl From<ClientWireError> for ClientError {
+    fn from(error: ClientWireError) -> Self {
+        Self::Wire(error)
     }
 }
 

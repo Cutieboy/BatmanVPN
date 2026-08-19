@@ -113,6 +113,7 @@ class MouseVpnService : VpnService() {
                     profile.endpoint,
                     profile.serverPublicKey,
                     profile.clientPrivateKey,
+                    profile.protocol.nativeValue,
                 ),
             )
             handle = prepared.getLong("handle")
@@ -154,7 +155,7 @@ class MouseVpnService : VpnService() {
             val notification = VpnNotification.create(this, summary)
             getSystemService(android.app.NotificationManager::class.java)
                 .notify(VpnNotification.ID, notification)
-            return monitor(handle, connectedAt)
+            return monitor(handle, connectedAt, summary)
         } catch (_: InterruptedException) {
             val current = handle
             if (current != 0L) NativeBridge.stop(current)
@@ -270,7 +271,8 @@ class MouseVpnService : VpnService() {
         return policy.mode to applied
     }
 
-    private fun monitor(currentHandle: Long, connectedAt: Long): AttemptResult {
+    private fun monitor(currentHandle: Long, connectedAt: Long, connectedSummary: String): AttemptResult {
+        var reconnectingShown = false
         while (!Thread.currentThread().isInterrupted && handle == currentHandle) {
             val nativeStatus = NativeBridge.status(currentHandle)
             if (nativeStatus == "parameters-changed") {
@@ -283,7 +285,15 @@ class MouseVpnService : VpnService() {
                     connectedForMs = elapsedSince(connectedAt),
                 )
             }
-            if (nativeStatus != "running") {
+            if (nativeStatus == "reconnecting") {
+                if (!reconnectingShown) {
+                    val status = "Смена сети… переподключение"
+                    broadcast(status)
+                    getSystemService(android.app.NotificationManager::class.java)
+                        .notify(VpnNotification.ID, VpnNotification.create(this, status))
+                    reconnectingShown = true
+                }
+            } else if (nativeStatus != "running") {
                 finishDiagnostics("connection_lost", nativeStatus, currentHandle)
                 NativeBridge.stop(currentHandle)
                 handle = 0L
@@ -292,6 +302,14 @@ class MouseVpnService : VpnService() {
                     AttemptOutcome.CONNECTION_LOST,
                     connectedForMs = elapsedSince(connectedAt),
                 )
+            } else if (reconnectingShown) {
+                broadcast(connectedSummary)
+                getSystemService(android.app.NotificationManager::class.java)
+                    .notify(
+                        VpnNotification.ID,
+                        VpnNotification.create(this, connectedSummary),
+                    )
+                reconnectingShown = false
             }
             val now = SystemClock.elapsedRealtime()
             if (now - lastCheckpointElapsedRealtime >= DIAGNOSTIC_CHECKPOINT_MS) {
@@ -349,6 +367,26 @@ class MouseVpnService : VpnService() {
         networkHandler.postDelayed(signalNetworkChange, NETWORK_CHANGE_DEBOUNCE_MS)
     }
 
+    /**
+     * Excludes a native UDP socket from the VPN and pins it to the physical
+     * network selected by the connectivity callback.
+     *
+     * `protect` alone only prevents a routing loop. After Wi-Fi/mobile roaming,
+     * Android may otherwise keep a newly created socket on the obsolete route.
+     * Rust calls this method before connecting every handshake or migration
+     * socket, so a failed race with a disappearing network is retried safely.
+     */
+    fun protectAndBindSocket(socketFd: Int): Boolean {
+        if (!protect(socketFd)) return false
+        val network = synchronized(this) { selectedUnderlyingNetwork } ?: return true
+        return runCatching {
+            ParcelFileDescriptor.fromFd(socketFd).use { descriptor ->
+                network.bindSocket(descriptor.fileDescriptor)
+            }
+            true
+        }.getOrDefault(false)
+    }
+
     private fun updateUnderlyingNetwork(network: Network): Boolean {
         val capabilities = getSystemService(ConnectivityManager::class.java)
             .getNetworkCapabilities(network)
@@ -372,7 +410,14 @@ class MouseVpnService : VpnService() {
             ?.key
         selectedUnderlyingState = selectedUnderlyingNetwork?.let(underlyingNetworks::get)
         underlyingNetwork = selectedUnderlyingState?.diagnosticLabel ?: "none"
-        return selectedUnderlyingNetwork != previousNetwork || selectedUnderlyingState != previousState
+        val changed = selectedUnderlyingNetwork != previousNetwork ||
+            selectedUnderlyingState != previousState
+        if (changed) {
+            runCatching {
+                setUnderlyingNetworks(selectedUnderlyingNetwork?.let { arrayOf(it) })
+            }
+        }
+        return changed
     }
 
     private fun networkPriority(network: UnderlyingNetworkState): Int =

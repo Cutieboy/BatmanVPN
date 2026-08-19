@@ -2,10 +2,12 @@ use std::{
     io,
     net::{SocketAddr, UdpSocket},
     sync::{atomic::AtomicBool, atomic::Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_crypto::ClientHandshake;
 use mousevpn_data_plane::TunnelDataPlane;
@@ -23,34 +25,38 @@ const RETRANSMIT: Duration = Duration::from_millis(700);
 pub(crate) fn negotiate(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
-    negotiate_with_stop(socket, config, None)
+    negotiate_with_stop(socket, config, wire, None)
 }
 
 pub(crate) fn negotiate_interruptible(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
     stopping: &AtomicBool,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
-    negotiate_with_stop(socket, config, Some(stopping))
+    negotiate_with_stop(socket, config, wire, Some(stopping))
 }
 
 fn negotiate_with_stop(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
     stopping: Option<&AtomicBool>,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
     socket
         .connect(config.server)
         .context("UDP connect failed")?;
     let mut transport = UdpTransport::from_socket(socket, config.server)?;
-    let (plane, parameters) = renegotiate(&mut transport, config, stopping)?;
+    let (plane, parameters) = renegotiate(&mut transport, config, wire, stopping)?;
     Ok((transport, plane, parameters))
 }
 
 fn renegotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
     stopping: Option<&AtomicBool>,
 ) -> Result<(TunnelDataPlane, SessionParameters)> {
     let mut session_bytes = [0_u8; 8];
@@ -77,10 +83,13 @@ fn renegotiate(
 
     let started = Instant::now();
     let deadline = started + TIMEOUT;
-    send_request(transport, &request)?;
+    send_prelude(transport, wire)?;
+    let mut encoded_request = Vec::new();
+    send_request(transport, wire, &request, &mut encoded_request)?;
     let mut next_retransmit = started + RETRANSMIT;
 
     let mut buffer = vec![0_u8; 65_535];
+    let mut decoded = Vec::with_capacity(65_535);
     loop {
         if stopping.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err(anyhow!("handshake cancelled"));
@@ -90,7 +99,7 @@ fn renegotiate(
             return Err(anyhow!("handshake timed out"));
         }
         if now >= next_retransmit {
-            send_request(transport, &request)?;
+            send_request(transport, wire, &request, &mut encoded_request)?;
             next_retransmit = now + RETRANSMIT;
         }
 
@@ -101,7 +110,10 @@ fn renegotiate(
             Err(error) if is_retryable(&error) => continue,
             Err(error) => return Err(error.into()),
         };
-        let Ok(response) = Datagram::decode(&buffer[..length]) else {
+        let Ok(true) = wire.decode(&buffer[..length], &mut decoded) else {
+            continue;
+        };
+        let Ok(response) = Datagram::decode(&decoded) else {
             continue;
         };
         if response.header.kind != PacketKind::HandshakeResponse
@@ -118,14 +130,33 @@ fn renegotiate(
     }
 }
 
-fn send_request(transport: &mut UdpTransport, request: &[u8]) -> Result<()> {
-    match transport.send(request) {
+fn send_request(
+    transport: &mut UdpTransport,
+    wire: &ClientWire,
+    request: &[u8],
+    encoded: &mut Vec<u8>,
+) -> Result<()> {
+    wire.encode(request, encoded)?;
+    match transport.send(encoded) {
         // A refused or reset connection is a stale ICMP error from an earlier
         // datagram, not a reason to abandon this attempt.
         Ok(()) => Ok(()),
         Err(error) if is_retryable(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn send_prelude(transport: &mut UdpTransport, wire: &ClientWire) -> Result<()> {
+    let mut cover = Vec::new();
+    for _ in 0..wire.cover_count()? {
+        wire.encode_cover(&mut cover)?;
+        transport.send(&cover)?;
+        let jitter = wire.handshake_jitter_ms()?;
+        if jitter != 0 {
+            thread::sleep(Duration::from_millis(jitter));
+        }
+    }
+    Ok(())
 }
 
 fn is_retryable(error: &io::Error) -> bool {

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::{Datagram, SessionParameters};
@@ -40,6 +41,7 @@ pub(crate) fn run(
     session: &Arc<Session>,
     stopping: &Arc<AtomicBool>,
     network: &mut NetworkGuard,
+    wire: &ClientWire,
 ) -> Result<(), ClientError> {
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
@@ -58,6 +60,7 @@ pub(crate) fn run(
         Arc::clone(&reconnect_requested),
         transport_rx,
         result_tx,
+        wire.clone(),
     );
     let _policy_worker = PeriodicWorker::spawn(POLICY_REFRESH_INTERVAL, {
         let refresher = network.refresher();
@@ -69,6 +72,11 @@ pub(crate) fn run(
     })?;
 
     eprintln!("MOUSEVPN_STATE=connected");
+    if let Some(profile) = wire.profile() {
+        eprintln!("MOUSEVPN_PROTOCOL=morph_{}", profile.name());
+    } else {
+        eprintln!("MOUSEVPN_PROTOCOL=legacy");
+    }
     let result = IncomingLoop {
         config,
         transport: incoming,
@@ -82,6 +90,7 @@ pub(crate) fn run(
         outgoing_transport: transport_tx,
         worker: result_rx,
         network,
+        wire,
         wintun_send_drops: 0,
         reconnect_event_grace_until: None,
     }
@@ -106,22 +115,29 @@ struct IncomingLoop<'a> {
     outgoing_transport: mpsc::SyncSender<UdpTransport>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a mut NetworkGuard,
+    wire: &'a ClientWire,
     wintun_send_drops: u64,
     reconnect_event_grace_until: Option<Instant>,
 }
 
 impl IncomingLoop<'_> {
     fn run(&mut self) -> Result<(), ClientError> {
-        let mut encrypted = vec![0_u8; DATAGRAM_BUFFER_LEN];
+        let mut encrypted = vec![0_u8; MAX_WIRE_DATAGRAM_LEN];
+        let mut wire_payload = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
         let mut plaintext = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
         let mut keepalive = Vec::with_capacity(128);
+        let mut wire_keepalive = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
         let mut liveness = Liveness::new(Instant::now());
         while !self.stopping.load(Ordering::Acquire) {
             self.check_worker()?;
             match self.transport.receive(&mut encrypted) {
                 Ok(length) => {
-                    let decoded = Datagram::decode(&encrypted[..length])
+                    let decoded = self
+                        .wire
+                        .decode(&encrypted[..length], &mut wire_payload)
                         .ok()
+                        .filter(|decoded| *decoded)
+                        .and_then(|_| Datagram::decode(&wire_payload).ok())
                         .map(|datagram| self.receiver.decode_into(datagram, &mut plaintext));
                     match decoded {
                         Some(Ok(Decoded::Ip(packet))) => {
@@ -155,7 +171,7 @@ impl IncomingLoop<'_> {
             ) {
                 liveness.connection_lost(now);
             }
-            self.maintain_liveness(&mut liveness, &mut keepalive)?;
+            self.maintain_liveness(&mut liveness, &mut keepalive, &mut wire_keepalive)?;
         }
         Ok(())
     }
@@ -179,6 +195,7 @@ impl IncomingLoop<'_> {
         &mut self,
         liveness: &mut Liveness,
         keepalive: &mut Vec<u8>,
+        wire_keepalive: &mut Vec<u8>,
     ) -> Result<(), ClientError> {
         let now = Instant::now();
         match liveness.action(now) {
@@ -186,7 +203,8 @@ impl IncomingLoop<'_> {
             Action::Keepalive => {
                 let mut sender = self.sender.lock().map_err(|_| poisoned_sender())?;
                 sender.encode_keepalive_into(keepalive)?;
-                match self.transport.send(keepalive) {
+                self.wire.encode(keepalive, wire_keepalive)?;
+                match self.transport.send(wire_keepalive) {
                     Ok(()) => liveness.keepalive_sent(now),
                     Err(error) if is_peer_unavailable(&error) => liveness.connection_lost(now),
                     Err(error) => return Err(error.into()),
@@ -225,7 +243,7 @@ impl IncomingLoop<'_> {
 
     fn establish_replacement(&mut self) -> Result<(), ClientError> {
         self.network.refresh()?;
-        let (replacement_transport, replacement, parameters) = connect(self.config)?;
+        let (replacement_transport, replacement, parameters) = connect(self.config, self.wire)?;
         replacement_transport.set_read_timeout(Some(UDP_POLL))?;
         let replacement_outgoing = replacement_transport.try_clone()?;
         if parameters != self.parameters {
@@ -309,11 +327,15 @@ fn spawn_outgoing(
     reconnect_requested: Arc<AtomicBool>,
     transport_replacements: mpsc::Receiver<UdpTransport>,
     result_tx: mpsc::SyncSender<Result<(), ClientError>>,
+    wire: ClientWire,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         const BATCH_SIZE: usize = 32;
         const WAIT_MS: u32 = 100;
         let mut encrypted: Vec<Vec<u8>> = (0..BATCH_SIZE).map(|_| Vec::new()).collect();
+        let mut wire_datagrams: Vec<Vec<u8>> = (0..BATCH_SIZE)
+            .map(|_| Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN))
+            .collect();
         let mut dropped_packets = 0_u64;
         let result = (|| {
             while !stopping.load(Ordering::Acquire) {
@@ -376,8 +398,9 @@ fn spawn_outgoing(
                         }
                     }
                 }
-                for datagram in &encrypted[..encoded] {
-                    match transport.send(datagram) {
+                for index in 0..encoded {
+                    wire.encode(&encrypted[index], &mut wire_datagrams[index])?;
+                    match transport.send(&wire_datagrams[index]) {
                         Ok(()) => {}
                         Err(error) if is_peer_unavailable(&error) => {
                             reconnect_requested.store(true, Ordering::Release);

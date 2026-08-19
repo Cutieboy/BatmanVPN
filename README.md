@@ -23,6 +23,7 @@ Production readiness and draft network policy are tracked in
 
 - `protocol`: versioned datagrams, session parameters and inner packets;
 - `crypto`: Noise IK, X25519, ChaCha20-Poly1305 and replay protection;
+- `morph`: authenticated polymorphic UDP envelope and traffic-shaping profiles;
 - `transport`: UDP transport abstraction;
 - `data-plane`: encrypted IPv4 packet and keepalive processing;
 - `linux-client` / `linux-platform`: TUN, routing, DNS and kill switch;
@@ -38,7 +39,9 @@ Production readiness and draft network policy are tracked in
 
 The cryptographic design and explicit non-goals are documented in
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) and
-[docs/PROTOCOL.md](docs/PROTOCOL.md).
+[docs/PROTOCOL.md](docs/PROTOCOL.md). The experimental cross-platform masked
+transport used by Linux, Android and Windows is specified separately in
+[docs/MOUSEMORPH_V2.md](docs/MOUSEMORPH_V2.md).
 
 ## Development checks
 

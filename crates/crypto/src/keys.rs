@@ -1,11 +1,14 @@
 use std::fmt;
 
+use hkdf::Hkdf;
+use sha2::Sha256;
 use snow::Builder;
 use zeroize::Zeroize;
 
 use crate::{handshake::noise_params, CryptoError};
 
 pub const KEY_LEN: usize = 32;
+const MORPH_KEY_LABEL: &[u8] = b"MouseVPN MouseMorph v2 key";
 
 pub struct SecretKey(Box<[u8; KEY_LEN]>);
 
@@ -100,5 +103,63 @@ impl KeyPair {
             secret: SecretKey::from_vec(generated.private)?,
             public: PublicKey::from_slice(&generated.public)?,
         })
+    }
+}
+
+/// Derives the deployment- and device-specific key for the `MouseMorph` envelope.
+///
+/// `server_public_key` and `client_public_key` are always supplied in role
+/// order so both sides construct identical HKDF info regardless of which side
+/// calls this function.
+///
+/// # Errors
+///
+/// Returns an error for a low-order peer key or an impossible HKDF expansion
+/// failure.
+pub fn derive_morph_key(
+    local_secret_key: &SecretKey,
+    peer_public_key: &PublicKey,
+    server_public_key: &PublicKey,
+    client_public_key: &PublicKey,
+) -> Result<[u8; KEY_LEN], CryptoError> {
+    let mut shared = x25519_dalek::x25519(*local_secret_key.0, *peer_public_key.as_bytes());
+    if shared == [0_u8; KEY_LEN] {
+        return Err(CryptoError::InvalidSharedSecret);
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(MORPH_KEY_LABEL), &shared);
+    let mut info = [0_u8; KEY_LEN * 2];
+    info[..KEY_LEN].copy_from_slice(server_public_key.as_bytes());
+    info[KEY_LEN..].copy_from_slice(client_public_key.as_bytes());
+    let mut output = [0_u8; KEY_LEN];
+    hkdf.expand(&info, &mut output)
+        .map_err(|_| CryptoError::InvalidKeyLength { actual: KEY_LEN })?;
+    shared.zeroize();
+    info.zeroize();
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{derive_morph_key, KeyPair};
+
+    #[test]
+    fn both_roles_derive_the_same_morph_key() {
+        let server = KeyPair::generate().expect("server keys");
+        let client = KeyPair::generate().expect("client keys");
+        let from_client = derive_morph_key(
+            &client.secret,
+            &server.public,
+            &server.public,
+            &client.public,
+        )
+        .expect("client derivation");
+        let from_server = derive_morph_key(
+            &server.secret,
+            &client.public,
+            &server.public,
+            &client.public,
+        )
+        .expect("server derivation");
+        assert_eq!(from_client, from_server);
     }
 }

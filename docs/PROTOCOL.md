@@ -2,6 +2,11 @@
 
 Status: development draft. Incompatible changes are expected.
 
+This document describes the legacy on-wire framing, which remains the default.
+The optional Linux-first authenticated masking envelope is specified in
+[MOUSEMORPH_V2.md](MOUSEMORPH_V2.md); it carries these complete datagrams as
+encrypted inner payloads.
+
 ## Cryptographic protocol
 
 The protected session uses:

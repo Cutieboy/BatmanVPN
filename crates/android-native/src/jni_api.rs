@@ -6,7 +6,8 @@ use jni::{
     sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE},
     JNIEnv,
 };
-use mousevpn_config::ClientConfig;
+use mousevpn_client_wire::ClientWire;
+use mousevpn_config::{ClientConfig, ClientProtocol};
 
 use crate::{
     handshake::{bind_socket, negotiate},
@@ -26,6 +27,7 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepare(
     endpoint: JString,
     server_public_key: JString,
     client_private_key: JString,
+    protocol: JString,
 ) -> jstring {
     let result = catch_unwind(AssertUnwindSafe(|| {
         prepare(
@@ -34,6 +36,7 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepare(
             &endpoint,
             &server_public_key,
             &client_private_key,
+            &protocol,
         )
     }));
     match result {
@@ -57,21 +60,26 @@ fn prepare(
     endpoint: &JString,
     server_public_key: &JString,
     client_private_key: &JString,
+    protocol: &JString,
 ) -> Result<String> {
+    let protocol = parse_protocol(env.get_string(protocol)?.to_str()?)?;
     let config = ClientConfig {
         server: env.get_string(endpoint)?.to_str()?.parse()?,
         server_public_key: env.get_string(server_public_key)?.into(),
         client_private_key: env.get_string(client_private_key)?.into(),
         tun_name: "android".to_owned(),
+        protocol,
     }
     .validate()?;
+    let wire = ClientWire::from_config(&config)?;
     let protector = SocketProtector::new(env, service)?;
     let socket = bind_socket(config.server)?;
     protector.protect(&socket)?;
-    let (transport, plane, parameters) = negotiate(socket, &config)?;
+    let (transport, plane, parameters) = negotiate(socket, &config, &wire)?;
     let handle = insert_pending(PendingSession {
         transport,
         plane,
+        wire,
         config,
         parameters,
         protector,
@@ -84,6 +92,16 @@ fn prepare(
         "dns": parameters.dns.to_string(),
     })
     .to_string())
+}
+
+fn parse_protocol(value: &str) -> Result<ClientProtocol> {
+    match value {
+        "legacy" => Ok(ClientProtocol::Legacy),
+        "morph_quiet" => Ok(ClientProtocol::MorphQuiet),
+        "morph_balanced" => Ok(ClientProtocol::MorphBalanced),
+        "morph_paranoid" => Ok(ClientProtocol::MorphParanoid),
+        _ => Err(anyhow!("unsupported MouseVPN protocol mode: {value}")),
+    }
 }
 
 #[no_mangle]
@@ -99,6 +117,7 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_start(
             tun_fd,
             pending.transport,
             pending.plane,
+            pending.wire,
             pending.config,
             pending.parameters,
             pending.protector,

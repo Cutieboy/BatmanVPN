@@ -4,12 +4,25 @@ import android.util.Base64
 import org.json.JSONObject
 import java.util.UUID
 
+enum class VpnProtocol(val nativeValue: String) {
+    LEGACY("legacy"),
+    MORPH_QUIET("morph_quiet"),
+    MORPH_BALANCED("morph_balanced"),
+    MORPH_PARANOID("morph_paranoid");
+
+    companion object {
+        fun fromStored(value: String): VpnProtocol =
+            entries.firstOrNull { it.nativeValue == value } ?: LEGACY
+    }
+}
+
 data class VpnProfile(
     val id: String,
     val name: String,
     val endpoint: String,
     val serverPublicKey: String,
     val clientPrivateKey: String,
+    val protocol: VpnProtocol = VpnProtocol.LEGACY,
 ) {
     fun validate(): VpnProfile {
         require(isValidEndpoint(endpoint)) { "Неверный IPv4:port" }
@@ -27,6 +40,7 @@ data class VpnProfile(
         .put("endpoint", endpoint)
         .put("serverPublicKey", serverPublicKey)
         .put("clientPrivateKey", clientPrivateKey)
+        .put("protocol", protocol.nativeValue)
         .toString()
 
     companion object {
@@ -41,6 +55,7 @@ data class VpnProfile(
                 endpoint = value.getString("endpoint"),
                 serverPublicKey = value.getString("serverPublicKey"),
                 clientPrivateKey = value.getString("clientPrivateKey"),
+                protocol = VpnProtocol.fromStored(value.optString("protocol", "legacy")),
             ).validate()
         }
 

@@ -2,6 +2,8 @@
 members = [
     "crates/protocol",
     "crates/crypto",
+    "crates/morph",
+    "crates/client-wire",
     "crates/transport",
     "crates/client-core",
     "crates/config",

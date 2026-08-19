@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let base: ClientConfig = load_toml(&arguments.base_config)?;
     let keys = KeyPair::generate()?;
     let client = format!(
-        "server = \"{}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"mousevpn0\"\n",
+        "server = \"{}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"mousevpn0\"\n# legacy | morph_quiet | morph_balanced | morph_paranoid\nprotocol = \"legacy\"\n",
         base.server,
         base.server_public_key,
         encode_secret_key(&keys.secret),

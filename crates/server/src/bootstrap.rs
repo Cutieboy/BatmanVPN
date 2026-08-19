@@ -30,7 +30,7 @@ pub fn generate_example_configs(
         encode_public_key(&client_keys.public),
     );
     let client_config = format!(
-        "server = \"{server_endpoint}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"mousevpn0\"\n",
+        "server = \"{server_endpoint}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"mousevpn0\"\n# legacy | morph_quiet | morph_balanced | morph_paranoid\nprotocol = \"legacy\"\n",
         encode_public_key(&server_keys.public),
         encode_secret_key(&client_keys.secret),
     );

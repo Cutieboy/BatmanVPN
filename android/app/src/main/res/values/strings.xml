@@ -20,6 +20,21 @@
     <string name="status_connecting">Подключение…</string>
     <string name="status_connecting_hint">Устанавливаем защищённое соединение</string>
     <string name="status_error_title">Не удалось подключиться</string>
+    <string name="protocol_label">Протокол</string>
+    <string name="protocol_title">Режим маскировки</string>
+    <string name="protocol_legacy_hint">Обычный MouseVPN для старых клиентов</string>
+    <string-array name="protocol_mode_labels">
+        <item>Legacy — совместимый</item>
+        <item>Morph Quiet — экономный</item>
+        <item>Morph Balanced — усиленный</item>
+        <item>Morph Paranoid — максимальный</item>
+    </string-array>
+    <string-array name="protocol_mode_hints">
+        <item>Обычный MouseVPN для старых клиентов</item>
+        <item>Меняющийся тег и лёгкое случайное дополнение</item>
+        <item>Выравнивание размеров и 1–2 маскирующих пакета</item>
+        <item>Секундная ротация и 3–5 маскирующих пакетов</item>
+    </string-array>
     <string name="plus">+</string>
     <string name="empty_value">—</string>
     <string name="stat_server">Сервер</string>

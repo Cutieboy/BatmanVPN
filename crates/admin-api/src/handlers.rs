@@ -93,7 +93,7 @@ pub(crate) async fn provision_device(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let client_private_key = encode_secret_key(&provisioned.private_key);
     let client_config = format!(
-        "server = \"{}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"{}\"\n",
+        "server = \"{}\"\nserver_public_key = \"{}\"\nclient_private_key = \"{}\"\ntun_name = \"{}\"\n# legacy | morph_quiet | morph_balanced | morph_paranoid\nprotocol = \"legacy\"\n",
         state.settings.public_endpoint,
         state.settings.server_public_key,
         client_private_key,

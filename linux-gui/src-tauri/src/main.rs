@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use mousevpn_config::{load_toml, ClientConfig};
+use mousevpn_config::{load_toml, ClientConfig, ClientProtocol};
 use mousevpn_profile_cli::decrypt_profile;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State, WindowEvent};
@@ -26,6 +26,7 @@ struct ProfileSummary {
     id: String,
     name: String,
     endpoint: String,
+    protocol: ClientProtocol,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -36,6 +37,8 @@ struct StoredProfile {
     server_public_key: String,
     client_private_key: String,
     tun_name: String,
+    #[serde(default)]
+    protocol: ClientProtocol,
 }
 
 impl StoredProfile {
@@ -44,6 +47,7 @@ impl StoredProfile {
             id: self.id.clone(),
             name: self.name.clone(),
             endpoint: self.server.clone(),
+            protocol: self.protocol,
         }
     }
 
@@ -56,6 +60,7 @@ impl StoredProfile {
             server_public_key: self.server_public_key.clone(),
             client_private_key: self.client_private_key.clone(),
             tun_name: self.tun_name.clone(),
+            protocol: self.protocol,
         })
     }
 }
@@ -120,6 +125,7 @@ fn import_profile(token: String, mut password: String) -> Result<ProfileSummary,
         server_public_key,
         client_private_key,
         tun_name: "mousevpn0".to_owned(),
+        protocol: ClientProtocol::Legacy,
     };
     if profile.name.is_empty() {
         return Err("В конфигурации отсутствует название".to_owned());
@@ -128,6 +134,37 @@ fn import_profile(token: String, mut password: String) -> Result<ProfileSummary,
     let directory = profiles_dir()?;
     create_private_dir(&directory)?;
     let path = profile_path(&profile.id)?;
+    write_private_atomic(
+        &path,
+        toml::to_string_pretty(&profile)
+            .map_err(display_error)?
+            .as_bytes(),
+    )?;
+    Ok(profile.summary())
+}
+
+#[tauri::command]
+fn set_profile_protocol(
+    id: String,
+    protocol: ClientProtocol,
+    state: State<'_, AppState>,
+) -> Result<ProfileSummary, String> {
+    let id = normalized_id(&id)?;
+    let snapshot = lock(&state.snapshot)?.clone();
+    if snapshot.profile_id.as_deref() == Some(id.as_str())
+        && matches!(
+            snapshot.state.as_str(),
+            "connecting" | "connected" | "disconnecting"
+        )
+    {
+        return Err("Сначала отключите активный профиль".to_owned());
+    }
+
+    let path = profile_path(&id)?;
+    let contents = fs::read_to_string(&path).map_err(display_error)?;
+    let mut profile: StoredProfile = toml::from_str(&contents).map_err(display_error)?;
+    profile.protocol = protocol;
+    profile.client_config()?.validate().map_err(display_error)?;
     write_private_atomic(
         &path,
         toml::to_string_pretty(&profile)
@@ -494,6 +531,7 @@ fn run_gui() {
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             import_profile,
+            set_profile_protocol,
             delete_profile,
             connect_profile,
             disconnect,

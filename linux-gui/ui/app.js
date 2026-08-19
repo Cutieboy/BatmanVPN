@@ -20,6 +20,9 @@ const elements = {
   connectedServerEndpoint: document.querySelector("#connectedServerEndpoint"),
   badge: document.querySelector("#connectionBadge"),
   time: document.querySelector("#timeValue"),
+  protocolSelector: document.querySelector("#protocolSelector"),
+  protocolMode: document.querySelector("#protocolMode"),
+  protocolHint: document.querySelector("#protocolHint"),
   profileModal: document.querySelector("#profileModal"),
   profileForm: document.querySelector("#profileForm"),
   token: document.querySelector("#profileToken"),
@@ -66,6 +69,7 @@ let connection = { state: "disconnected", message: "VPN выключен", profi
 let connectedAt = null;
 const isWindows = navigator.userAgent.includes("Windows");
 
+elements.protocolSelector.classList.remove("hidden");
 if (isWindows) {
   elements.autostartSetting.classList.remove("hidden");
   invoke("split_tunneling_available")
@@ -131,6 +135,22 @@ function renderActiveProfile() {
   elements.connectedServer.classList.toggle("hidden", !showConnection);
   elements.connectedServerName.textContent = active?.name ?? "—";
   elements.connectedServerEndpoint.textContent = active?.endpoint ?? "—";
+  renderProtocol();
+}
+
+function renderProtocol() {
+  const profile = selectedProfile();
+  const protocol = profile?.protocol ?? "legacy";
+  const descriptions = {
+    legacy: "Обычный MouseVPN для старых клиентов",
+    morph_quiet: "Меняющийся тег и лёгкое случайное дополнение",
+    morph_balanced: "Выравнивание размеров и 1–2 маскирующих пакета",
+    morph_paranoid: "Секундная ротация и 3–5 маскирующих пакетов",
+  };
+  elements.protocolMode.value = protocol;
+  elements.protocolMode.disabled = !profile
+    || ["connecting", "connected", "disconnecting"].includes(connection.state);
+  elements.protocolHint.textContent = descriptions[protocol] ?? descriptions.legacy;
 }
 
 function renderConnection(next) {
@@ -321,6 +341,23 @@ elements.profiles.addEventListener("click", (event) => {
   selectedId = card.dataset.profileId;
   localStorage.setItem("mousevpn.selectedProfile", selectedId);
   renderProfiles();
+});
+
+elements.protocolMode.addEventListener("change", async () => {
+  const profile = selectedProfile();
+  if (!profile) return;
+  elements.protocolMode.disabled = true;
+  try {
+    const updated = await invoke("set_profile_protocol", {
+      id: profile.id,
+      protocol: elements.protocolMode.value,
+    });
+    profiles = profiles.map((item) => item.id === updated.id ? updated : item);
+    renderProfiles();
+  } catch (error) {
+    renderProtocol();
+    elements.protocolHint.textContent = `Не удалось сохранить режим: ${String(error)}`;
+  }
 });
 
 elements.cancelDelete.addEventListener("click", () => {

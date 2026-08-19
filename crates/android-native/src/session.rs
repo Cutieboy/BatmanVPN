@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::Datagram;
@@ -67,6 +68,7 @@ pub(crate) struct SessionMetrics {
 pub(crate) struct SpawnedSession {
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) alive: Arc<AtomicBool>,
+    pub(crate) reconnecting: Arc<AtomicBool>,
     pub(crate) reconnect_requested: Arc<AtomicBool>,
     pub(crate) parameters_changed: Arc<AtomicBool>,
     pub(crate) wake: Arc<EventFd>,
@@ -76,9 +78,11 @@ pub(crate) struct SpawnedSession {
 
 struct RunContext {
     config: ValidatedClientConfig,
+    wire: ClientWire,
     parameters: SessionParameters,
     protector: SocketProtector,
     stopping: Arc<AtomicBool>,
+    reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
     parameters_changed: Arc<AtomicBool>,
     wake: Arc<EventFd>,
@@ -102,6 +106,7 @@ struct IncomingLoop<'a> {
 
 struct OutgoingContext<'a> {
     outbound: &'a Mutex<OutboundState>,
+    wire: &'a ClientWire,
     stopping: &'a AtomicBool,
     reconnecting: &'a AtomicBool,
     reconnect_requested: &'a AtomicBool,
@@ -114,6 +119,7 @@ pub(crate) fn spawn(
     tun_fd: RawFd,
     transport: UdpTransport,
     plane: TunnelDataPlane,
+    wire: ClientWire,
     config: ValidatedClientConfig,
     parameters: SessionParameters,
     protector: SocketProtector,
@@ -124,6 +130,7 @@ pub(crate) fn spawn(
     let stopping = Arc::new(AtomicBool::new(false));
     let alive = Arc::new(AtomicBool::new(true));
     let thread_alive = Arc::clone(&alive);
+    let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let parameters_changed = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(
@@ -133,9 +140,11 @@ pub(crate) fn spawn(
     let metrics = Arc::new(SessionMetrics::default());
     let context = RunContext {
         config,
+        wire,
         parameters,
         protector,
         stopping: Arc::clone(&stopping),
+        reconnecting: Arc::clone(&reconnecting),
         reconnect_requested: Arc::clone(&reconnect_requested),
         parameters_changed: Arc::clone(&parameters_changed),
         wake: Arc::clone(&wake),
@@ -150,6 +159,7 @@ pub(crate) fn spawn(
     Ok(SpawnedSession {
         stopping,
         alive,
+        reconnecting,
         reconnect_requested,
         parameters_changed,
         wake,
@@ -176,18 +186,20 @@ fn run(
     let outgoing_state = Arc::clone(&outbound);
     let outgoing_stopping = Arc::new(AtomicBool::new(false));
     let outgoing_flag = Arc::clone(&outgoing_stopping);
-    let reconnecting = Arc::new(AtomicBool::new(false));
+    let reconnecting = Arc::clone(&context.reconnecting);
     let outgoing_reconnecting = Arc::clone(&reconnecting);
     let outgoing_reconnect_requested = Arc::clone(&context.reconnect_requested);
     let outgoing_wake = Arc::clone(&context.wake);
     let session_stopping = Arc::clone(&context.stopping);
     let packet_capacity = usize::from(context.parameters.mtu) + 128;
     let outgoing_metrics = Arc::clone(&context.metrics);
+    let outgoing_wire = context.wire.clone();
     let outgoing = thread::spawn(move || {
         let result = send_outgoing(
             sending_tun,
             &OutgoingContext {
                 outbound: &outgoing_state,
+                wire: &outgoing_wire,
                 stopping: &outgoing_flag,
                 reconnecting: &outgoing_reconnecting,
                 reconnect_requested: &outgoing_reconnect_requested,
@@ -235,11 +247,13 @@ impl IncomingLoop<'_> {
     fn run(&mut self) -> Result<()> {
         let packet_capacity = usize::from(self.context.parameters.mtu) + 128;
         let mut packets: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
-            .map(|_| vec![0_u8; packet_capacity])
+            .map(|_| vec![0_u8; MAX_WIRE_DATAGRAM_LEN])
             .collect();
         let mut lengths = Vec::with_capacity(UDP_BATCH_SIZE);
+        let mut wire_payload = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
         let mut plaintext = Vec::with_capacity(packet_capacity);
         let mut keepalive = Vec::with_capacity(128);
+        let mut wire_keepalive = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
         let mut udp_batch = UdpBatch::default();
         while !self.context.stopping.load(Ordering::Relaxed) {
             match self
@@ -248,7 +262,11 @@ impl IncomingLoop<'_> {
             {
                 Ok(()) => {
                     for (packet, length) in packets.iter().zip(lengths.iter().copied()) {
-                        self.process_received(&packet[..length], &mut plaintext)?;
+                        self.process_received(
+                            &packet[..length],
+                            &mut wire_payload,
+                            &mut plaintext,
+                        )?;
                     }
                 }
                 Err(error) if is_poll_event(&error) => {}
@@ -264,7 +282,7 @@ impl IncomingLoop<'_> {
                 Err(error) => return Err(error.into()),
             }
             if self.last_sent.elapsed() >= KEEPALIVE {
-                self.send_keepalive(&mut keepalive)?;
+                self.send_keepalive(&mut keepalive, &mut wire_keepalive)?;
             }
             self.update_reconnect_state();
             if self.reconnect_needed && Instant::now() >= self.next_reconnect {
@@ -274,9 +292,19 @@ impl IncomingLoop<'_> {
         Ok(())
     }
 
-    fn process_received(&mut self, packet: &[u8], plaintext: &mut Vec<u8>) -> Result<()> {
-        let decoded = Datagram::decode(packet)
+    fn process_received(
+        &mut self,
+        packet: &[u8],
+        wire_payload: &mut Vec<u8>,
+        plaintext: &mut Vec<u8>,
+    ) -> Result<()> {
+        let decoded = self
+            .context
+            .wire
+            .decode(packet, wire_payload)
             .ok()
+            .filter(|decoded| *decoded)
+            .and_then(|_| Datagram::decode(wire_payload).ok())
             .map(|datagram| self.receiver.decode_into(datagram, plaintext));
         match decoded {
             Some(Ok(Decoded::Ip(ip))) => {
@@ -324,9 +352,10 @@ impl IncomingLoop<'_> {
         Ok(())
     }
 
-    fn send_keepalive(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
+    fn send_keepalive(&mut self, buffer: &mut Vec<u8>, wire_buffer: &mut Vec<u8>) -> Result<()> {
         encode_keepalive(&self.outbound, buffer)?;
-        match self.transport.send(buffer) {
+        self.context.wire.encode(buffer, wire_buffer)?;
+        match self.transport.send(wire_buffer) {
             Ok(()) => {
                 self.last_sent = Instant::now();
                 self.keepalive_sent_at = Some(self.last_sent);
@@ -372,6 +401,9 @@ impl IncomingLoop<'_> {
                 .fetch_add(1, Ordering::Relaxed);
             self.reconnect_needed = true;
         }
+        if self.reconnect_needed && !self.reconnecting.swap(true, Ordering::AcqRel) {
+            signal(&self.context.wake);
+        }
     }
 
     fn try_reconnect(&mut self) -> Result<()> {
@@ -380,9 +412,6 @@ impl IncomingLoop<'_> {
             .metrics
             .reconnects
             .fetch_add(1, Ordering::Relaxed);
-        self.reconnecting.store(true, Ordering::Release);
-        signal(&self.context.wake);
-
         if self.try_migrate() {
             self.finish_reconnect(started);
             return Ok(());
@@ -391,6 +420,7 @@ impl IncomingLoop<'_> {
         let result = reconnect(
             &self.context.protector,
             &self.context.config,
+            &self.context.wire,
             &self.context.stopping,
         );
         if let Ok((replacement_transport, replacement, parameters)) = result {
@@ -412,7 +442,7 @@ impl IncomingLoop<'_> {
             .fetch_add(1, Ordering::Relaxed);
         self.next_reconnect = Instant::now() + self.reconnect_backoff;
         self.reconnect_backoff = (self.reconnect_backoff * 2).min(MAX_RECONNECT_RETRY);
-        self.finish_reconnect(started);
+        self.record_reconnect_duration(started);
         Ok(())
     }
 
@@ -433,21 +463,35 @@ impl IncomingLoop<'_> {
 
         let capacity = usize::from(self.context.parameters.mtu) + 128;
         let mut request = Vec::with_capacity(128);
-        let mut response = vec![0_u8; capacity];
+        let mut wire_request = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
+        let mut response = vec![0_u8; MAX_WIRE_DATAGRAM_LEN];
+        let mut wire_payload = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
         let mut plaintext = Vec::with_capacity(capacity);
         for _ in 0..MIGRATION_ATTEMPTS {
             if self.context.stopping.load(Ordering::Relaxed) {
                 return false;
             }
             if encode_keepalive(&self.outbound, &mut request).is_err()
-                || transport.send(&request).is_err()
+                || self
+                    .context
+                    .wire
+                    .encode(&request, &mut wire_request)
+                    .is_err()
+                || transport.send(&wire_request).is_err()
             {
                 continue;
             }
             let Ok(length) = transport.receive(&mut response) else {
                 continue;
             };
-            let Ok(datagram) = Datagram::decode(&response[..length]) else {
+            let Ok(true) = self
+                .context
+                .wire
+                .decode(&response[..length], &mut wire_payload)
+            else {
+                continue;
+            };
+            let Ok(datagram) = Datagram::decode(&wire_payload) else {
                 continue;
             };
             if !matches!(
@@ -480,12 +524,16 @@ impl IncomingLoop<'_> {
     }
 
     fn finish_reconnect(&self, started: Instant) {
+        self.record_reconnect_duration(started);
+        self.reconnecting.store(false, Ordering::Release);
+        signal(&self.context.wake);
+    }
+
+    fn record_reconnect_duration(&self, started: Instant) {
         self.context.metrics.last_reconnect_ms.store(
             started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        self.reconnecting.store(false, Ordering::Release);
-        signal(&self.context.wake);
     }
 
     fn install_replacement(
@@ -523,6 +571,9 @@ fn send_outgoing(
         .collect();
     let mut datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
         .map(|_| Vec::with_capacity(packet_capacity + 128))
+        .collect();
+    let mut wire_datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+        .map(|_| Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN))
         .collect();
     let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
     let mut datagram_bytes = [0_u64; UDP_BATCH_SIZE];
@@ -576,43 +627,58 @@ fn send_outgoing(
                 datagram_count += 1;
             }
         }
+        for index in 0..datagram_count {
+            context
+                .wire
+                .encode(&datagrams[index], &mut wire_datagrams[index])?;
+        }
         let sent = outbound
             .transport
-            .send_batch_with(&datagrams[..datagram_count], &mut udp_batch);
+            .send_batch_with(&wire_datagrams[..datagram_count], &mut udp_batch);
         drop(outbound);
-        match sent {
-            Ok(sent_count) => {
-                let sent_bytes = datagram_bytes[..sent_count].iter().copied().sum::<u64>();
-                context
-                    .metrics
-                    .packets_sent
-                    .fetch_add(sent_count as u64, Ordering::Relaxed);
-                context
-                    .metrics
-                    .bytes_sent
-                    .fetch_add(sent_bytes, Ordering::Relaxed);
-                context.metrics.udp_send_drops.fetch_add(
-                    datagram_count.saturating_sub(sent_count) as u64,
-                    Ordering::Relaxed,
-                );
-            }
-            Err(error) if is_peer_unavailable(&error) => {
-                if !context.reconnect_requested.swap(true, Ordering::AcqRel) {
-                    context
-                        .metrics
-                        .peer_unreachable
-                        .fetch_add(1, Ordering::Relaxed);
-                    signal(context.wake);
-                }
-            }
-            Err(error) if is_transient_send(&error) => {
-                context
-                    .metrics
-                    .udp_send_drops
-                    .fetch_add(datagram_count as u64, Ordering::Relaxed);
-            }
-            Err(error) => return Err(error.into()),
+        record_outgoing_result(sent, datagram_count, &datagram_bytes, context)?;
+    }
+    Ok(())
+}
+
+fn record_outgoing_result(
+    sent: io::Result<usize>,
+    datagram_count: usize,
+    datagram_bytes: &[u64; UDP_BATCH_SIZE],
+    context: &OutgoingContext<'_>,
+) -> Result<()> {
+    match sent {
+        Ok(sent_count) => {
+            let sent_bytes = datagram_bytes[..sent_count].iter().copied().sum::<u64>();
+            context
+                .metrics
+                .packets_sent
+                .fetch_add(sent_count as u64, Ordering::Relaxed);
+            context
+                .metrics
+                .bytes_sent
+                .fetch_add(sent_bytes, Ordering::Relaxed);
+            context.metrics.udp_send_drops.fetch_add(
+                datagram_count.saturating_sub(sent_count) as u64,
+                Ordering::Relaxed,
+            );
         }
+        Err(error) if is_peer_unavailable(&error) => {
+            if !context.reconnect_requested.swap(true, Ordering::AcqRel) {
+                context
+                    .metrics
+                    .peer_unreachable
+                    .fetch_add(1, Ordering::Relaxed);
+                signal(context.wake);
+            }
+        }
+        Err(error) if is_transient_send(&error) => {
+            context
+                .metrics
+                .udp_send_drops
+                .fetch_add(datagram_count as u64, Ordering::Relaxed);
+        }
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -655,11 +721,12 @@ fn encode_keepalive(outbound: &Mutex<OutboundState>, buffer: &mut Vec<u8>) -> Re
 fn reconnect(
     protector: &SocketProtector,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
     stopping: &AtomicBool,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
     let socket = crate::handshake::bind_socket(config.server)?;
     protector.protect(&socket)?;
-    crate::handshake::negotiate_interruptible(socket, config, stopping)
+    crate::handshake::negotiate_interruptible(socket, config, wire, stopping)
 }
 
 fn is_peer_unavailable(error: &io::Error) -> bool {

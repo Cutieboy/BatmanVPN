@@ -7,6 +7,7 @@ pub enum CryptoError {
     Noise(snow::Error),
     InvalidKeyLength { actual: usize },
     MessageTooLarge { actual: usize, maximum: usize },
+    InvalidSharedSecret,
     MissingPeerStaticKey,
     Replay(ReplayError),
 }
@@ -24,6 +25,9 @@ impl fmt::Display for CryptoError {
                     "message is too large: {actual} bytes, maximum {maximum}"
                 )
             }
+            Self::InvalidSharedSecret => {
+                formatter.write_str("X25519 peer key produces an invalid shared secret")
+            }
             Self::MissingPeerStaticKey => formatter.write_str("peer static key is unavailable"),
             Self::Replay(error) => write!(formatter, "replay rejected: {error}"),
         }
@@ -37,6 +41,7 @@ impl Error for CryptoError {
             Self::Replay(error) => Some(error),
             Self::InvalidKeyLength { .. }
             | Self::MessageTooLarge { .. }
+            | Self::InvalidSharedSecret
             | Self::MissingPeerStaticKey => None,
         }
     }

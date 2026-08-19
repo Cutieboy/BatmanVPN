@@ -1,5 +1,6 @@
 use std::{fmt, io};
 
+use mousevpn_client_wire::ClientWireError;
 use mousevpn_crypto::CryptoError;
 use mousevpn_data_plane::DataPlaneError;
 use mousevpn_protocol::SessionParametersError;
@@ -11,6 +12,7 @@ pub enum ClientError {
     HandshakeTimeout,
     Io(io::Error),
     Protocol(SessionParametersError),
+    Wire(ClientWireError),
     Platform(String),
 }
 
@@ -22,6 +24,7 @@ impl fmt::Display for ClientError {
             Self::HandshakeTimeout => formatter.write_str("server handshake timed out"),
             Self::Io(error) => write!(formatter, "network I/O failed: {error}"),
             Self::Protocol(error) => write!(formatter, "invalid server parameters: {error}"),
+            Self::Wire(error) => write!(formatter, "wire protocol failed: {error}"),
             Self::Platform(error) => formatter.write_str(error),
         }
     }
@@ -50,6 +53,12 @@ impl From<DataPlaneError> for ClientError {
 impl From<SessionParametersError> for ClientError {
     fn from(error: SessionParametersError) -> Self {
         Self::Protocol(error)
+    }
+}
+
+impl From<ClientWireError> for ClientError {
+    fn from(error: ClientWireError) -> Self {
+        Self::Wire(error)
     }
 }
 

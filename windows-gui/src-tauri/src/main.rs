@@ -12,7 +12,7 @@ use std::{
     thread,
 };
 
-use mousevpn_config::{load_toml, ClientConfig};
+use mousevpn_config::{load_toml, ClientConfig, ClientProtocol};
 use serde::Serialize;
 use tauri::{Manager, State};
 
@@ -91,6 +91,25 @@ fn list_profiles() -> Result<Vec<profiles::ProfileSummary>, String> {
 #[tauri::command]
 fn import_profile(token: String, password: String) -> Result<profiles::ProfileSummary, String> {
     profiles::import(token, password)
+}
+
+#[tauri::command]
+fn set_profile_protocol(
+    id: String,
+    protocol: ClientProtocol,
+    state: State<'_, AppState>,
+) -> Result<profiles::ProfileSummary, String> {
+    let id = profiles::normalized_id(&id)?;
+    let snapshot = lock(&state.snapshot)?.clone();
+    if snapshot.profile_id.as_deref() == Some(id.as_str())
+        && matches!(
+            snapshot.state.as_str(),
+            "connecting" | "connected" | "disconnecting"
+        )
+    {
+        return Err("Сначала отключите активный профиль".to_owned());
+    }
+    profiles::set_protocol(&id, protocol)
 }
 
 #[tauri::command]
@@ -478,6 +497,17 @@ fn run_helper(path: &Path) -> Result<(), String> {
     }
 }
 
+fn run_probe(path: &Path) -> Result<(), String> {
+    let config: ClientConfig = load_toml(path).map_err(display_error)?;
+    let config = config.validate().map_err(display_error)?;
+    let parameters = mousevpn_windows_client::probe(&config).map_err(display_error)?;
+    println!(
+        "MouseVPN handshake succeeded: address={}/{} mtu={} dns={}",
+        parameters.client_address, parameters.prefix_len, parameters.mtu, parameters.dns
+    );
+    Ok(())
+}
+
 fn wait_for_stop(stopping: &AtomicBool, duration: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + duration;
     while !stopping.load(Ordering::Acquire) {
@@ -526,6 +556,7 @@ fn run_gui(minimized: bool) {
             split_tunneling_available,
             list_profiles,
             import_profile,
+            set_profile_protocol,
             delete_profile,
             get_app_routing,
             choose_executable,
@@ -576,6 +607,12 @@ fn main() {
         }
         [_, helper, config, path] if helper == "--helper" && config == "--config" => {
             if let Err(error) = run_helper(Path::new(path)) {
+                eprintln!("MOUSEVPN_ERROR={error}");
+                std::process::exit(1);
+            }
+        }
+        [_, probe, config, path] if probe == "--probe" && config == "--config" => {
+            if let Err(error) = run_probe(Path::new(path)) {
                 eprintln!("MOUSEVPN_ERROR={error}");
                 std::process::exit(1);
             }

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{Decoded, PacketDevice, TunnelReceiver, TunnelSender};
 use mousevpn_linux_platform::{DnsGuard, LinuxTun, RouteGuard};
@@ -53,6 +54,7 @@ pub(crate) struct PacketLoop<'a> {
     pub(crate) session_generation: Arc<AtomicU64>,
     pub(crate) worker: Receiver<Result<(), ClientError>>,
     pub(crate) outgoing_transport: Sender<UdpTransport>,
+    pub(crate) wire: ClientWire,
     pub(crate) routes: Option<&'a mut RouteGuard>,
     pub(crate) dns: Option<&'a mut DnsGuard>,
 }
@@ -65,7 +67,9 @@ impl PacketLoop<'_> {
         let mut lengths = Vec::with_capacity(BATCH_SIZE);
         // Reused across packets: the receive path allocates nothing in steady state.
         let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
+        let mut wire_payload = Vec::with_capacity(PACKET_BUFFER_LEN);
         let mut keepalive = Vec::with_capacity(128);
+        let mut wire_keepalive = Vec::with_capacity(256);
         let mut liveness = Liveness::new(Instant::now());
         let mut next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
         let mut udp_batch = UdpBatch::default();
@@ -75,7 +79,11 @@ impl PacketLoop<'_> {
             match self.receive(&mut datagrams, &mut lengths, &mut udp_batch)? {
                 ReceiveEvent::Packets => {
                     for (datagram, &length) in datagrams.iter().zip(&lengths) {
-                        if let Ok(parsed) = Datagram::decode(&datagram[..length]) {
+                        let Ok(true) = self.wire.decode(&datagram[..length], &mut wire_payload)
+                        else {
+                            continue;
+                        };
+                        if let Ok(parsed) = Datagram::decode(&wire_payload) {
                             match self.receiver.decode_into(parsed, &mut plaintext) {
                                 Ok(Decoded::Ip(packet)) => {
                                     liveness.packet_received(Instant::now());
@@ -110,7 +118,7 @@ impl PacketLoop<'_> {
                 }
                 next_route_refresh = Instant::now() + ROUTE_REFRESH_INTERVAL;
             }
-            self.maintain_liveness(&mut liveness, &mut keepalive)?;
+            self.maintain_liveness(&mut liveness, &mut keepalive, &mut wire_keepalive)?;
         }
         Ok(())
     }
@@ -143,12 +151,13 @@ impl PacketLoop<'_> {
         &mut self,
         liveness: &mut Liveness,
         keepalive: &mut Vec<u8>,
+        wire_keepalive: &mut Vec<u8>,
     ) -> Result<(), ClientError> {
         let now = Instant::now();
         match liveness.action(now) {
             Action::None => Ok(()),
             Action::Keepalive => {
-                match self.send_keepalive(keepalive) {
+                match self.send_keepalive(keepalive, wire_keepalive) {
                     Ok(()) => liveness.keepalive_sent(now),
                     Err(ClientError::Io(error)) if is_peer_unavailable(&error) => {
                         liveness.connection_lost(now);
@@ -164,12 +173,17 @@ impl PacketLoop<'_> {
         }
     }
 
-    fn send_keepalive(&mut self, buffer: &mut Vec<u8>) -> Result<(), ClientError> {
+    fn send_keepalive(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        wire_buffer: &mut Vec<u8>,
+    ) -> Result<(), ClientError> {
         self.sender
             .lock()
             .map_err(|_| ClientError::WorkerStopped)?
             .encode_keepalive_into(buffer)?;
-        self.transport.send(buffer)?;
+        self.wire.encode(buffer, wire_buffer)?;
+        self.transport.send(wire_buffer)?;
         Ok(())
     }
 
@@ -204,7 +218,7 @@ impl PacketLoop<'_> {
         // Do not reuse the connected socket across suspend or a gateway
         // change. Linux may keep its old source address and cached route even
         // after the server host route has been repaired.
-        let (replacement_transport, replacement, parameters) = connect(self.config)?;
+        let (replacement_transport, replacement, parameters) = connect(self.config, &self.wire)?;
         replacement_transport.set_read_timeout(Some(POLL_INTERVAL))?;
         let outgoing_transport = replacement_transport.try_clone()?;
         self.apply_session_parameters(parameters)?;
@@ -231,7 +245,9 @@ impl PacketLoop<'_> {
         let mut replacement = UdpTransport::bind(local, self.config.server)?;
         replacement.set_read_timeout(Some(MIGRATION_POLL))?;
         let mut keepalive = Vec::with_capacity(128);
+        let mut wire_keepalive = Vec::with_capacity(256);
         let mut datagram = vec![0_u8; PACKET_BUFFER_LEN];
+        let mut wire_payload = Vec::with_capacity(PACKET_BUFFER_LEN);
         let mut plaintext = Vec::with_capacity(PACKET_BUFFER_LEN);
 
         for _ in 0..MIGRATION_ATTEMPTS {
@@ -239,10 +255,14 @@ impl PacketLoop<'_> {
                 .lock()
                 .map_err(|_| ClientError::WorkerStopped)?
                 .encode_keepalive_into(&mut keepalive)?;
-            replacement.send(&keepalive)?;
+            self.wire.encode(&keepalive, &mut wire_keepalive)?;
+            replacement.send(&wire_keepalive)?;
             match replacement.receive(&mut datagram) {
                 Ok(length) => {
-                    let parsed = Datagram::decode(&datagram[..length])
+                    if !self.wire.decode(&datagram[..length], &mut wire_payload)? {
+                        continue;
+                    }
+                    let parsed = Datagram::decode(&wire_payload)
                         .map_err(|_| io::Error::other("invalid migration response"))?;
                     match self.receiver.decode_into(parsed, &mut plaintext) {
                         Ok(Decoded::Keepalive) => {}

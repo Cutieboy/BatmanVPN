@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap, HashSet},
     env, fs,
     io::{self, IoSlice, IoSliceMut},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -15,14 +15,18 @@ use mousevpn_admin_api::{
     SharedDeviceRegistry, TrafficStore,
 };
 use mousevpn_config::{
-    encode_public_key, ValidatedServerConfig, DEFAULT_TUN_MTU, MAX_SAFE_TUN_MTU,
+    decode_public_key, encode_public_key, ValidatedServerConfig, DEFAULT_TUN_MTU, MAX_SAFE_TUN_MTU,
 };
-use mousevpn_crypto::{PublicKey, ServerHandshake};
+use mousevpn_crypto::{derive_morph_key, PublicKey, ServerHandshake};
 use mousevpn_data_plane::{
     looks_like_protocol_datagram, Decoded, Ipv4Packet, PacketDevice, TunnelDataPlane,
     TunnelReceiver, TunnelSender, TUNNEL_OVERHEAD,
 };
 use mousevpn_linux_platform::{LinuxTun, LinuxTunConfig, DEFAULT_TX_QUEUE_LEN};
+use mousevpn_morph::{
+    accepted_epochs, current_epoch, routing_tag_at, DecodedFrame, Direction, MorphCodec,
+    MorphError, MorphKey, Profile, SAFE_TUN_MTU,
+};
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::socket::{
@@ -52,6 +56,7 @@ struct RuntimeSession {
     inbound: Mutex<TunnelReceiver>,
     /// Server-to-client direction, driven by the TUN worker alone.
     outbound: Mutex<TunnelSender>,
+    wire: WireMode,
     last_peer_log: Mutex<Option<Instant>>,
 }
 
@@ -123,7 +128,155 @@ struct ReceivedDatagram {
 /// derived, so an exact repeat is answered with the exact same response.
 struct CachedHandshake {
     request: Vec<u8>,
+    /// Complete legacy response datagram; `MouseMorph` is freshly applied for
+    /// every retransmission so nonces and padding do not repeat.
     response: Vec<u8>,
+}
+
+struct KeepaliveBuffers {
+    plaintext: Vec<u8>,
+    response: Vec<u8>,
+    wire_response: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+enum WireMode {
+    Legacy,
+    Morph {
+        client_public_key: PublicKey,
+        codec: MorphCodec,
+    },
+}
+
+impl WireMode {
+    fn encode_server(&self, inner: &[u8], output: &mut Vec<u8>) -> Result<(), MorphError> {
+        match self {
+            Self::Legacy => {
+                output.clear();
+                output.extend_from_slice(inner);
+                Ok(())
+            }
+            Self::Morph { codec, .. } => {
+                codec.encode_payload(inner, Direction::ServerToClient, output)
+            }
+        }
+    }
+
+    fn allows_client(&self, public_key: &PublicKey) -> bool {
+        match self {
+            Self::Legacy => true,
+            Self::Morph {
+                client_public_key, ..
+            } => client_public_key == public_key,
+        }
+    }
+
+    fn matches(&self, incoming: &Self) -> bool {
+        match (self, incoming) {
+            (Self::Legacy, Self::Legacy) => true,
+            (
+                Self::Morph {
+                    client_public_key: expected,
+                    codec: expected_codec,
+                },
+                Self::Morph {
+                    client_public_key: actual,
+                    codec: actual_codec,
+                },
+            ) => expected == actual && expected_codec.profile() == actual_codec.profile(),
+            _ => false,
+        }
+    }
+
+    fn session_mtu(&self, configured: u16) -> u16 {
+        match self {
+            Self::Legacy => configured,
+            Self::Morph { .. } => configured.min(SAFE_TUN_MTU),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MorphRoute {
+    public_key: PublicKey,
+    key: MorphKey,
+    profile: Profile,
+}
+
+#[derive(Default)]
+struct MorphRouter {
+    epoch: Option<u64>,
+    routes: HashMap<[u8; 8], MorphRoute>,
+    ambiguous: HashSet<[u8; 8]>,
+}
+
+impl MorphRouter {
+    fn resolve(
+        &mut self,
+        input: &[u8],
+        config: &ValidatedServerConfig,
+        authorized: &SharedDeviceRegistry,
+    ) -> Option<MorphRoute> {
+        let tag: [u8; 8] = input.get(..8)?.try_into().ok()?;
+        let epoch = current_epoch(Profile::Paranoid).ok()?;
+        if self.epoch != Some(epoch) && self.refresh(epoch, config, authorized).is_err() {
+            return None;
+        }
+        self.routes.get(&tag).cloned()
+    }
+
+    fn refresh(
+        &mut self,
+        epoch: u64,
+        config: &ValidatedServerConfig,
+        authorized: &SharedDeviceRegistry,
+    ) -> Result<(), ()> {
+        let devices = authorized.list().map_err(|_| ())?;
+        self.routes.clear();
+        self.ambiguous.clear();
+        for device in devices {
+            let Ok(public_key) = decode_public_key(&device.public_key) else {
+                continue;
+            };
+            let Ok(key) = derive_morph_key(
+                &config.server_private_key,
+                &public_key,
+                &config.server_public_key,
+                &public_key,
+            ) else {
+                continue;
+            };
+            let key = MorphKey::from_bytes(key);
+            for profile in [Profile::Quiet, Profile::Balanced, Profile::Paranoid] {
+                let Ok(profile_epoch) = current_epoch(profile) else {
+                    continue;
+                };
+                let route = MorphRoute {
+                    public_key,
+                    key: key.clone(),
+                    profile,
+                };
+                for accepted in accepted_epochs(profile_epoch) {
+                    let tag =
+                        routing_tag_at(&route.key, profile, Direction::ClientToServer, accepted);
+                    if self.ambiguous.contains(&tag) {
+                        continue;
+                    }
+                    match self.routes.entry(tag) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(route.clone());
+                        }
+                        Entry::Occupied(entry) => {
+                            entry.remove();
+                            self.ambiguous.insert(tag);
+                        }
+                    }
+                }
+            }
+        }
+        self.epoch = Some(epoch);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +308,7 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     setsockopt(&socket, RxqOvfl, &1).map_err(io::Error::from)?;
     let sessions: SessionMap = Arc::new(RwLock::new(Sessions::default()));
     let authorized = open_device_registry(config)?;
+    let mut morph_router = MorphRouter::default();
     let traffic = open_traffic_store()?;
     traffic.spawn_flusher(Duration::from_secs(10));
     start_admin_if_configured(config, &authorized, &traffic)?;
@@ -171,7 +325,12 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
     let mut last_rx_overflow = 0_u32;
     // Reused across packets so the steady-state receive path never allocates.
     let mut plaintext = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
-    let mut response = Vec::with_capacity(usize::from(config.tun.mtu) + 128);
+    let mut keepalive = KeepaliveBuffers {
+        plaintext: Vec::with_capacity(128),
+        response: Vec::with_capacity(128),
+        wire_response: Vec::with_capacity(256),
+    };
+    let mut morph_payload = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
     loop {
         check_tun_worker(&tun_worker)?;
         match receive_batch(&socket, &mut buffers, &mut headers, &mut received) {
@@ -189,20 +348,21 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
                 peer,
                 rx_overflow,
             } = received;
-            if let Some(rx_overflow) = rx_overflow {
-                if rx_overflow > last_rx_overflow {
-                    eprintln!(
-                        "MouseVPN UDP receive queue dropped {} datagrams (total {rx_overflow})",
-                        rx_overflow - last_rx_overflow
-                    );
-                    last_rx_overflow = rx_overflow;
-                }
-            }
+            record_rx_overflow(rx_overflow, &mut last_rx_overflow);
             let buffer = &buffers[index][..length];
-            if !looks_like_protocol_datagram(buffer) {
+            let Some(wire) = decode_wire_into(
+                buffer,
+                config,
+                &authorized,
+                &mut morph_router,
+                &mut morph_payload,
+            ) else {
+                continue;
+            };
+            if !looks_like_protocol_datagram(&morph_payload) {
                 continue;
             }
-            let Ok(datagram) = Datagram::decode(buffer) else {
+            let Ok(datagram) = Datagram::decode(&morph_payload) else {
                 continue;
             };
             match datagram.header.kind {
@@ -217,26 +377,56 @@ pub fn run(config: &ValidatedServerConfig) -> Result<(), ServerDaemonError> {
                             traffic: &traffic,
                             sessions: &sessions,
                         },
+                        &wire,
                         &mut handshake_cache,
                     );
                 }
                 PacketKind::Data => {
-                    handle_client_data(peer, datagram, &sessions, &tun, &mut plaintext);
+                    handle_client_data(peer, datagram, &wire, &sessions, &tun, &mut plaintext);
                 }
                 PacketKind::Keepalive => {
-                    handle_keepalive(
-                        &socket,
-                        peer,
-                        datagram,
-                        &sessions,
-                        &mut plaintext,
-                        &mut response,
-                    );
+                    handle_keepalive(&socket, peer, datagram, &wire, &sessions, &mut keepalive);
                 }
                 _ => {}
             }
         }
     }
+}
+
+fn record_rx_overflow(observed: Option<u32>, previous: &mut u32) {
+    let Some(observed) = observed.filter(|observed| observed > previous) else {
+        return;
+    };
+    eprintln!(
+        "MouseVPN UDP receive queue dropped {} datagrams (total {observed})",
+        observed - *previous
+    );
+    *previous = observed;
+}
+
+fn decode_wire_into(
+    input: &[u8],
+    config: &ValidatedServerConfig,
+    authorized: &SharedDeviceRegistry,
+    router: &mut MorphRouter,
+    output: &mut Vec<u8>,
+) -> Option<WireMode> {
+    let Some(route) = router.resolve(input, config, authorized) else {
+        output.clear();
+        output.extend_from_slice(input);
+        return Some(WireMode::Legacy);
+    };
+    let codec = MorphCodec::new(route.key.clone(), route.profile);
+    let Ok(frame) = codec.decode(input, Direction::ClientToServer, output) else {
+        return None;
+    };
+    let DecodedFrame::Payload { profile } = frame else {
+        return None;
+    };
+    Some(WireMode::Morph {
+        client_public_key: route.public_key,
+        codec: MorphCodec::new(route.key, profile),
+    })
 }
 
 fn receive_batch(
@@ -339,9 +529,9 @@ fn handle_keepalive(
     socket: &UdpSocket,
     peer: SocketAddr,
     datagram: Datagram<'_>,
+    wire: &WireMode,
     sessions: &SessionMap,
-    plaintext: &mut Vec<u8>,
-    response: &mut Vec<u8>,
+    buffers: &mut KeepaliveBuffers,
 ) {
     let Some(session) = find_session_by_id(sessions, datagram.header.session_id) else {
         return;
@@ -349,12 +539,15 @@ fn handle_keepalive(
     if !session.authorization.is_active() {
         return;
     }
+    if !session.wire.matches(wire) {
+        return;
+    }
     {
         let Ok(mut inbound) = session.inbound.lock() else {
             return;
         };
         if !matches!(
-            inbound.decode_into(datagram, plaintext),
+            inbound.decode_into(datagram, &mut buffers.plaintext),
             Ok(Decoded::Keepalive)
         ) {
             return;
@@ -365,11 +558,21 @@ fn handle_keepalive(
         let Ok(mut outbound) = session.outbound.lock() else {
             return;
         };
-        if outbound.encode_keepalive_into(response).is_err() {
+        if outbound
+            .encode_keepalive_into(&mut buffers.response)
+            .is_err()
+        {
             return;
         }
     }
-    let _ = socket.send_to(response, peer);
+    if session
+        .wire
+        .encode_server(&buffers.response, &mut buffers.wire_response)
+        .is_err()
+    {
+        return;
+    }
+    let _ = socket.send_to(&buffers.wire_response, peer);
 }
 
 fn handle_handshake(
@@ -377,6 +580,7 @@ fn handle_handshake(
     peer: SocketAddr,
     datagram: Datagram<'_>,
     services: HandshakeServices<'_>,
+    wire: &WireMode,
     cache: &mut HashMap<PublicKey, CachedHandshake>,
 ) {
     let Ok(mut handshake) = ServerHandshake::new(
@@ -391,6 +595,9 @@ fn handle_handshake(
     let Some(public_key) = handshake.peer_static_key() else {
         return;
     };
+    if !wire.allows_client(&public_key) {
+        return;
+    }
     let Some(client) = services.authorized.authorize(&public_key) else {
         return;
     };
@@ -400,26 +607,29 @@ fn handle_handshake(
     // existing session alive instead of replacing it with unusable keys.
     if let Some(cached) = cache.get(&public_key) {
         if cached.request == datagram.payload {
-            let _ = socket.send_to(&cached.response, peer);
+            let mut wire_response = Vec::with_capacity(cached.response.len() + 128);
+            if wire
+                .encode_server(&cached.response, &mut wire_response)
+                .is_ok()
+            {
+                let _ = socket.send_to(&wire_response, peer);
+            }
             return;
         }
     }
 
+    let session_mtu = wire.session_mtu(services.config.tun.mtu);
     let parameters = SessionParameters {
         client_address: client.address,
         prefix_len: services.config.tun.prefix_len,
-        mtu: services.config.tun.mtu,
+        mtu: session_mtu,
         dns: services.config.tun.dns,
     };
     let Ok((crypto, response)) = handshake.finish(&parameters.encode()) else {
         return;
     };
-    let (sender, receiver) = TunnelDataPlane::new(
-        datagram.header.session_id,
-        usize::from(services.config.tun.mtu),
-        crypto,
-    )
-    .split();
+    let (sender, receiver) =
+        TunnelDataPlane::new(datagram.header.session_id, usize::from(session_mtu), crypto).split();
     let session = Arc::new(RuntimeSession {
         client_address: client.address,
         authorization: client.authorization,
@@ -429,6 +639,7 @@ fn handle_handshake(
         peer: RwLock::new(peer),
         inbound: Mutex::new(receiver),
         outbound: Mutex::new(sender),
+        wire: wire.clone(),
         last_peer_log: Mutex::new(None),
     });
 
@@ -445,7 +656,11 @@ fn handle_handshake(
         sequence: 0,
     };
     let encoded = Datagram::new(header, &response).encode();
-    let _ = socket.send_to(&encoded, peer);
+    let mut wire_encoded = Vec::with_capacity(encoded.len() + 128);
+    if wire.encode_server(&encoded, &mut wire_encoded).is_err() {
+        return;
+    }
+    let _ = socket.send_to(&wire_encoded, peer);
     cache.insert(
         public_key,
         CachedHandshake {
@@ -459,6 +674,7 @@ fn handle_handshake(
 fn handle_client_data(
     peer: SocketAddr,
     datagram: Datagram<'_>,
+    wire: &WireMode,
     sessions: &SessionMap,
     tun: &LinuxTun,
     plaintext: &mut Vec<u8>,
@@ -467,6 +683,9 @@ fn handle_client_data(
         return;
     };
     if !session.authorization.is_active() {
+        return;
+    }
+    if !session.wire.matches(wire) {
         return;
     }
     let packet = {
@@ -510,6 +729,9 @@ fn run_tun_worker(tun: &LinuxTun, socket: &UdpSocket, sessions: &SessionMap) -> 
         .map(|_| vec![0_u8; DATAGRAM_BUFFER_LEN])
         .collect();
     let mut datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
+        .map(|_| Vec::with_capacity(DATAGRAM_BUFFER_LEN))
+        .collect();
+    let mut wire_datagrams: Vec<Vec<u8>> = (0..UDP_BATCH_SIZE)
         .map(|_| Vec::with_capacity(DATAGRAM_BUFFER_LEN))
         .collect();
     let mut packet_lengths = [0_usize; UDP_BATCH_SIZE];
@@ -568,6 +790,16 @@ fn run_tun_worker(tun: &LinuxTun, socket: &UdpSocket, sessions: &SessionMap) -> 
                     continue;
                 }
             }
+            if session
+                .wire
+                .encode_server(
+                    &datagrams[datagram_count],
+                    &mut wire_datagrams[datagram_count],
+                )
+                .is_err()
+            {
+                continue;
+            }
             peers.push(peer);
             traffic.push(Arc::clone(&session.traffic));
             payload_lengths.push(ip.as_bytes().len() as u64);
@@ -580,7 +812,7 @@ fn run_tun_worker(tun: &LinuxTun, socket: &UdpSocket, sessions: &SessionMap) -> 
         let sent = send_server_batch(
             socket,
             &mut send_headers,
-            &datagrams,
+            &wire_datagrams,
             &peers,
             datagram_count,
         )?;
@@ -783,7 +1015,15 @@ mod admin_listener_tests {
         sync::mpsc,
     };
 
-    use super::{admin_listener_allowed, check_tun_worker, is_recoverable};
+    use mousevpn_admin_api::{SeedDevice, SharedDeviceRegistry};
+    use mousevpn_config::{ServerTunConfig, ValidatedAuthorizedClient, ValidatedServerConfig};
+    use mousevpn_crypto::{derive_morph_key, KeyPair, ProtocolContext};
+    use mousevpn_morph::{DecodedFrame, Direction, MorphCodec, MorphKey, Profile};
+
+    use super::{
+        admin_listener_allowed, check_tun_worker, decode_wire_into, is_recoverable, MorphRouter,
+        WireMode,
+    };
 
     #[test]
     fn public_admin_listener_requires_explicit_opt_in() {
@@ -828,5 +1068,87 @@ mod admin_listener_tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(sender);
         assert!(check_tun_worker(&receiver).is_err());
+    }
+
+    #[test]
+    fn router_resolves_every_profile_without_a_global_marker() {
+        let server = KeyPair::generate().expect("server keys");
+        let client = KeyPair::generate().expect("client keys");
+        let server_public = server.public;
+        let client_public = client.public;
+        let config = ValidatedServerConfig {
+            listen: "127.0.0.1:51820".parse().expect("listen"),
+            public_endpoint: None,
+            server_public_key: server_public,
+            server_private_key: server.secret,
+            context: ProtocolContext::for_server(&server_public),
+            tun: ServerTunConfig {
+                name: "mousevpn0".to_owned(),
+                address: Ipv4Addr::new(10, 77, 0, 1),
+                prefix_len: 24,
+                mtu: 1_420,
+                dns: Ipv4Addr::new(1, 1, 1, 1),
+            },
+            clients: vec![ValidatedAuthorizedClient {
+                name: "owner".to_owned(),
+                public_key: client_public,
+                address: Ipv4Addr::new(10, 77, 0, 2),
+            }],
+        };
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = SharedDeviceRegistry::open(
+            directory.path().join("devices.toml"),
+            vec![SeedDevice {
+                name: "owner".to_owned(),
+                public_key: client_public,
+                address: Ipv4Addr::new(10, 77, 0, 2),
+            }],
+            config.tun.address,
+            config.tun.prefix_len,
+        )
+        .expect("registry");
+        let key = derive_morph_key(
+            &client.secret,
+            &server_public,
+            &server_public,
+            &client_public,
+        )
+        .expect("client morph key");
+        let mut router = MorphRouter::default();
+
+        for profile in [Profile::Quiet, Profile::Balanced, Profile::Paranoid] {
+            let codec = MorphCodec::new(MorphKey::from_bytes(key), profile);
+            let mut encoded = Vec::new();
+            codec
+                .encode_payload(b"legacy packet", Direction::ClientToServer, &mut encoded)
+                .expect("encode");
+            let route = router.resolve(&encoded, &config, &registry).expect("route");
+            assert_eq!(route.public_key, client_public);
+            assert_eq!(route.profile, profile);
+            let codec = MorphCodec::new(route.key, route.profile);
+            let mut plaintext = Vec::new();
+            assert_eq!(
+                codec
+                    .decode(&encoded, Direction::ClientToServer, &mut plaintext)
+                    .expect("decode"),
+                DecodedFrame::Payload { profile }
+            );
+            assert_eq!(plaintext, b"legacy packet");
+        }
+        assert!(router
+            .resolve(
+                b"legacy datagram without a matching tag",
+                &config,
+                &registry
+            )
+            .is_none());
+
+        let legacy = b"legacy datagram without a matching tag";
+        let mut decoded = Vec::new();
+        assert!(matches!(
+            decode_wire_into(legacy, &config, &registry, &mut router, &mut decoded),
+            Some(WireMode::Legacy)
+        ));
+        assert_eq!(decoded, legacy);
     }
 }

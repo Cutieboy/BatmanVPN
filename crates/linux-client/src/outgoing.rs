@@ -13,6 +13,8 @@ use mousevpn_linux_platform::LinuxTun;
 use mousevpn_transport::{UdpBatch, UdpTransport};
 use nix::poll::{poll, PollFd, PollFlags};
 
+use mousevpn_client_wire::ClientWire;
+
 use crate::{
     error::{is_peer_unavailable, is_retryable_network},
     ClientError,
@@ -38,11 +40,15 @@ pub(crate) fn run(
     transport: &mut UdpTransport,
     stopping: &Arc<AtomicBool>,
     reconnect: &ReconnectControl,
+    wire: &ClientWire,
 ) -> Result<(), ClientError> {
     let mut packets: Vec<Vec<u8>> = (0..BATCH_SIZE)
         .map(|_| vec![0_u8; PACKET_BUFFER_LEN])
         .collect();
     let mut datagrams: Vec<Vec<u8>> = (0..BATCH_SIZE)
+        .map(|_| Vec::with_capacity(PACKET_BUFFER_LEN))
+        .collect();
+    let mut wire_datagrams: Vec<Vec<u8>> = (0..BATCH_SIZE)
         .map(|_| Vec::with_capacity(PACKET_BUFFER_LEN))
         .collect();
     let mut drops = Drops::default();
@@ -102,7 +108,10 @@ pub(crate) fn run(
         if encoded == 0 {
             continue;
         }
-        match transport.send_batch_with(&datagrams[..encoded], &mut udp_batch) {
+        for index in 0..encoded {
+            wire.encode(&datagrams[index], &mut wire_datagrams[index])?;
+        }
+        match transport.send_batch_with(&wire_datagrams[..encoded], &mut udp_batch) {
             Ok(sent) if sent == encoded => {}
             Ok(sent) => drops.record(&format_args!(
                 "UDP send queue accepted {sent} of {encoded} batched packets"

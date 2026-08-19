@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use mousevpn_config::{ClientConfig, ValidatedClientConfig};
+use mousevpn_config::{ClientConfig, ClientProtocol, ValidatedClientConfig};
 use mousevpn_data_plane::{
     looks_like_protocol_datagram, Decoded, TunnelReceiver, TunnelSender, TUNNEL_OVERHEAD,
 };
@@ -90,6 +90,7 @@ impl AppleSession {
             server_public_key,
             client_private_key,
             tun_name: "utun".to_owned(),
+            protocol: ClientProtocol::Legacy,
         }
         .validate()?;
         Self::connect_validated(&config, local_address)

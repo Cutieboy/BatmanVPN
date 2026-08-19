@@ -79,6 +79,22 @@
           </div>
         </section>
 
+        <section id="protocolSelector" class="protocol-card hidden">
+          <div class="protocol-copy">
+            <span class="eyebrow">ПРОТОКОЛ</span>
+            <strong>Режим маскировки</strong>
+            <small id="protocolHint">Обычный MouseVPN для старых клиентов</small>
+          </div>
+          <label class="protocol-select-label" for="protocolMode">
+            <select id="protocolMode" aria-label="Режим маскировки">
+              <option value="legacy">Legacy — совместимый</option>
+              <option value="morph_quiet">Morph Quiet — экономный</option>
+              <option value="morph_balanced">Morph Balanced — усиленный</option>
+              <option value="morph_paranoid">Morph Paranoid — максимальный</option>
+            </select>
+          </label>
+        </section>
+
         <section class="stats-card">
           <div class="stat">
             <span class="stat-icon">◈</span>

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use wintun::Adapter;
 
@@ -50,7 +51,8 @@ pub fn run_with_stop(
         }
     };
 
-    let (incoming, plane, mut parameters) = connect(config)?;
+    let wire = ClientWire::from_config(config)?;
+    let (incoming, plane, mut parameters) = connect(config, &wire)?;
     incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
     let outgoing = incoming.try_clone()?;
     let wintun_path = materialize_wintun()?;
@@ -91,6 +93,7 @@ pub fn run_with_stop(
             &session,
             stopping,
             &mut network,
+            &wire,
         );
         let _ = session.shutdown();
         if stopping.load(Ordering::Acquire) {
@@ -119,7 +122,7 @@ pub fn run_with_stop(
             }
 
             let attempt: Result<_, ClientError> = (|| {
-                let (next_incoming, next_plane, next_parameters) = connect(config)?;
+                let (next_incoming, next_plane, next_parameters) = connect(config, &wire)?;
                 next_incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
                 let next_outgoing = next_incoming.try_clone()?;
                 adapter
