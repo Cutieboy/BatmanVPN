@@ -15,5 +15,5 @@ cd "$repo_root"
 rustup target add "$target"
 cargo xwin build -p mousevpn-windows-gui --target "$target" --release
 mkdir -p "$dist"
-cp "$artifact" "$dist/MouseVPN_0.1.16_windows_x64.exe"
-sha256sum "$dist/MouseVPN_0.1.16_windows_x64.exe"
+cp "$artifact" "$dist/MouseVPN_0.1.17_windows_x64.exe"
+sha256sum "$dist/MouseVPN_0.1.17_windows_x64.exe"

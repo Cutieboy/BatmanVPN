@@ -12,8 +12,8 @@ android {
         applicationId = "dev.mousevpn.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.1.11"
+        versionCode = 14
+        versionName = "0.1.13"
     }
 
     buildTypes {
@@ -57,3 +57,7 @@ val buildRust by tasks.registering(Exec::class) {
 }
 
 tasks.named("preBuild").configure { dependsOn(buildRust) }
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}

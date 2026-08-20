@@ -1,6 +1,6 @@
 [package]
 name = "mousevpn-windows-gui"
-version = "0.1.16"
+version = "0.1.17"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -23,6 +23,9 @@ tauri = { version = "2.11.5", features = ["tray-icon"] }
 toml = "1.0"
 uuid = { version = "1.18", features = ["v4"] }
 zeroize = "1.8"
+
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-single-instance = "2.4.3"
 
 [lints]
 workspace = true

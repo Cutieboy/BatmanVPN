@@ -44,6 +44,8 @@ protocol implementation.
   runtime after an unexpected fatal packet-path error;
 - keeps running in the Windows notification area when its main window is
   closed, with show, connect/disconnect and quit actions;
+- prevents duplicate GUI processes and reveals the existing window when the
+  application is launched a second time;
 - can register an elevated Task Scheduler logon task and start minimized in
   the notification area without showing a UAC prompt on every launch;
 - starts the tunnel helper and Windows networking commands without visible
@@ -86,7 +88,7 @@ Cross-build a release EXE on Linux with:
 ./windows-gui/build-windows.sh
 ```
 
-The artifact is written to `windows-gui/dist/MouseVPN-windows-x64.exe`.
+The versioned artifact is written to `windows-gui/dist`.
 
 Release builds contain a `requireAdministrator` application manifest. The
 NSIS/MSI configuration downloads the Microsoft WebView2 bootstrapper when the

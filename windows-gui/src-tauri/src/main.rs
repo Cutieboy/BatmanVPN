@@ -531,7 +531,17 @@ fn display_error(error: impl std::fmt::Display) -> String {
 }
 
 fn run_gui(minimized: bool) {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(
+        |app, arguments, _working_directory| {
+            if should_reveal_existing_instance(&arguments) {
+                reveal_main_window(app);
+            }
+        },
+    ));
+
+    builder
         .manage(AppState::default())
         .setup(move |app| {
             tray::install(app)?;
@@ -574,6 +584,20 @@ fn run_gui(minimized: bool) {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MouseVPN Windows GUI");
+}
+
+#[cfg(any(windows, test))]
+fn should_reveal_existing_instance(arguments: &[String]) -> bool {
+    !arguments.iter().any(|argument| argument == "--minimized")
+}
+
+#[cfg(windows)]
+fn reveal_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 fn main() {
@@ -629,7 +653,20 @@ mod helper_status_tests {
         sync::{atomic::AtomicU64, Arc, Mutex},
     };
 
-    use super::{autostart_command, read_helper_status, ConnectionSnapshot};
+    use super::{
+        autostart_command, read_helper_status, should_reveal_existing_instance, ConnectionSnapshot,
+    };
+
+    #[test]
+    fn duplicate_manual_launch_reveals_the_existing_window() {
+        assert!(should_reveal_existing_instance(&[
+            r"C:\Program Files\MouseVPN\MouseVPN.exe".to_owned()
+        ]));
+        assert!(!should_reveal_existing_instance(&[
+            r"C:\Program Files\MouseVPN\MouseVPN.exe".to_owned(),
+            "--minimized".to_owned(),
+        ]));
+    }
 
     #[test]
     fn autostart_quotes_the_executable_and_starts_minimized() {

@@ -292,7 +292,9 @@ class MainActivity : Activity() {
         )
         statusText.text = when {
             connected -> message
-            connecting -> getString(R.string.status_connecting_hint)
+            connecting && message == MouseVpnService.STATUS_CONNECTING ->
+                getString(R.string.status_connecting_hint)
+            connecting -> message
             message.startsWith("Ошибка") || message == "Соединение потеряно" -> message
             else -> getString(R.string.status_off_hint)
         }

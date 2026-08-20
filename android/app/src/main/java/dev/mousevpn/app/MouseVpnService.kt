@@ -41,8 +41,7 @@ class MouseVpnService : VpnService() {
         }
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            underlyingNetworks[network] = networkState(capabilities)
-            if (refreshUnderlyingNetwork()) signalNetworkChange()
+            if (updateUnderlyingNetwork(network, capabilities)) signalNetworkChange()
         }
 
         override fun onLost(network: Network) {
@@ -61,11 +60,16 @@ class MouseVpnService : VpnService() {
         super.onCreate()
         diagnostics = DiagnosticStore(this)
         val connectivity = getSystemService(ConnectivityManager::class.java)
-        // Seed the physical route synchronously. NetworkCallback delivers its
-        // initial onAvailable asynchronously; starting the handshake first made
-        // that initial callback look like roaming and needlessly replaced a
-        // healthy UDP socket a few milliseconds after connection setup.
-        connectivity.activeNetwork?.let(::updateUnderlyingNetwork)
+        // Seed every physical route synchronously. `activeNetwork` may itself be
+        // another VPN, and binding MouseVPN's transport socket to it is rejected
+        // by some Android vendors before the callback delivers the real route.
+        @Suppress("DEPRECATION")
+        val availableNetworks = connectivity.allNetworks
+        availableNetworks.forEach { network ->
+            connectivity.getNetworkCapabilities(network)?.let { capabilities ->
+                updateUnderlyingNetwork(network, capabilities)
+            }
+        }
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -78,7 +82,7 @@ class MouseVpnService : VpnService() {
             disconnect()
             return START_NOT_STICKY
         }
-        startForeground(VpnNotification.ID, VpnNotification.create(this, "Подключение…"))
+        startForeground(VpnNotification.ID, VpnNotification.create(this, STATUS_CONNECTING))
         if (task?.isDone != false) {
             stopRequested = false
             val generation = connectionGeneration.incrementAndGet()
@@ -89,9 +93,15 @@ class MouseVpnService : VpnService() {
 
     private fun runConnectionLoop(generation: Long) {
         val backoff = ReconnectBackoff()
+        val initialBudget = InitialConnectBudget(MAX_INITIAL_CONNECT_ATTEMPTS)
         while (isAttemptActive(generation)) {
             val result = connectOnce(generation)
             if (!isAttemptActive(generation) || result.outcome == AttemptOutcome.STOPPED) {
+                return
+            }
+            if (result.connectedForMs > 0L) initialBudget.recordConnected()
+            if (result.outcome == AttemptOutcome.SETUP_FAILED && initialBudget.recordFailure()) {
+                showFinalConnectionError(result.detail, initialBudget.failures)
                 return
             }
             if (result.connectedForMs >= RECONNECT_BACKOFF_RESET_MS) backoff.reset()
@@ -102,7 +112,20 @@ class MouseVpnService : VpnService() {
                 else -> backoff.nextDelayMs()
             }
             if (delay > 0L) {
-                val status = "Подключение… повтор через ${delay / 1_000} с"
+                val status = if (result.outcome == AttemptOutcome.SETUP_FAILED) {
+                    buildString {
+                        append(STATUS_CONNECTING)
+                        append(' ')
+                        append(result.detail ?: "Неизвестная ошибка")
+                        append(". Повтор через ${delay / 1_000} с")
+                        if (!initialBudget.connected) {
+                            append(" (попытка ${initialBudget.failures + 1}")
+                            append(" из $MAX_INITIAL_CONNECT_ATTEMPTS)")
+                        }
+                    }
+                } else {
+                    "$STATUS_CONNECTING Повтор через ${delay / 1_000} с"
+                }
                 broadcast(status)
                 getSystemService(android.app.NotificationManager::class.java)
                     .notify(VpnNotification.ID, VpnNotification.create(this, status))
@@ -120,7 +143,7 @@ class MouseVpnService : VpnService() {
             // physical network. A later callback sets the flag again if the route
             // changes while setup is in flight.
             networkRestartRequested.set(false)
-            broadcast("Подключение…")
+            broadcast(STATUS_CONNECTING)
             val profile = requireNotNull(ProfileStore(this).selected()) { "Сначала вставьте профиль" }
             diagnosticSessionId = runCatching {
                 diagnostics.begin(profile, underlyingNetwork)
@@ -182,9 +205,10 @@ class MouseVpnService : VpnService() {
             connectedSinceElapsedRealtime = 0L
             return AttemptResult(AttemptOutcome.STOPPED, elapsedSince(connectedAt))
         } catch (error: Exception) {
+            val detail = connectionErrorDetail(error.message)
             finishDiagnostics(
                 "connection_error",
-                error.message ?: error.javaClass.simpleName,
+                detail,
                 handle,
             )
             if (handle != 0L) NativeBridge.stop(handle)
@@ -193,6 +217,7 @@ class MouseVpnService : VpnService() {
             return AttemptResult(
                 AttemptOutcome.SETUP_FAILED,
                 connectedForMs = elapsedSince(connectedAt),
+                detail = detail,
             )
         } finally {
             descriptor?.close()
@@ -208,6 +233,17 @@ class MouseVpnService : VpnService() {
             Thread.currentThread().interrupt()
             false
         }
+    }
+
+    private fun showFinalConnectionError(detail: String?, attempts: Int) {
+        val status = buildString {
+            append("Ошибка подключения: ")
+            append(detail ?: "Не удалось связаться с сервером")
+            append(" ($attempts попытки)")
+        }
+        broadcast(status)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun isAttemptActive(generation: Long): Boolean =
@@ -413,25 +449,52 @@ class MouseVpnService : VpnService() {
      * socket, so a failed race with a disappearing network is retried safely.
      */
     fun protectAndBindSocket(socketFd: Int): Boolean {
-        if (!protect(socketFd)) return false
+        if (!protect(socketFd)) {
+            Log.e(LOG_TAG, "VpnService.protect rejected UDP socket $socketFd")
+            return false
+        }
         val network = synchronized(this) { selectedUnderlyingNetwork } ?: return true
-        return runCatching {
+        return try {
             ParcelFileDescriptor.fromFd(socketFd).use { descriptor ->
                 network.bindSocket(descriptor.fileDescriptor)
             }
             true
-        }.getOrDefault(false)
+        } catch (error: Exception) {
+            // `protect` prevents a VPN routing loop. Binding merely pins that
+            // protected socket to the preferred physical route. Some vendor
+            // firmwares reject bindSocket during transitions; the system's
+            // physical default route remains a safe fallback.
+            Log.w(LOG_TAG, "Unable to bind protected UDP socket; using default route", error)
+            true
+        }
     }
 
     private fun updateUnderlyingNetwork(network: Network): Boolean {
         val capabilities = getSystemService(ConnectivityManager::class.java)
             .getNetworkCapabilities(network)
-        if (capabilities != null) {
-            underlyingNetworks[network] = networkState(capabilities)
-            return refreshUnderlyingNetwork()
+        return if (capabilities != null) {
+            updateUnderlyingNetwork(network, capabilities)
+        } else {
+            underlyingNetworks.remove(network)
+            refreshUnderlyingNetwork()
         }
-        return false
     }
+
+    private fun updateUnderlyingNetwork(
+        network: Network,
+        capabilities: NetworkCapabilities,
+    ): Boolean {
+        if (isPhysicalInternet(capabilities)) {
+            underlyingNetworks[network] = networkState(capabilities)
+        } else {
+            underlyingNetworks.remove(network)
+        }
+        return refreshUnderlyingNetwork()
+    }
+
+    private fun isPhysicalInternet(capabilities: NetworkCapabilities): Boolean =
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
 
     @Synchronized
     private fun refreshUnderlyingNetwork(): Boolean {
@@ -546,7 +609,10 @@ class MouseVpnService : VpnService() {
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
         private const val DIAGNOSTIC_CHECKPOINT_MS = 60_000L
         private const val RECONNECT_BACKOFF_RESET_MS = 60_000L
+        private const val MAX_INITIAL_CONNECT_ATTEMPTS = 3
         private const val LOG_TAG = "MouseVpnService"
+
+        const val STATUS_CONNECTING = "Подключение…"
 
         const val ACTION_CONNECT = "dev.mousevpn.app.CONNECT"
         const val ACTION_DISCONNECT = "dev.mousevpn.app.DISCONNECT"
@@ -565,6 +631,7 @@ class MouseVpnService : VpnService() {
     private data class AttemptResult(
         val outcome: AttemptOutcome,
         val connectedForMs: Long,
+        val detail: String? = null,
     )
 
     private enum class AttemptOutcome {
