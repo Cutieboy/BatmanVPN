@@ -1,9 +1,8 @@
-#![cfg_attr(not(windows), allow(dead_code))]
-
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::Ipv4Addr,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -12,21 +11,25 @@ use std::{
 use fs2::FileExt;
 use mousevpn_protocol::SessionParameters;
 use serde::{Deserialize, Serialize};
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
 use crate::{
     app_bypass::{AppBypassGuard, AppBypassRefresher},
+    netcfg::{self, OwnedRoute},
     AppRoutingMode, AppRoutingPolicy, ClientError,
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+pub(crate) use crate::netcfg::PhysicalAddresses;
 
 pub(crate) const ADAPTER_NAME: &str = "MouseVPN";
 const FIREWALL_GROUP: &str = "MouseVPN Kill Switch";
-const ROUTE_METRIC: u16 = 4242;
 const STATE_FILE: &str = "network-state.toml";
-#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The two halves of the default route the tunnel installs. Two `/1` routes
+/// beat a physical `0.0.0.0/0` on prefix length without replacing it, so the
+/// original default route survives for the tunnel endpoint itself.
+const TUNNEL_HALVES: [Ipv4Addr; 2] = [Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)];
 
 pub(crate) struct RuntimeLock {
     _file: File,
@@ -88,39 +91,13 @@ impl NetworkGuard {
         let state = RecoveryState { server_ip };
         let state_path = state_path()?;
         write_state(&state_path, &state)?;
-        let prefixes = blocked_ipv4_prefixes(server_ip).join("','");
-        let firewall = firewall_script(app_routing, false);
-        let script = format!(
-            "$ErrorActionPreference='Stop'; \
-             $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
-             $blocked=@('{prefixes}'); \
-             $physical=Get-NetAdapter | Where-Object {{$_.Name -ne '{ADAPTER_NAME}' -and $_.InterfaceDescription -notmatch 'Loopback'}}; \
-             {firewall}; \
-             $up=@(Get-NetAdapter | Where-Object {{$_.Status -eq 'Up'}}).ifIndex; \
-             $default=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {{$_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -ne $vpn.ifIndex -and $up -contains $_.InterfaceIndex}} | Sort-Object RouteMetric | Select-Object -First 1; \
-             if (-not $default) {{ throw 'No active physical IPv4 default route found' }}; \
-             Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false; \
-             Set-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1; \
-             New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} | Out-Null; \
-             try {{ \
-               $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
-               if ($profile -and $profile.NetworkCategory -ne 'Public') {{Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction Stop}} \
-             }} catch {{Write-Warning ('Could not mark MouseVPN as a Public network: '+$_.Exception.Message)}}; \
-             Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}'; \
-             New-NetRoute -DestinationPrefix '{server_ip}/32' -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null; \
-             New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $vpn.ifIndex -NextHop '0.0.0.0' -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null; \
-             New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $vpn.ifIndex -NextHop '0.0.0.0' -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null; \
-             Write-Output 'MouseVPN network policy installed for {server_ip}:{server_port}'",
-            parameters.client_address,
-            parameters.prefix_len,
-            parameters.dns,
-        );
-        if let Err(error) = run_powershell(&script, "install the Windows network policy") {
-            if cleanup(Some(server_ip)).is_ok() {
+        if let Err(error) = install_policy(server_ip, parameters, app_routing) {
+            if cleanup().is_ok() {
                 let _ = fs::remove_file(&state_path);
             }
             return Err(error);
         }
+        eprintln!("MOUSEVPN_POLICY=installed for {server_ip}:{server_port}");
         Ok(Self {
             state,
             state_path,
@@ -141,41 +118,22 @@ impl NetworkGuard {
         let _guard = self.refresh_lock.lock().map_err(|_| {
             ClientError::Platform("Windows network policy refresh lock was poisoned".to_owned())
         })?;
+        let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
         let previous = self.parameters;
-        let script = format!(
-            "$ErrorActionPreference='Stop'; \
-             $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
-             try {{ \
-               Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop; \
-               New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} -ErrorAction Stop | Out-Null; \
-               Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}' -ErrorAction Stop \
-             }} catch {{ \
-               $applyError=$_.Exception.Message; \
-               Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; \
-               New-NetIPAddress -InterfaceIndex $vpn.ifIndex -IPAddress '{}' -PrefixLength {} -ErrorAction Stop | Out-Null; \
-               Set-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ServerAddresses '{}' -ErrorAction Stop; \
-               throw ('updating MouseVPN session parameters failed: '+$applyError) \
-             }}",
-            parameters.client_address,
-            parameters.prefix_len,
-            parameters.dns,
-            previous.client_address,
-            previous.prefix_len,
-            previous.dns,
-        );
-        run_powershell(&script, "update the Windows tunnel parameters")?;
+        if let Err(error) = apply_parameters(tunnel, parameters) {
+            // Fall back to what the tunnel was already using so the interface
+            // never sits without an address, then report the original failure.
+            apply_parameters(tunnel, previous)?;
+            return Err(ClientError::Platform(format!(
+                "updating MouseVPN session parameters failed: {error}"
+            )));
+        }
         self.parameters = parameters;
         Ok(())
     }
 
     pub(crate) fn refresh(&self) -> Result<(), ClientError> {
-        NetworkRefresher {
-            server_ip: self.state.server_ip,
-            refresh_lock: Arc::clone(&self.refresh_lock),
-            app_routing: self.app_routing.clone(),
-            app_bypass: self.app_bypass.as_ref().map(AppBypassGuard::refresher),
-        }
-        .refresh()
+        self.refresher().refresh()
     }
 
     pub(crate) fn refresher(&self) -> NetworkRefresher {
@@ -193,6 +151,8 @@ impl NetworkRefresher {
         let _guard = self.refresh_lock.lock().map_err(|_| {
             ClientError::Platform("Windows network policy refresh lock was poisoned".to_owned())
         })?;
+        let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
+        repair_routes(tunnel, self.server_ip)?;
         run_powershell(
             &refresh_script(self.server_ip, &self.app_routing),
             "refresh the Windows network policy",
@@ -204,29 +164,238 @@ impl NetworkRefresher {
     }
 }
 
+fn install_policy(
+    server_ip: Ipv4Addr,
+    parameters: SessionParameters,
+    app_routing: &AppRoutingPolicy,
+) -> Result<(), ClientError> {
+    let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
+    // The kill switch has to be in place before the default route moves, or
+    // traffic leaks over the physical interface during the switchover.
+    run_powershell(
+        &install_script(server_ip, app_routing),
+        "install the Windows kill switch",
+    )?;
+    let default = netcfg::default_ipv4_route(Some(tunnel))?;
+    apply_parameters(tunnel, parameters)?;
+    netcfg::set_tunnel_metric(tunnel)?;
+    netcfg::add_route(default.interface_luid, server_ip, 32, default.next_hop)?;
+    for destination in TUNNEL_HALVES {
+        netcfg::add_route(tunnel, destination, 1, Ipv4Addr::UNSPECIFIED)?;
+    }
+    Ok(())
+}
+
+fn apply_parameters(
+    tunnel: NET_LUID_LH,
+    parameters: SessionParameters,
+) -> Result<(), ClientError> {
+    netcfg::set_tunnel_address(tunnel, parameters.client_address, parameters.prefix_len)?;
+    netcfg::set_tunnel_dns(ADAPTER_NAME, parameters.dns)
+}
+
+/// Restores any route the tunnel owns that roaming or another VPN removed.
+fn repair_routes(tunnel: NET_LUID_LH, server_ip: Ipv4Addr) -> Result<(), ClientError> {
+    let tunnel_index = netcfg::interface_index(tunnel)?;
+    let default = netcfg::default_ipv4_route(Some(tunnel))?;
+    let routes = netcfg::owned_routes()?;
+
+    if server_route_is_stale(
+        &routes,
+        server_ip,
+        default.interface_index,
+        default.next_hop,
+    ) {
+        netcfg::remove_owned_routes(|route| is_server_route(route, server_ip))?;
+        netcfg::add_route(default.interface_luid, server_ip, 32, default.next_hop)?;
+    }
+
+    for destination in TUNNEL_HALVES {
+        let present = routes.iter().any(|route| {
+            route.destination == destination
+                && route.prefix_len == 1
+                && route.interface_index == tunnel_index
+        });
+        if !present {
+            netcfg::add_route(tunnel, destination, 1, Ipv4Addr::UNSPECIFIED)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_server_route(route: &OwnedRoute, server_ip: Ipv4Addr) -> bool {
+    route.destination == server_ip && route.prefix_len == 32
+}
+
+/// Reports whether the endpoint route needs replacing.
+///
+/// It is stale when it is missing, duplicated, or points somewhere other than
+/// the current physical default gateway — which is exactly what happens when
+/// the machine roams to another network.
+fn server_route_is_stale(
+    routes: &[OwnedRoute],
+    server_ip: Ipv4Addr,
+    interface_index: u32,
+    next_hop: Ipv4Addr,
+) -> bool {
+    let mut total = 0_usize;
+    let mut matching = 0_usize;
+    for route in routes.iter().filter(|route| is_server_route(route, server_ip)) {
+        total += 1;
+        if route.interface_index == interface_index && route.next_hop == next_hop {
+            matching += 1;
+        }
+    }
+    total != 1 || matching != 1
+}
+
+impl Drop for NetworkGuard {
+    fn drop(&mut self) {
+        if cleanup().is_ok() {
+            let _ = fs::remove_file(&self.state_path);
+        }
+    }
+}
+
+pub(crate) fn recover_stale_state() -> Result<(), ClientError> {
+    let path = state_path()?;
+    if !path.exists() {
+        // Policy is only ever written after the recovery journal exists, so a
+        // missing journal and a missing interface together mean the machine is
+        // already clean. Skipping cleanup here keeps a full PowerShell start-up
+        // off every normal connection.
+        if !netcfg::interface_exists(ADAPTER_NAME) {
+            return Ok(());
+        }
+        cleanup()?;
+        return Ok(());
+    }
+    cleanup()?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn repair() -> Result<(), ClientError> {
+    cleanup()?;
+    match fs::remove_file(state_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn report() -> Result<String, ClientError> {
+    let script = format!(
+        "$vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
+         $routes=@(); $dns=@(); $category=$null; $metric=$null; $bindings=@(); $otherDns=@(); \
+         if ($vpn) {{ \
+           $routes=@(Get-NetRoute -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue | Where-Object {{$_.DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1'}} | Select-Object DestinationPrefix,InterfaceIndex,RouteMetric); \
+           $dns=@((Get-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
+           $metric=(Get-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric; \
+           $category=(Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue).NetworkCategory; \
+           $bindings=@(Get-NetAdapterBinding -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue | Where-Object {{$_.Enabled -and $_.ComponentID -in 'nt_ndisrd','nt_ndiswgc'}} | Select-Object -ExpandProperty ComponentID); \
+           $otherDns=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{$_.ifIndex -ne $vpn.ifIndex -and $_.Status -eq 'Up'}} | ForEach-Object {{ \
+             $adapter=$_; $ip=Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue; $servers=@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
+             if ($servers.Count -gt 0) {{[pscustomobject]@{{interfaceAlias=$adapter.Name; interfaceMetric=$ip.InterfaceMetric; dnsServers=$servers}}}} \
+           }}) \
+         }}; \
+         [ordered]@{{ adapterUp=[bool]($vpn -and $vpn.Status -eq 'Up'); routeCount=$routes.Count; firewallRuleCount=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -Enabled True -ErrorAction SilentlyContinue).Count; dnsServers=$dns; interfaceMetric=$metric; networkCategory=$category; incompatibleBindings=$bindings; otherDnsAdapters=$otherDns; stateJournal=Test-Path '{}'; ipv6DefaultRoutes=@(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue).Count }} | ConvertTo-Json -Depth 4 -Compress",
+        powershell_path(&state_path()?)
+    );
+    run_powershell_output(&script, "collect the Windows network report")
+}
+
+pub(crate) fn physical_addresses() -> Result<PhysicalAddresses, ClientError> {
+    netcfg::physical_addresses(netcfg::interface_luid(ADAPTER_NAME).ok())
+}
+
+fn write_state(path: &Path, state: &RecoveryState) -> Result<(), ClientError> {
+    let contents = toml::to_string(state).map_err(|error| {
+        ClientError::Platform(format!("failed to encode recovery state: {error}"))
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temporary, path)?;
+        Ok::<(), io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(Into::into)
+}
+
+/// Undoes every network change `MouseVPN` can make.
+///
+/// Nothing here depends on the recovery journal: routes are recognised by the
+/// metric and protocol the client always stamps on them, so a session whose
+/// journal was lost still cleans up completely.
+fn cleanup() -> Result<(), ClientError> {
+    let mut failures = Vec::new();
+    if let Ok(tunnel) = netcfg::interface_luid(ADAPTER_NAME) {
+        collect(&mut failures, netcfg::reset_tunnel_dns(ADAPTER_NAME));
+        collect(&mut failures, netcfg::reset_tunnel_metric(tunnel));
+        collect(&mut failures, netcfg::clear_addresses(tunnel));
+    }
+    collect(&mut failures, netcfg::remove_owned_routes(|_| true));
+    collect(
+        &mut failures,
+        run_powershell(
+            &format!(
+                "$rules=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -ErrorAction SilentlyContinue); \
+                 if ($rules.Count -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}; \
+                 exit 0"
+            ),
+            "remove the Windows kill switch",
+        ),
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ClientError::Platform(failures.join("; ")))
+    }
+}
+
+fn collect(failures: &mut Vec<String>, result: Result<(), ClientError>) {
+    if let Err(error) = result {
+        failures.push(error.to_string());
+    }
+}
+
+fn install_script(server_ip: Ipv4Addr, app_routing: &AppRoutingPolicy) -> String {
+    let prefixes = blocked_ipv4_prefixes(server_ip).join("','");
+    let firewall = firewall_script(app_routing, false);
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         $blocked=@('{prefixes}'); \
+         $physical=Get-NetAdapter | Where-Object {{$_.Name -ne '{ADAPTER_NAME}' -and $_.InterfaceDescription -notmatch 'Loopback'}}; \
+         {firewall}"
+    )
+}
+
 fn refresh_script(server_ip: Ipv4Addr, app_routing: &AppRoutingPolicy) -> String {
     let prefixes = blocked_ipv4_prefixes(server_ip).join("','");
     let firewall = firewall_script(app_routing, true);
     format!(
-            "$ErrorActionPreference='Stop'; \
-             $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
-             try {{ \
-               $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
-               if ($profile -and $profile.NetworkCategory -ne 'Public') {{Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction Stop}} \
-             }} catch {{Write-Warning ('Could not mark MouseVPN as a Public network: '+$_.Exception.Message)}}; \
-             $blocked=@('{prefixes}'); \
-             $physical=Get-NetAdapter | Where-Object {{$_.Name -ne '{ADAPTER_NAME}' -and $_.InterfaceDescription -notmatch 'Loopback'}}; \
-             {firewall}; \
-             $up=@(Get-NetAdapter | Where-Object {{$_.Status -eq 'Up'}}).ifIndex; \
-             $default=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {{$_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -ne $vpn.ifIndex -and $up -contains $_.InterfaceIndex}} | Sort-Object RouteMetric | Select-Object -First 1; \
-             if (-not $default) {{ throw 'No active physical IPv4 default route found' }}; \
-             $serverRoutes=@(Get-NetRoute -DestinationPrefix '{server_ip}/32' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {ROUTE_METRIC} -and $_.Protocol -eq 'NetMgmt'}}); \
-             $routeMatches=@($serverRoutes | Where-Object {{$_.InterfaceIndex -eq $default.InterfaceIndex -and $_.NextHop -eq $default.NextHop}}); \
-             if ($serverRoutes.Count -ne 1 -or $routeMatches.Count -ne 1) {{ \
-               if ($serverRoutes.Count -gt 0) {{$serverRoutes | Remove-NetRoute -Confirm:$false -ErrorAction Stop}}; \
-               New-NetRoute -DestinationPrefix '{server_ip}/32' -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric {ROUTE_METRIC} -Protocol NetMgmt -PolicyStore ActiveStore | Out-Null \
-             }}"
-        )
+        "$ErrorActionPreference='Stop'; \
+         $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction Stop; \
+         try {{ \
+           $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
+           if ($profile -and $profile.NetworkCategory -ne 'Public') {{Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction Stop}} \
+         }} catch {{Write-Warning ('Could not mark MouseVPN as a Public network: '+$_.Exception.Message)}}; \
+         $blocked=@('{prefixes}'); \
+         $physical=Get-NetAdapter | Where-Object {{$_.Name -ne '{ADAPTER_NAME}' -and $_.InterfaceDescription -notmatch 'Loopback'}}; \
+         {firewall}"
+    )
 }
 
 fn firewall_script(policy: &AppRoutingPolicy, only_missing: bool) -> String {
@@ -265,154 +434,6 @@ fn firewall_script(policy: &AppRoutingPolicy, only_missing: bool) -> String {
             )
         }
     }
-}
-
-impl Drop for NetworkGuard {
-    fn drop(&mut self) {
-        if cleanup(Some(self.state.server_ip)).is_ok() {
-            let _ = fs::remove_file(&self.state_path);
-        }
-    }
-}
-
-/// Reports whether a `MouseVPN` interface is currently present on the machine.
-///
-/// This is a single `iphlpapi` lookup, so it costs microseconds and lets the
-/// connection path skip the (multi-second) PowerShell cleanup when there is
-/// provably nothing left behind by an earlier session.
-#[cfg(windows)]
-pub(crate) fn adapter_exists() -> bool {
-    use windows_sys::Win32::NetworkManagement::{
-        IpHelper::ConvertInterfaceAliasToLuid, Ndis::NET_LUID_LH,
-    };
-
-    const ERROR_SUCCESS: u32 = 0;
-
-    let alias = ADAPTER_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
-    unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &raw mut luid) == ERROR_SUCCESS }
-}
-
-#[cfg(not(windows))]
-pub(crate) const fn adapter_exists() -> bool {
-    false
-}
-
-pub(crate) fn recover_stale_state() -> Result<(), ClientError> {
-    let path = state_path()?;
-    if !path.exists() {
-        // Policy is only ever written after the recovery journal exists, so a
-        // missing journal and a missing interface together mean the machine is
-        // already clean. Skipping the cleanup script here removes a full
-        // PowerShell start-up from every normal connection.
-        if !adapter_exists() {
-            return Ok(());
-        }
-        cleanup(None)?;
-        return Ok(());
-    }
-    let state = fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| toml::from_str::<RecoveryState>(&contents).ok());
-    cleanup(state.map(|value| value.server_ip))?;
-    fs::remove_file(path)?;
-    Ok(())
-}
-
-pub(crate) fn repair() -> Result<(), ClientError> {
-    let path = state_path()?;
-    let state = fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| toml::from_str::<RecoveryState>(&contents).ok());
-    cleanup(state.map(|value| value.server_ip))?;
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(crate) fn report() -> Result<String, ClientError> {
-    let script = format!(
-        "$vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
-         $routes=@(); $dns=@(); $category=$null; $metric=$null; $bindings=@(); $otherDns=@(); \
-         if ($vpn) {{ \
-           $routes=@(Get-NetRoute -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue | Where-Object {{$_.DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1'}} | Select-Object DestinationPrefix,InterfaceIndex,RouteMetric); \
-           $dns=@((Get-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
-           $metric=(Get-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric; \
-           $category=(Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue).NetworkCategory; \
-           $bindings=@(Get-NetAdapterBinding -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue | Where-Object {{$_.Enabled -and $_.ComponentID -in 'nt_ndisrd','nt_ndiswgc'}} | Select-Object -ExpandProperty ComponentID); \
-           $otherDns=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{$_.ifIndex -ne $vpn.ifIndex -and $_.Status -eq 'Up'}} | ForEach-Object {{ \
-             $adapter=$_; $ip=Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue; $servers=@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses); \
-             if ($servers.Count -gt 0) {{[pscustomobject]@{{interfaceAlias=$adapter.Name; interfaceMetric=$ip.InterfaceMetric; dnsServers=$servers}}}} \
-           }}) \
-         }}; \
-         [ordered]@{{ adapterUp=[bool]($vpn -and $vpn.Status -eq 'Up'); routeCount=$routes.Count; firewallRuleCount=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -Enabled True -ErrorAction SilentlyContinue).Count; dnsServers=$dns; interfaceMetric=$metric; networkCategory=$category; incompatibleBindings=$bindings; otherDnsAdapters=$otherDns; stateJournal=Test-Path '{}'; ipv6DefaultRoutes=@(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue).Count }} | ConvertTo-Json -Depth 4 -Compress",
-        powershell_path(&state_path()?)
-    );
-    run_powershell_output(&script, "collect the Windows network report")
-}
-
-fn write_state(path: &Path, state: &RecoveryState) -> Result<(), ClientError> {
-    let contents = toml::to_string(state).map_err(|error| {
-        ClientError::Platform(format!("failed to encode recovery state: {error}"))
-    })?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&temporary, path)?;
-        Ok::<(), io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result.map_err(Into::into)
-}
-
-fn cleanup(server_ip: Option<Ipv4Addr>) -> Result<(), ClientError> {
-    let server_cleanup = server_ip.map_or_else(
-        String::new,
-        |address| {
-            format!(
-                "$serverRoutes=@(Get-NetRoute -DestinationPrefix '{address}/32' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {ROUTE_METRIC} -and $_.Protocol -eq 'NetMgmt'}}); \
-                 if ($serverRoutes.Count -gt 0) {{ Invoke-MouseVpnCleanup {{$serverRoutes | Remove-NetRoute -Confirm:$false -ErrorAction Stop}} }};"
-            )
-        },
-    );
-    let script = format!(
-        "$ErrorActionPreference='Stop'; \
-         $cleanupErrors=New-Object System.Collections.Generic.List[string]; \
-         function Invoke-MouseVpnCleanup([scriptblock]$action) {{ \
-           try {{ & $action }} catch {{ $cleanupErrors.Add($_.Exception.Message) }} \
-         }}; \
-         $vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
-         if ($vpn) {{ \
-           $vpnRoutes=@(Get-NetRoute -InterfaceIndex $vpn.ifIndex -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue | Where-Object {{$_.RouteMetric -eq {ROUTE_METRIC}}}); \
-           if ($vpnRoutes.Count -gt 0) {{ Invoke-MouseVpnCleanup {{$vpnRoutes | Remove-NetRoute -Confirm:$false -ErrorAction Stop}} }}; \
-           Invoke-MouseVpnCleanup {{Reset-DnsClientServerAddress -InterfaceIndex $vpn.ifIndex -ErrorAction Stop}}; \
-           Invoke-MouseVpnCleanup {{Set-NetIPInterface -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop}}; \
-           $vpnAddresses=@(Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue); \
-           if ($vpnAddresses.Count -gt 0) {{ Invoke-MouseVpnCleanup {{$vpnAddresses | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop}} }} \
-         }}; \
-         {server_cleanup} \
-         $firewallRules=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -ErrorAction SilentlyContinue); \
-         if ($firewallRules.Count -gt 0) {{ Invoke-MouseVpnCleanup {{$firewallRules | Remove-NetFirewallRule -ErrorAction Stop}} }}; \
-         if ($cleanupErrors.Count -gt 0) {{ throw ($cleanupErrors -join '; ') }}; \
-         exit 0"
-    );
-    run_powershell(&script, "clean up the Windows network policy")
 }
 
 fn blocked_ipv4_prefixes(server_ip: Ipv4Addr) -> Vec<String> {
@@ -468,7 +489,6 @@ fn run_powershell_output(script: &str, operation: &str) -> Result<String, Client
          {script}"
     );
     let mut command = Command::new("powershell.exe");
-    #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let output = command
         .args([
@@ -496,80 +516,32 @@ fn run_powershell_output(script: &str, operation: &str) -> Result<String, Client
     )))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PhysicalAddresses {
-    pub(crate) ipv4: Ipv4Addr,
-    pub(crate) ipv6: Option<Ipv6Addr>,
-}
-
-pub(crate) fn physical_addresses() -> Result<PhysicalAddresses, ClientError> {
-    let output = run_powershell_output(
-        "$vpn=Get-NetAdapter -Name 'MouseVPN' -ErrorAction SilentlyContinue; \
-         $up=@(Get-NetAdapter | Where-Object {$_.Status -eq 'Up'}).ifIndex; \
-         $default=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | \
-           Where-Object {$_.NextHop -ne '0.0.0.0' -and (!$vpn -or $_.InterfaceIndex -ne $vpn.ifIndex) -and $up -contains $_.InterfaceIndex} | \
-           Sort-Object RouteMetric | Select-Object -First 1; \
-         if (-not $default) {throw 'No active physical IPv4 default route found'}; \
-         $address=Get-NetIPAddress -InterfaceIndex $default.InterfaceIndex -AddressFamily IPv4 | \
-           Where-Object {$_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource} | \
-           Select-Object -First 1 -ExpandProperty IPAddress; \
-         if (-not $address) {throw 'No preferred physical IPv4 address found'}; \
-         Write-Output ('IPv4='+$address); \
-         $default6=Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | \
-           Where-Object {$_.NextHop -ne '::' -and (!$vpn -or $_.InterfaceIndex -ne $vpn.ifIndex) -and $up -contains $_.InterfaceIndex} | \
-           Sort-Object RouteMetric | Select-Object -First 1; \
-         if ($default6) { \
-           $address6=Get-NetIPAddress -InterfaceIndex $default6.InterfaceIndex -AddressFamily IPv6 | \
-             Where-Object {$_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource -and $_.IPAddress -notlike 'fe80:*'} | \
-             Select-Object -First 1 -ExpandProperty IPAddress; \
-           if ($address6) {Write-Output ('IPv6='+$address6)} \
-         }",
-        "discover the physical IP addresses",
-    )?;
-    parse_physical_addresses(&output)
-}
-
-fn parse_physical_addresses(output: &str) -> Result<PhysicalAddresses, ClientError> {
-    let ipv4 = output
-        .lines()
-        .find_map(|line| line.strip_prefix("IPv4="))
-        .ok_or_else(|| {
-            ClientError::Platform("Windows returned no physical IPv4 address".to_owned())
-        })?;
-    let ipv4 = ipv4.parse().map_err(|error| {
-        ClientError::Platform(format!(
-            "invalid physical IPv4 address returned by Windows ({ipv4}): {error}"
-        ))
-    })?;
-    let ipv6 = output
-        .lines()
-        .find_map(|line| line.strip_prefix("IPv6="))
-        .map(str::parse)
-        .transpose()
-        .map_err(|error| {
-            ClientError::Platform(format!(
-                "invalid physical IPv6 address returned by Windows: {error}"
-            ))
-        })?;
-    Ok(PhysicalAddresses { ipv4, ipv6 })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_ipv4_prefixes, firewall_script, parse_physical_addresses, refresh_script,
-        PhysicalAddresses,
+        blocked_ipv4_prefixes, firewall_script, install_script, server_route_is_stale, OwnedRoute,
     };
     use crate::{AppRoutingMode, AppRoutingPolicy};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
+
+    const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+
+    fn server_route(interface_index: u32, next_hop: Ipv4Addr) -> OwnedRoute {
+        OwnedRoute {
+            destination: SERVER,
+            prefix_len: 32,
+            interface_index,
+            next_hop,
+        }
+    }
 
     #[test]
     fn emits_valid_cidr_prefixes_that_exclude_the_server() {
-        let server = Ipv4Addr::new(203, 0, 113, 10);
-        let prefixes = blocked_ipv4_prefixes(server);
+        let prefixes = blocked_ipv4_prefixes(SERVER);
         assert_eq!(prefixes.len(), 32);
-        assert!(prefixes.iter().all(|prefix| !contains(prefix, server)));
+        assert!(prefixes.iter().all(|prefix| !contains(prefix, SERVER)));
         assert!(contains_any(&prefixes, Ipv4Addr::UNSPECIFIED));
         assert!(contains_any(&prefixes, Ipv4Addr::BROADCAST));
         assert!(contains_any(&prefixes, Ipv4Addr::new(203, 0, 113, 9)));
@@ -586,24 +558,52 @@ mod tests {
     }
 
     #[test]
-    fn refresh_only_replaces_a_stale_server_route() {
-        let script = refresh_script(
-            Ipv4Addr::new(203, 0, 113, 10),
-            &crate::AppRoutingPolicy::default(),
-        );
-        assert!(script.contains("$serverRoutes.Count -ne 1 -or $routeMatches.Count -ne 1"));
-        assert!(script.contains("if ($serverRoutes.Count -gt 0)"));
+    fn keeps_a_matching_endpoint_route() {
+        assert!(!server_route_is_stale(
+            &[server_route(7, GATEWAY)],
+            SERVER,
+            7,
+            GATEWAY
+        ));
     }
 
     #[test]
-    fn parses_dual_stack_physical_addresses() {
-        assert_eq!(
-            parse_physical_addresses("IPv4=192.168.1.20\r\nIPv6=2001:db8::20").unwrap(),
-            PhysicalAddresses {
-                ipv4: Ipv4Addr::new(192, 168, 1, 20),
-                ipv6: Some("2001:db8::20".parse::<Ipv6Addr>().unwrap()),
-            }
-        );
+    fn replaces_an_endpoint_route_left_on_the_previous_network() {
+        assert!(server_route_is_stale(
+            &[server_route(7, Ipv4Addr::new(10, 0, 0, 1))],
+            SERVER,
+            7,
+            GATEWAY
+        ));
+        assert!(server_route_is_stale(
+            &[server_route(9, GATEWAY)],
+            SERVER,
+            7,
+            GATEWAY
+        ));
+    }
+
+    #[test]
+    fn replaces_a_missing_or_duplicated_endpoint_route() {
+        assert!(server_route_is_stale(&[], SERVER, 7, GATEWAY));
+        assert!(server_route_is_stale(
+            &[server_route(7, GATEWAY), server_route(9, GATEWAY)],
+            SERVER,
+            7,
+            GATEWAY
+        ));
+    }
+
+    #[test]
+    fn install_only_configures_the_kill_switch() {
+        let script = install_script(SERVER, &AppRoutingPolicy::default());
+        assert!(script.contains("MouseVPN-KS-v4-"));
+        // Addresses, DNS, the interface metric and routes are applied through
+        // iphlpapi now, so none of them may reappear in the script.
+        assert!(!script.contains("New-NetIPAddress"));
+        assert!(!script.contains("New-NetRoute"));
+        assert!(!script.contains("Set-DnsClientServerAddress"));
+        assert!(!script.contains("Set-NetIPInterface"));
     }
 
     #[test]

@@ -12,6 +12,9 @@ mod app_bypass;
 mod error;
 mod handshake;
 mod liveness;
+#[cfg(windows)]
+mod netcfg;
+#[cfg(windows)]
 mod network;
 #[cfg(windows)]
 mod network_events;
