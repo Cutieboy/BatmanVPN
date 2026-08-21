@@ -6,7 +6,8 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     os::windows::process::CommandExt,
     process::Command,
-    ptr,
+    ptr, thread,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
@@ -30,8 +31,19 @@ use windows_sys::Win32::{
 use crate::ClientError;
 
 const ERROR_SUCCESS: u32 = 0;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_NOT_FOUND: u32 = 1168;
 const ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How long to let Windows attach IPv4 to a newly created tunnel interface.
+const INTERFACE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const INTERFACE_READY_POLL: Duration = Duration::from_millis(25);
+
+/// Reports whether a delete already had nothing to delete.
+const fn already_gone(status: u32) -> bool {
+    status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND
+}
 
 /// Route metric shared by every route `MouseVPN` installs, so cleanup can
 /// recognise its own routes without consulting a journal.
@@ -276,7 +288,7 @@ pub(crate) fn clear_addresses(luid: NET_LUID_LH) -> Result<(), ClientError> {
             continue;
         }
         let status = unsafe { DeleteUnicastIpAddressEntry(ptr::from_ref(row)) };
-        if status != ERROR_SUCCESS && failure.is_none() {
+        if status != ERROR_SUCCESS && !already_gone(status) && failure.is_none() {
             failure = Some(win32_error("remove a stale MouseVPN address", status));
         }
     }
@@ -284,6 +296,49 @@ pub(crate) fn clear_addresses(luid: NET_LUID_LH) -> Result<(), ClientError> {
         FreeMibTable(table.cast::<c_void>());
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Reports whether the IPv4 stack is currently bound to this interface.
+///
+/// Windows unbinds IPv4 before the device itself disappears, so an interface
+/// can still be present by alias while none of its IPv4 settings exist any
+/// more. Cleanup uses this to tell "already undone" apart from a real failure.
+pub(crate) fn has_ipv4_binding(luid: NET_LUID_LH) -> bool {
+    let mut row: MIB_IPINTERFACE_ROW = unsafe { mem::zeroed() };
+    row.Family = AF_INET;
+    row.InterfaceLuid = luid;
+    unsafe { GetIpInterfaceEntry(&raw mut row) == ERROR_SUCCESS }
+}
+
+/// Waits for Windows to finish binding IPv4 to a freshly created interface.
+///
+/// Wintun hands back the adapter before the IP stack has attached to it, and
+/// every address, metric and route call below fails with `ERROR_NOT_FOUND`
+/// until it has. In the normal case the first poll already succeeds.
+///
+/// # Errors
+///
+/// Returns an error when the binding does not appear within
+/// [`INTERFACE_READY_TIMEOUT`], or when Windows reports anything other than a
+/// missing interface.
+pub(crate) fn wait_for_ipv4_interface(luid: NET_LUID_LH) -> Result<(), ClientError> {
+    let deadline = Instant::now() + INTERFACE_READY_TIMEOUT;
+    loop {
+        let mut row: MIB_IPINTERFACE_ROW = unsafe { mem::zeroed() };
+        row.Family = AF_INET;
+        row.InterfaceLuid = luid;
+        let status = unsafe { GetIpInterfaceEntry(&raw mut row) };
+        if status == ERROR_SUCCESS {
+            return Ok(());
+        }
+        if status != ERROR_NOT_FOUND || Instant::now() >= deadline {
+            return Err(win32_error(
+                "wait for the MouseVPN interface to accept IPv4",
+                status,
+            ));
+        }
+        thread::sleep(INTERFACE_READY_POLL);
+    }
 }
 
 /// Pins the tunnel interface metric so its half-default routes win.
@@ -410,7 +465,7 @@ pub(crate) fn remove_owned_routes(
             continue;
         }
         let status = unsafe { DeleteIpForwardEntry2(ptr::from_ref(row)) };
-        if status != ERROR_SUCCESS && failure.is_none() {
+        if status != ERROR_SUCCESS && !already_gone(status) && failure.is_none() {
             failure = Some(win32_error("remove a MouseVPN route", status));
         }
     }

@@ -203,6 +203,9 @@ fn install_policy(
     app_routing: &AppRoutingPolicy,
 ) -> Result<Option<KillSwitch>, ClientError> {
     let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
+    // Wintun returns the adapter before Windows has attached IPv4 to it, and
+    // every address, metric and route call below needs that binding.
+    netcfg::wait_for_ipv4_interface(tunnel)?;
     // The kill switch has to be in place before the default route moves, or
     // traffic leaks over the physical interface during the switchover.
     let kill_switch = match app_routing.mode {
@@ -442,10 +445,17 @@ fn write_state(path: &Path, state: &RecoveryState) -> Result<(), ClientError> {
 /// out of every disconnect.
 fn cleanup(firewall_rules: bool) -> Result<(), ClientError> {
     let mut failures = Vec::new();
+    // Windows unbinds IPv4 before it removes the device, so between a
+    // disconnect and the adapter actually disappearing the interface still
+    // resolves by alias while none of its IPv4 settings exist. There is
+    // nothing left to undo in that window, and treating it as a failure used
+    // to block the next connection until Windows finished the removal.
     if let Ok(tunnel) = netcfg::interface_luid(ADAPTER_NAME) {
-        collect(&mut failures, netcfg::reset_tunnel_dns(ADAPTER_NAME));
-        collect(&mut failures, netcfg::reset_tunnel_metric(tunnel));
-        collect(&mut failures, netcfg::clear_addresses(tunnel));
+        if netcfg::has_ipv4_binding(tunnel) {
+            collect(&mut failures, netcfg::reset_tunnel_dns(ADAPTER_NAME));
+            collect(&mut failures, netcfg::reset_tunnel_metric(tunnel));
+            collect(&mut failures, netcfg::clear_addresses(tunnel));
+        }
     }
     collect(&mut failures, netcfg::remove_owned_routes(|_| true));
     if firewall_rules {
