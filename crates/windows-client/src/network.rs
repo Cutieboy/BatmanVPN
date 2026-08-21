@@ -23,8 +23,20 @@ use crate::{
 pub(crate) use crate::netcfg::PhysicalAddresses;
 
 pub(crate) const ADAPTER_NAME: &str = "MouseVPN";
+/// Fixed device GUID for the Wintun interface.
+///
+/// Wintun deletes the adapter when the last handle closes, so every connection
+/// creates it again. Reusing one GUID makes Windows reuse the same device
+/// instance and its cached network profile instead of classifying a brand new
+/// "Network N" each time, which both speeds the interface up and stops the
+/// profile list from growing without bound.
+pub(crate) const ADAPTER_GUID: u128 = 0x53a1_e2c4_7b90_4d6e_9f31_08c5_a4b7_d260;
 const FIREWALL_GROUP: &str = "MouseVPN Kill Switch";
 const STATE_FILE: &str = "network-state.toml";
+/// Records that the tunnel's network profile has already been marked Public.
+/// It holds the adapter GUID it was applied to, so changing [`ADAPTER_GUID`]
+/// re-applies the category to the new profile.
+const CATEGORY_MARKER: &str = "network-category.marker";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The two halves of the default route the tunnel installs. Two `/1` routes
@@ -252,11 +264,22 @@ fn install_policy(
 ///
 /// This runs detached: it needs the Network Location Awareness service to have
 /// classified the brand new interface, which it has usually not done yet, and
-/// nothing about the tunnel depends on the outcome. Keeping it off the
-/// connection path is the difference between a connection that completes in
-/// under two seconds and one that waits on PowerShell.
+/// nothing about the tunnel depends on the outcome.
+///
+/// It also runs at most once per machine. Windows remembers the category
+/// against the network profile, and the tunnel now uses a fixed device GUID, so
+/// the same profile comes back on every connection. Re-applying it would put a
+/// PowerShell start-up — and the console window that flashes with it — on a
+/// connection path that otherwise has none.
 fn harden_network_category() {
-    std::thread::spawn(|| {
+    let Ok(marker) = runtime_dir().map(|directory| directory.join(CATEGORY_MARKER)) else {
+        return;
+    };
+    let applied = format!("{ADAPTER_GUID:032x}");
+    if fs::read_to_string(&marker).is_ok_and(|contents| contents.trim() == applied) {
+        return;
+    }
+    std::thread::spawn(move || {
         let script = format!(
             "$vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
              if ($vpn) {{ \
@@ -267,8 +290,11 @@ fn harden_network_category() {
              }}; \
              exit 0"
         );
-        if let Err(error) = run_powershell(&script, "mark MouseVPN as a Public network") {
-            eprintln!("MOUSEVPN_POLICY_WARNING={error}");
+        match run_powershell(&script, "mark MouseVPN as a Public network") {
+            Ok(()) => {
+                let _ = fs::write(&marker, applied);
+            }
+            Err(error) => eprintln!("MOUSEVPN_POLICY_WARNING={error}"),
         }
     });
 }
@@ -349,23 +375,29 @@ impl Drop for NetworkGuard {
 
 pub(crate) fn recover_stale_state() -> Result<(), ClientError> {
     let path = state_path()?;
-    let Some(state) = read_state(&path) else {
-        // Policy is only ever written after the recovery journal exists, so a
-        // missing journal and a missing interface together mean the machine is
-        // already clean. Skipping cleanup here keeps a full PowerShell start-up
-        // off every normal connection.
-        if !path.exists() && !netcfg::interface_exists(ADAPTER_NAME) {
-            return Ok(());
-        }
-        cleanup(true)?;
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+    if let Some(state) = read_state(&path) {
+        cleanup(state.firewall_rules)?;
+        fs::remove_file(path)?;
         return Ok(());
-    };
-    cleanup(state.firewall_rules)?;
-    fs::remove_file(path)?;
-    Ok(())
+    }
+    if path.exists() {
+        // A journal that will not parse says nothing about what was installed,
+        // so assume the worst and sweep everything.
+        cleanup(true)?;
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+    // Policy is only ever written after the journal exists, so a missing
+    // journal and a missing interface together mean the machine is clean.
+    if !netcfg::interface_exists(ADAPTER_NAME) {
+        return Ok(());
+    }
+    // The adapter usually outlives the session by a few seconds: Windows
+    // removes the device well after the helper that owned it exited. The
+    // journal is written before any firewall rule is created and removed only
+    // after a cleanup that succeeded, so its absence proves there are no rules
+    // of ours to sweep, and the firewall search can be skipped.
+    cleanup(false)
 }
 
 pub(crate) fn repair() -> Result<(), ClientError> {

@@ -14,21 +14,13 @@ use wintun::Adapter;
 use crate::{
     app_bypass::AppBypassGuard,
     handshake::connect,
-    network::{self, NetworkGuard, RuntimeLock, ADAPTER_NAME},
+    network::{self, NetworkGuard, RuntimeLock, ADAPTER_GUID, ADAPTER_NAME},
     packet_loop,
     platform::{ensure_supported_runtime, materialize_wintun},
     AppRoutingPolicy, ClientError,
 };
 
 const ADAPTER_TUNNEL_TYPE: &str = "MouseVPN";
-/// Fixed device GUID for the Wintun interface.
-///
-/// Wintun deletes the adapter when the last handle closes, so every connection
-/// creates it again. Reusing one GUID makes Windows reuse the same device
-/// instance and its cached network profile instead of classifying a brand new
-/// "Network N" each time, which both speeds the interface up and stops the
-/// profile list from growing without bound.
-const ADAPTER_GUID: u128 = 0x53a1_e2c4_7b90_4d6e_9f31_08c5_a4b7_d260;
 const RESTART_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(16);
 const STABLE_RUNTIME: Duration = Duration::from_secs(60);
