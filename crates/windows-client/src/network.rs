@@ -275,9 +275,42 @@ impl Drop for NetworkGuard {
     }
 }
 
+/// Reports whether a `MouseVPN` interface is currently present on the machine.
+///
+/// This is a single `iphlpapi` lookup, so it costs microseconds and lets the
+/// connection path skip the (multi-second) PowerShell cleanup when there is
+/// provably nothing left behind by an earlier session.
+#[cfg(windows)]
+pub(crate) fn adapter_exists() -> bool {
+    use windows_sys::Win32::NetworkManagement::{
+        IpHelper::ConvertInterfaceAliasToLuid, Ndis::NET_LUID_LH,
+    };
+
+    const ERROR_SUCCESS: u32 = 0;
+
+    let alias = ADAPTER_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+    unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &raw mut luid) == ERROR_SUCCESS }
+}
+
+#[cfg(not(windows))]
+pub(crate) const fn adapter_exists() -> bool {
+    false
+}
+
 pub(crate) fn recover_stale_state() -> Result<(), ClientError> {
     let path = state_path()?;
     if !path.exists() {
+        // Policy is only ever written after the recovery journal exists, so a
+        // missing journal and a missing interface together mean the machine is
+        // already clean. Skipping the cleanup script here removes a full
+        // PowerShell start-up from every normal connection.
+        if !adapter_exists() {
+            return Ok(());
+        }
         cleanup(None)?;
         return Ok(());
     }

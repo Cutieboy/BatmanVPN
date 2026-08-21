@@ -1,12 +1,18 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, ptr};
 
-use std::os::windows::process::CommandExt;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    Security::{GetTokenInformation, OpenProcessToken, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+    System::{
+        LibraryLoader::{GetModuleHandleA, GetProcAddress},
+        Threading::GetCurrentProcess,
+    },
+};
 
 use crate::{network, ClientError};
 
 const WINTUN_DLL: &[u8] = include_bytes!("../vendor/wintun/wintun.dll");
 pub(crate) const WINTUN_VERSION: &str = "0.14.1";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDiagnostics {
@@ -56,7 +62,12 @@ pub(crate) fn materialize_wintun() -> Result<PathBuf, ClientError> {
     let directory = network::runtime_dir()?;
     fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("wintun-{WINTUN_VERSION}.dll"));
-    if fs::read(&destination).is_ok_and(|contents| contents == WINTUN_DLL) {
+    // Comparing the length first keeps the common warm-start path from reading
+    // the whole embedded library back off disk on every connection.
+    if fs::metadata(&destination)
+        .is_ok_and(|metadata| metadata.len() == WINTUN_DLL.len() as u64)
+        && fs::read(&destination).is_ok_and(|contents| contents == WINTUN_DLL)
+    {
         return Ok(destination);
     }
     let temporary = directory.join(format!(
@@ -74,20 +85,42 @@ pub(crate) fn materialize_wintun() -> Result<PathBuf, ClientError> {
     Ok(destination)
 }
 
+/// Reports whether the current process token carries an elevated administrator
+/// identity.
+///
+/// This deliberately avoids `net session`: that command depends on the
+/// `LanmanServer` service, so it reports "not elevated" on machines where the
+/// Server service is disabled, and it costs a process spawn on every check.
 fn is_elevated() -> bool {
-    let mut command = Command::new("net");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .arg("session")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let mut token: HANDLE = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION {
+        TokenIsElevated: 0,
+    };
+    let mut returned = 0_u32;
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            u32::try_from(size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    queried != 0 && elevation.TokenIsElevated != 0
 }
 
+/// Detects Wine by looking for its `ntdll` extension export instead of shelling
+/// out to `reg.exe`.
 fn is_wine() -> bool {
-    let mut command = Command::new("reg.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .args(["query", r"HKCU\Software\Wine"])
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let module = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast()) };
+    if module.is_null() {
+        return false;
+    }
+    unsafe { GetProcAddress(module, c"wine_get_version".as_ptr().cast()) }.is_some()
 }

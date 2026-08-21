@@ -21,6 +21,14 @@ use crate::{
 };
 
 const ADAPTER_TUNNEL_TYPE: &str = "MouseVPN";
+/// Fixed device GUID for the Wintun interface.
+///
+/// Wintun deletes the adapter when the last handle closes, so every connection
+/// creates it again. Reusing one GUID makes Windows reuse the same device
+/// instance and its cached network profile instead of classifying a brand new
+/// "Network N" each time, which both speeds the interface up and stops the
+/// profile list from growing without bound.
+const ADAPTER_GUID: u128 = 0x53a1_e2c4_7b90_4d6e_9f31_08c5_a4b7_d260;
 const RESTART_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(16);
 const STABLE_RUNTIME: Duration = Duration::from_secs(60);
@@ -59,7 +67,14 @@ pub fn run_with_stop(
     let wintun = unsafe { wintun::load_from_path(&wintun_path) }
         .map_err(|error| ClientError::Platform(format!("failed to load wintun.dll: {error}")))?;
     let adapter = Adapter::open(&wintun, ADAPTER_NAME)
-        .or_else(|_| Adapter::create(&wintun, ADAPTER_NAME, ADAPTER_TUNNEL_TYPE, None))
+        .or_else(|_| {
+            Adapter::create(
+                &wintun,
+                ADAPTER_NAME,
+                ADAPTER_TUNNEL_TYPE,
+                Some(ADAPTER_GUID),
+            )
+        })
         .map_err(|error| {
             ClientError::Platform(format!("failed to create Wintun adapter: {error}"))
         })?;
