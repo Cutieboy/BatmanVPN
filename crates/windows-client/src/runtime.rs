@@ -60,24 +60,38 @@ pub fn run_with_stop(
     };
 
     let wire = ClientWire::from_config(config)?;
-    let (incoming, plane, mut parameters) = connect(config, &wire)?;
+    // Materialising wintun.dll and creating the device is a second or more of
+    // driver work that does not depend on the session, so let the handshake run
+    // beside it rather than after it.
+    let (handshake, device) = thread::scope(|scope| {
+        let handshake = scope.spawn(|| connect(config, &wire));
+        let device = (|| {
+            let wintun_path = materialize_wintun()?;
+            let wintun = unsafe { wintun::load_from_path(&wintun_path) }.map_err(|error| {
+                ClientError::Platform(format!("failed to load wintun.dll: {error}"))
+            })?;
+            let adapter = Adapter::open(&wintun, ADAPTER_NAME)
+                .or_else(|_| {
+                    Adapter::create(
+                        &wintun,
+                        ADAPTER_NAME,
+                        ADAPTER_TUNNEL_TYPE,
+                        Some(ADAPTER_GUID),
+                    )
+                })
+                .map_err(|error| {
+                    ClientError::Platform(format!("failed to create Wintun adapter: {error}"))
+                })?;
+            Ok::<_, ClientError>((wintun, adapter))
+        })();
+        (handshake.join(), device)
+    });
+    let (incoming, plane, mut parameters) = handshake.map_err(|_| {
+        ClientError::Platform("the MouseVPN handshake thread panicked".to_owned())
+    })??;
+    let (_wintun, adapter) = device?;
     incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
     let outgoing = incoming.try_clone()?;
-    let wintun_path = materialize_wintun()?;
-    let wintun = unsafe { wintun::load_from_path(&wintun_path) }
-        .map_err(|error| ClientError::Platform(format!("failed to load wintun.dll: {error}")))?;
-    let adapter = Adapter::open(&wintun, ADAPTER_NAME)
-        .or_else(|_| {
-            Adapter::create(
-                &wintun,
-                ADAPTER_NAME,
-                ADAPTER_TUNNEL_TYPE,
-                Some(ADAPTER_GUID),
-            )
-        })
-        .map_err(|error| {
-            ClientError::Platform(format!("failed to create Wintun adapter: {error}"))
-        })?;
     adapter
         .set_mtu(usize::from(parameters.mtu))
         .map_err(|error| ClientError::Platform(format!("failed to set Wintun MTU: {error}")))?;
