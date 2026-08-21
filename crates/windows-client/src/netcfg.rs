@@ -115,6 +115,7 @@ pub(crate) fn interface_index(luid: NET_LUID_LH) -> Result<u32, ClientError> {
 /// Returns an error when the route table cannot be read or the machine has no
 /// usable physical default route.
 pub(crate) fn default_ipv4_route(tunnel: Option<NET_LUID_LH>) -> Result<DefaultRoute, ClientError> {
+    let tunnel = tunnel.map(luid_value);
     let mut table: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
     let status = unsafe { GetIpForwardTable2(AF_INET, &raw mut table) };
     if status != ERROR_SUCCESS {
@@ -126,13 +127,14 @@ pub(crate) fn default_ipv4_route(tunnel: Option<NET_LUID_LH>) -> Result<DefaultR
             continue;
         }
         let next_hop = unsafe { ipv4_from_sockaddr(&row.NextHop) };
-        if next_hop.is_unspecified() {
+        if next_hop.is_unspecified() || tunnel == Some(luid_value(row.InterfaceLuid)) {
             continue;
         }
-        if tunnel.is_some_and(|tunnel| same_luid(tunnel, row.InterfaceLuid)) {
-            continue;
-        }
-        if best.is_none_or(|(metric, _)| row.Metric < metric) {
+        let better = match &best {
+            Some((metric, _)) => row.Metric < *metric,
+            None => true,
+        };
+        if better {
             best = Some((
                 row.Metric,
                 DefaultRoute {
@@ -167,7 +169,7 @@ pub(crate) fn physical_addresses(
     })?;
     Ok(PhysicalAddresses {
         ipv4,
-        ipv6: best_source_address_v6(tunnel),
+        ipv6: best_source_address_v6(tunnel.map(luid_value)),
     })
 }
 
@@ -193,7 +195,7 @@ fn best_source_address_v4(luid: NET_LUID_LH, destination: Ipv4Addr) -> Option<Ip
     (!address.is_unspecified()).then_some(address)
 }
 
-fn best_source_address_v6(tunnel: Option<NET_LUID_LH>) -> Option<Ipv6Addr> {
+fn best_source_address_v6(tunnel: Option<u64>) -> Option<Ipv6Addr> {
     // Any global unicast destination is enough to make Windows run its own
     // source address selection over the physical IPv6 default route.
     let destination = sockaddr_v6(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0));
@@ -213,7 +215,7 @@ fn best_source_address_v6(tunnel: Option<NET_LUID_LH>) -> Option<Ipv6Addr> {
     if status != ERROR_SUCCESS {
         return None;
     }
-    if tunnel.is_some_and(|tunnel| same_luid(tunnel, route.InterfaceLuid)) {
+    if tunnel == Some(luid_value(route.InterfaceLuid)) {
         return None;
     }
     let address = unsafe { ipv6_from_sockaddr(&source) };
@@ -404,7 +406,8 @@ pub(crate) fn remove_owned_routes(
         if row.Metric != ROUTE_METRIC || row.Protocol != MIB_IPPROTO_NETMGMT {
             continue;
         }
-        if !selected(&unsafe { owned_route(row) }) {
+        let owned = unsafe { owned_route(row) };
+        if !selected(&owned) {
             continue;
         }
         let status = unsafe { DeleteIpForwardEntry2(ptr::from_ref(row)) };
@@ -517,8 +520,12 @@ unsafe fn unicast_rows<'table>(
     }
 }
 
-pub(crate) fn same_luid(left: NET_LUID_LH, right: NET_LUID_LH) -> bool {
-    unsafe { left.Value == right.Value }
+fn luid_value(luid: NET_LUID_LH) -> u64 {
+    unsafe { luid.Value }
+}
+
+fn same_luid(left: NET_LUID_LH, right: NET_LUID_LH) -> bool {
+    luid_value(left) == luid_value(right)
 }
 
 fn sockaddr_v4(address: Ipv4Addr) -> SOCKADDR_INET {
