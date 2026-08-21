@@ -170,10 +170,18 @@ fn configure_transaction(
         unsafe { FwpmSubLayerAdd0(engine, &raw const sublayer, ptr::null_mut()) },
         "add the MouseVPN kill switch sublayer",
     )?;
+    add_ipv4_filters(engine, server_ip, tunnel)?;
+    add_ipv6_filters(engine)
+}
 
-    // IPv4: everything is denied unless it leaves through the tunnel, is the
-    // tunnel's own transport, is loopback, or is the DHCP exchange that keeps
-    // the physical link addressed.
+/// Denies IPv4 unless it leaves through the tunnel, is the tunnel's own
+/// transport, is loopback, or is the DHCP exchange that keeps the physical link
+/// addressed.
+fn add_ipv4_filters(
+    engine: HANDLE,
+    server_ip: Ipv4Addr,
+    tunnel: u64,
+) -> Result<(), ClientError> {
     add_filter(
         engine,
         FWPM_LAYER_ALE_AUTH_CONNECT_V4,
@@ -222,10 +230,12 @@ fn configure_transaction(
             u16_condition(FWPM_CONDITION_IP_REMOTE_PORT, DHCP_SERVER_PORT),
         ],
         "MouseVPN kill switch IPv4 DHCP permit",
-    )?;
+    )
+}
 
-    // IPv6: the tunnel is IPv4 only, so nothing but loopback and on-link
-    // neighbour traffic has anywhere legitimate to go.
+/// Denies IPv6 outright. The tunnel is IPv4 only, so nothing but loopback and
+/// on-link neighbours has anywhere legitimate to go.
+fn add_ipv6_filters(engine: HANDLE) -> Result<(), ClientError> {
     add_filter(
         engine,
         FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -255,8 +265,7 @@ fn configure_transaction(
         PERMIT_WEIGHT,
         &mut [remote_ipv6_condition(&mut link_local)],
         "MouseVPN kill switch IPv6 link-local permit",
-    )?;
-    Ok(())
+    )
 }
 
 fn add_filter(

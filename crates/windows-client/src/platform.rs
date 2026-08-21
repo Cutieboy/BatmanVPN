@@ -2,10 +2,10 @@ use std::{fs, path::PathBuf, ptr};
 
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
-    Security::{GetTokenInformation, OpenProcessToken, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+    Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
     System::{
         LibraryLoader::{GetModuleHandleA, GetProcAddress},
-        Threading::GetCurrentProcess,
+        Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
 

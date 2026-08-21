@@ -16,15 +16,14 @@ use windows_sys::Win32::{
             CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry,
             FreeMibTable, GetBestRoute2, GetIpForwardTable2, GetIpInterfaceEntry,
             GetUnicastIpAddressTable, InitializeIpForwardEntry, InitializeUnicastIpAddressEntry,
-            IpDadStatePreferred, SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-            MIB_IPINTERFACE_ROW, MIB_IPPROTO_NETMGMT, MIB_UNICASTIPADDRESS_ROW,
-            MIB_UNICASTIPADDRESS_TABLE,
+            SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+            MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
         },
         Ndis::NET_LUID_LH,
     },
     Networking::WinSock::{
-        AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6,
-        SOCKADDR_IN6_0, SOCKADDR_INET,
+        IpDadStatePreferred, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0,
+        MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
     },
 };
 
@@ -50,7 +49,7 @@ pub(crate) struct PhysicalAddresses {
 }
 
 /// The physical IPv4 default route the tunnel endpoint has to keep using.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct DefaultRoute {
     pub(crate) interface_luid: NET_LUID_LH,
     pub(crate) interface_index: u32,
@@ -294,7 +293,7 @@ pub(crate) fn clear_addresses(luid: NET_LUID_LH) -> Result<(), ClientError> {
 /// Returns an error when Windows rejects the interface write.
 pub(crate) fn set_tunnel_metric(luid: NET_LUID_LH) -> Result<(), ClientError> {
     update_interface(luid, |row| {
-        row.UseAutomaticMetric = 0;
+        row.UseAutomaticMetric = false;
         row.Metric = TUNNEL_INTERFACE_METRIC;
     })
 }
@@ -306,7 +305,7 @@ pub(crate) fn set_tunnel_metric(luid: NET_LUID_LH) -> Result<(), ClientError> {
 /// Returns an error when Windows rejects the interface write.
 pub(crate) fn reset_tunnel_metric(luid: NET_LUID_LH) -> Result<(), ClientError> {
     update_interface(luid, |row| {
-        row.UseAutomaticMetric = 1;
+        row.UseAutomaticMetric = true;
     })
 }
 

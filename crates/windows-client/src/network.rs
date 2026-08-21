@@ -30,7 +30,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The two halves of the default route the tunnel installs. Two `/1` routes
 /// beat a physical `0.0.0.0/0` on prefix length without replacing it, so the
 /// original default route survives for the tunnel endpoint itself.
-const TUNNEL_HALVES: [Ipv4Addr; 2] = [Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)];
+const TUNNEL_HALVES: [Ipv4Addr; 2] = [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(128, 0, 0, 0)];
 
 pub(crate) struct RuntimeLock {
     _file: File,
