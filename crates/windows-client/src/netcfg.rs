@@ -31,6 +31,7 @@ use windows_sys::Win32::{
 use crate::ClientError;
 
 const ERROR_SUCCESS: u32 = 0;
+const ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Route metric shared by every route `MouseVPN` installs, so cleanup can
@@ -351,7 +352,9 @@ pub(crate) fn add_route(
     row.Metric = ROUTE_METRIC;
     row.Protocol = MIB_IPPROTO_NETMGMT;
     let status = unsafe { CreateIpForwardEntry2(&raw const row) };
-    if status == ERROR_SUCCESS {
+    // An identical route already being present is the outcome we wanted. This
+    // happens when a previous cleanup could not finish.
+    if status == ERROR_SUCCESS || status == ERROR_OBJECT_ALREADY_EXISTS {
         Ok(())
     } else {
         Err(win32_error(

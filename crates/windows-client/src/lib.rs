@@ -13,6 +13,8 @@ mod error;
 mod handshake;
 mod liveness;
 #[cfg(windows)]
+mod killswitch;
+#[cfg(windows)]
 mod netcfg;
 #[cfg(windows)]
 mod network;

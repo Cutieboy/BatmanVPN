@@ -923,7 +923,7 @@ fn sc_error(operation: &str, details: &str) -> ClientError {
     ClientError::Platform(format!("failed to {operation}: {details}"))
 }
 
-fn check_wfp(code: u32, operation: &str) -> Result<(), ClientError> {
+pub(crate) fn check_wfp(code: u32, operation: &str) -> Result<(), ClientError> {
     if code == 0 {
         Ok(())
     } else {
@@ -933,14 +933,14 @@ fn check_wfp(code: u32, operation: &str) -> Result<(), ClientError> {
     }
 }
 
-fn display_data(name: &mut [u16]) -> FWPM_DISPLAY_DATA0 {
+pub(crate) fn display_data(name: &mut [u16]) -> FWPM_DISPLAY_DATA0 {
     FWPM_DISPLAY_DATA0 {
         name: name.as_mut_ptr(),
         description: ptr::null_mut(),
     }
 }
 
-fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 

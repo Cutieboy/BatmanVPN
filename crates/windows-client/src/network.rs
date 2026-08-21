@@ -15,6 +15,7 @@ use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
 use crate::{
     app_bypass::{AppBypassGuard, AppBypassRefresher},
+    killswitch::KillSwitch,
     netcfg::{self, OwnedRoute},
     AppRoutingMode, AppRoutingPolicy, ClientError,
 };
@@ -61,6 +62,16 @@ impl RuntimeLock {
 #[derive(Debug, Deserialize, Serialize)]
 struct RecoveryState {
     server_ip: Ipv4Addr,
+    /// Whether this session created Windows Firewall rules. The full tunnel
+    /// keeps its kill switch in WFP, where it disappears with the process, so
+    /// recovery can skip the firewall cleanup entirely. Defaults to true so a
+    /// journal written by an older build is still cleaned up properly.
+    #[serde(default = "yes")]
+    firewall_rules: bool,
+}
+
+const fn yes() -> bool {
+    true
 }
 
 pub(crate) struct NetworkGuard {
@@ -69,6 +80,10 @@ pub(crate) struct NetworkGuard {
     refresh_lock: Arc<Mutex<()>>,
     app_routing: AppRoutingPolicy,
     app_bypass: Option<AppBypassGuard>,
+    /// Present for the full tunnel, where the kill switch lives in WFP. The
+    /// allowlist edition still needs per-application Windows Firewall rules,
+    /// and leaves this empty.
+    kill_switch: Option<KillSwitch>,
     parameters: SessionParameters,
 }
 
@@ -78,6 +93,9 @@ pub(crate) struct NetworkRefresher {
     refresh_lock: Arc<Mutex<()>>,
     app_routing: AppRoutingPolicy,
     app_bypass: Option<AppBypassRefresher>,
+    /// WFP filters live for as long as the session handle, so there is nothing
+    /// for a refresh to re-create.
+    kill_switch_is_dynamic: bool,
 }
 
 impl NetworkGuard {
@@ -88,22 +106,34 @@ impl NetworkGuard {
         app_routing: &AppRoutingPolicy,
         app_bypass: Option<AppBypassGuard>,
     ) -> Result<Self, ClientError> {
-        let state = RecoveryState { server_ip };
         let state_path = state_path()?;
+        // Journal first, and pessimistically: if the machine loses power midway
+        // through the install, recovery has to assume firewall rules exist.
+        let mut state = RecoveryState {
+            server_ip,
+            firewall_rules: true,
+        };
         write_state(&state_path, &state)?;
-        if let Err(error) = install_policy(server_ip, parameters, app_routing) {
-            if cleanup().is_ok() {
-                let _ = fs::remove_file(&state_path);
+        let kill_switch = match install_policy(server_ip, parameters, app_routing) {
+            Ok(kill_switch) => kill_switch,
+            Err(error) => {
+                if cleanup(true).is_ok() {
+                    let _ = fs::remove_file(&state_path);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        state.firewall_rules = kill_switch.is_none();
+        write_state(&state_path, &state)?;
         eprintln!("MOUSEVPN_POLICY=installed for {server_ip}:{server_port}");
+        harden_network_category();
         Ok(Self {
             state,
             state_path,
             refresh_lock: Arc::new(Mutex::new(())),
             app_routing: app_routing.clone(),
             app_bypass,
+            kill_switch,
             parameters,
         })
     }
@@ -142,6 +172,7 @@ impl NetworkGuard {
             refresh_lock: Arc::clone(&self.refresh_lock),
             app_routing: self.app_routing.clone(),
             app_bypass: self.app_bypass.as_ref().map(AppBypassGuard::refresher),
+            kill_switch_is_dynamic: self.kill_switch.is_some(),
         }
     }
 }
@@ -153,10 +184,12 @@ impl NetworkRefresher {
         })?;
         let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
         repair_routes(tunnel, self.server_ip)?;
-        run_powershell(
-            &refresh_script(self.server_ip, &self.app_routing),
-            "refresh the Windows network policy",
-        )?;
+        if !self.kill_switch_is_dynamic {
+            run_powershell(
+                &refresh_script(self.server_ip, &self.app_routing),
+                "refresh the Windows network policy",
+            )?;
+        }
         if let Some(app_bypass) = &self.app_bypass {
             app_bypass.refresh()?;
         }
@@ -168,14 +201,39 @@ fn install_policy(
     server_ip: Ipv4Addr,
     parameters: SessionParameters,
     app_routing: &AppRoutingPolicy,
-) -> Result<(), ClientError> {
+) -> Result<Option<KillSwitch>, ClientError> {
     let tunnel = netcfg::interface_luid(ADAPTER_NAME)?;
     // The kill switch has to be in place before the default route moves, or
     // traffic leaks over the physical interface during the switchover.
-    run_powershell(
-        &install_script(server_ip, app_routing),
-        "install the Windows kill switch",
-    )?;
+    let kill_switch = match app_routing.mode {
+        AppRoutingMode::Exclude => match KillSwitch::install(server_ip, tunnel) {
+            Ok(kill_switch) => Some(kill_switch),
+            Err(error) => {
+                // Never trade the kill switch for speed. If this machine's WFP
+                // stack will not take the filters, fall back to the Windows
+                // Firewall rules: slower to install, but the tunnel is still
+                // fenced in.
+                eprintln!(
+                    "MOUSEVPN_POLICY_WARNING=WFP kill switch unavailable, using Windows Firewall instead: {error}"
+                );
+                run_powershell(
+                    &install_script(server_ip, app_routing),
+                    "install the Windows kill switch",
+                )?;
+                None
+            }
+        },
+        // The allowlist edition blocks per application and per service rather
+        // than globally, which Windows Firewall can express and a single WFP
+        // interface condition cannot.
+        AppRoutingMode::Include => {
+            run_powershell(
+                &install_script(server_ip, app_routing),
+                "install the Windows kill switch",
+            )?;
+            None
+        }
+    };
     let default = netcfg::default_ipv4_route(Some(tunnel))?;
     apply_parameters(tunnel, parameters)?;
     netcfg::set_tunnel_metric(tunnel)?;
@@ -183,7 +241,33 @@ fn install_policy(
     for destination in TUNNEL_HALVES {
         netcfg::add_route(tunnel, destination, 1, Ipv4Addr::UNSPECIFIED)?;
     }
-    Ok(())
+    Ok(kill_switch)
+}
+
+/// Marks the tunnel as a Public network so Windows applies its stricter
+/// built-in inbound rules to it.
+///
+/// This runs detached: it needs the Network Location Awareness service to have
+/// classified the brand new interface, which it has usually not done yet, and
+/// nothing about the tunnel depends on the outcome. Keeping it off the
+/// connection path is the difference between a connection that completes in
+/// under two seconds and one that waits on PowerShell.
+fn harden_network_category() {
+    std::thread::spawn(|| {
+        let script = format!(
+            "$vpn=Get-NetAdapter -Name '{ADAPTER_NAME}' -ErrorAction SilentlyContinue; \
+             if ($vpn) {{ \
+               $profile=Get-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -ErrorAction SilentlyContinue; \
+               if ($profile -and $profile.NetworkCategory -ne 'Public') {{ \
+                 Set-NetConnectionProfile -InterfaceIndex $vpn.ifIndex -NetworkCategory Public -ErrorAction SilentlyContinue \
+               }} \
+             }}; \
+             exit 0"
+        );
+        if let Err(error) = run_powershell(&script, "mark MouseVPN as a Public network") {
+            eprintln!("MOUSEVPN_POLICY_WARNING={error}");
+        }
+    });
 }
 
 fn apply_parameters(
@@ -251,7 +335,10 @@ fn server_route_is_stale(
 
 impl Drop for NetworkGuard {
     fn drop(&mut self) {
-        if cleanup().is_ok() {
+        // The WFP kill switch stays up for the whole of cleanup and only falls
+        // away with this guard, so the machine is never briefly unprotected
+        // while the routes are being taken down.
+        if cleanup(self.state.firewall_rules).is_ok() {
             let _ = fs::remove_file(&self.state_path);
         }
     }
@@ -259,29 +346,38 @@ impl Drop for NetworkGuard {
 
 pub(crate) fn recover_stale_state() -> Result<(), ClientError> {
     let path = state_path()?;
-    if !path.exists() {
+    let Some(state) = read_state(&path) else {
         // Policy is only ever written after the recovery journal exists, so a
         // missing journal and a missing interface together mean the machine is
         // already clean. Skipping cleanup here keeps a full PowerShell start-up
         // off every normal connection.
-        if !netcfg::interface_exists(ADAPTER_NAME) {
+        if !path.exists() && !netcfg::interface_exists(ADAPTER_NAME) {
             return Ok(());
         }
-        cleanup()?;
+        cleanup(true)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
         return Ok(());
-    }
-    cleanup()?;
+    };
+    cleanup(state.firewall_rules)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
 pub(crate) fn repair() -> Result<(), ClientError> {
-    cleanup()?;
+    // An explicit repair makes no assumptions: sweep the firewall too, so rules
+    // left by a build that predates the WFP kill switch are collected.
+    cleanup(true)?;
     match fs::remove_file(state_path()?) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_state(path: &Path) -> Option<RecoveryState> {
+    toml::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 pub(crate) fn report() -> Result<String, ClientError> {
@@ -336,10 +432,15 @@ fn write_state(path: &Path, state: &RecoveryState) -> Result<(), ClientError> {
 
 /// Undoes every network change `MouseVPN` can make.
 ///
-/// Nothing here depends on the recovery journal: routes are recognised by the
-/// metric and protocol the client always stamps on them, so a session whose
-/// journal was lost still cleans up completely.
-fn cleanup() -> Result<(), ClientError> {
+/// Route removal does not depend on the recovery journal: routes are recognised
+/// by the metric and protocol the client always stamps on them, so a session
+/// whose journal was lost still cleans up completely.
+///
+/// `firewall_rules` says whether Windows Firewall is worth searching. The full
+/// tunnel keeps its kill switch in a dynamic WFP session that Windows tears down
+/// with the process, so skipping the search keeps a six-second PowerShell start
+/// out of every disconnect.
+fn cleanup(firewall_rules: bool) -> Result<(), ClientError> {
     let mut failures = Vec::new();
     if let Ok(tunnel) = netcfg::interface_luid(ADAPTER_NAME) {
         collect(&mut failures, netcfg::reset_tunnel_dns(ADAPTER_NAME));
@@ -347,17 +448,19 @@ fn cleanup() -> Result<(), ClientError> {
         collect(&mut failures, netcfg::clear_addresses(tunnel));
     }
     collect(&mut failures, netcfg::remove_owned_routes(|_| true));
-    collect(
-        &mut failures,
-        run_powershell(
-            &format!(
-                "$rules=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -ErrorAction SilentlyContinue); \
-                 if ($rules.Count -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}; \
-                 exit 0"
+    if firewall_rules {
+        collect(
+            &mut failures,
+            run_powershell(
+                &format!(
+                    "$rules=@(Get-NetFirewallRule -Group '{FIREWALL_GROUP}' -ErrorAction SilentlyContinue); \
+                     if ($rules.Count -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}; \
+                     exit 0"
+                ),
+                "remove the Windows kill switch",
             ),
-            "remove the Windows kill switch",
-        ),
-    );
+        );
+    }
     if failures.is_empty() {
         Ok(())
     } else {
