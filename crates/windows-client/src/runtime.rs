@@ -117,6 +117,14 @@ pub fn run_with_stop(
             &wire,
         );
         let _ = session.shutdown();
+        // `Session::shutdown` only signals blocking readers to stop; the driver
+        // does not release the session (WintunEndSession) until every `Arc`
+        // handle to it is dropped. `packet_loop::run` has already dropped its
+        // own clones by the time it returns, so this is the last one. Drop it
+        // now rather than waiting for a successful retry to overwrite it below
+        // — otherwise every `adapter.start_session` attempt below races the
+        // still-live old session and fails with WintunStartSession forever.
+        drop(session);
         if stopping.load(Ordering::Acquire) {
             return Ok(());
         }
