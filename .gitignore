@@ -16,3 +16,6 @@ local.toml
 /windows-driver/x64/
 /windows-driver/MouseVpn.*/
 /windows-gui/src-tauri/friend-test-installer.generated.nsh
+
+# CodeGraph index (local, rebuilt by `codegraph init`)
+.codegraph/
