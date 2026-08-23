@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 
@@ -168,10 +168,14 @@ pub(crate) fn prepare_inbound(bytes: &mut [u8], translation: Translation) -> boo
 }
 
 /// Captures outbound packets and feeds the routed ones to the tunnel.
+///
+/// The translation is shared rather than copied because a reconnect can change
+/// it: the server may assign a different tunnel address or MTU, and moving
+/// between networks changes the physical address too.
 pub(crate) struct Diverter {
     handle: Arc<Handle>,
     table: Arc<FlowTable>,
-    translation: Translation,
+    translation: Arc<RwLock<Translation>>,
 }
 
 impl Diverter {
@@ -184,7 +188,7 @@ impl Diverter {
     pub(crate) fn open(
         library: &Arc<Library>,
         table: Arc<FlowTable>,
-        translation: Translation,
+        translation: Arc<RwLock<Translation>>,
         server: SocketAddr,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
@@ -219,8 +223,15 @@ impl Diverter {
             let Some(length) = self.handle.recv(&mut buffer, &mut address)? else {
                 return Ok(());
             };
+            // Read once per packet: a reconnect may have replaced the
+            // addresses since the last one arrived.
+            let Ok(translation) = self.translation.read().map(|guard| *guard) else {
+                return Err(ClientError::Platform(
+                    "the split tunnel translation lock was poisoned".to_owned(),
+                ));
+            };
             let packet = &mut buffer[..length];
-            match prepare_outbound(packet, &self.table, self.translation) {
+            match prepare_outbound(packet, &self.table, translation) {
                 Outcome::PassThrough => {
                     // Captured but unmodified, so the checksums the stack
                     // computed are still correct and reinjection is a

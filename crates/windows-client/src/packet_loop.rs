@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -461,7 +461,7 @@ fn take_reconnect_request(
     requested.swap(false, Ordering::AcqRel) && grace_until.is_none_or(|deadline| now >= deadline)
 }
 
-fn is_peer_unavailable(error: &std::io::Error) -> bool {
+pub(crate) fn is_peer_unavailable(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::ConnectionRefused
@@ -472,7 +472,7 @@ fn is_peer_unavailable(error: &std::io::Error) -> bool {
     )
 }
 
-fn is_transient_io(error: &std::io::Error) -> bool {
+pub(crate) fn is_transient_io(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::Interrupted

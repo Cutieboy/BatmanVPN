@@ -73,6 +73,17 @@ impl FlowTable {
         }
     }
 
+    /// Forgets every classification.
+    ///
+    /// Needed when the physical address changes: it forms part of every key
+    /// here, so entries recorded against the old one can never match again and
+    /// would keep the table growing for the life of the session.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.clear();
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.read().map_or(0, |entries| entries.len())
