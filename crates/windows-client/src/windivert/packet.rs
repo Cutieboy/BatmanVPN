@@ -1,4 +1,4 @@
-#![doc = "Minimal in-place editing of the IP packets WinDivert hands over."]
+﻿#![doc = "Minimal in-place editing of the IP packets `WinDivert` hands over."]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -21,6 +21,10 @@ mod v6 {
 
 pub(crate) const PROTOCOL_TCP: u8 = 6;
 pub(crate) const PROTOCOL_UDP: u8 = 17;
+
+/// The low 13 bits of the IPv4 fragment field hold the offset; the upper 3
+/// are flags.
+const FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 
 /// A borrowed IP packet that can have its addresses rewritten.
 ///
@@ -130,14 +134,14 @@ impl<'a> Packet<'a> {
     ///
     /// Only the first fragment of a fragmented IPv4 datagram does. The later
     /// ones still need their addresses rewritten, so they are not rejected
-    /// outright — they simply have no ports to read.
+    /// outright: they simply have no ports to read.
     fn is_first_fragment(&self) -> bool {
         match self.version {
             Version::V4 => {
                 let field =
                     u16::from_be_bytes([self.bytes[v4::FRAGMENT], self.bytes[v4::FRAGMENT + 1]]);
-                // The low 13 bits hold the offset; the upper 3 are flags.
-                field & 0x1fff == 0
+                let fragment_offset = field & FRAGMENT_OFFSET_MASK;
+                fragment_offset == 0
             }
             Version::V6 => true,
         }

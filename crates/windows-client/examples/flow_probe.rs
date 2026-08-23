@@ -1,7 +1,7 @@
-//! Prints live WinDivert flow events, to validate split tunnelling on a real
+//! Prints live `WinDivert` flow events, to validate split tunnelling on a real
 //! machine before any of it reaches the connection path.
 //!
-//! Requires Administrator: opening the first WinDivert handle installs and
+//! Requires Administrator: opening the first `WinDivert` handle installs and
 //! starts the driver service. `WinDivert.dll` and `WinDivert64.sys` must sit
 //! next to this executable.
 //!

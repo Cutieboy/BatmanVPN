@@ -1,4 +1,4 @@
-#![doc = "Dynamic bindings to the vendored WinDivert 2.2 user-mode library."]
+﻿#![doc = "Dynamic bindings to the vendored `WinDivert` 2.2 user-mode library."]
 
 pub(crate) mod divert;
 pub(crate) mod flow;
@@ -34,7 +34,7 @@ pub(crate) const FLAG_RECV_ONLY: u64 = 0x0004;
 /// `WINDIVERT_SHUTDOWN_BOTH`.
 const SHUTDOWN_BOTH: u32 = 0x3;
 
-/// The largest packet WinDivert will hand back, from `WINDIVERT_MTU_MAX`.
+/// The largest packet `WinDivert` will hand back, from `WINDIVERT_MTU_MAX`.
 pub(crate) const MTU_MAX: usize = 40 + 0xFFFF;
 
 type OpenFn = unsafe extern "system" fn(*const i8, u32, i16, u64) -> HANDLE;
@@ -44,7 +44,7 @@ type ShutdownFn = unsafe extern "system" fn(HANDLE, u32) -> i32;
 type CloseFn = unsafe extern "system" fn(HANDLE) -> i32;
 type CalcChecksumsFn = unsafe extern "system" fn(*mut u8, u32, *mut Address, u64) -> i32;
 
-/// A WinDivert address, mirroring `WINDIVERT_ADDRESS`.
+/// A `WinDivert` address, mirroring `WINDIVERT_ADDRESS`.
 ///
 /// The C definition packs `Layer`, `Event` and eight one-bit properties into a
 /// single `UINT32` bitfield. Rust has no bitfields, so the word is stored raw
@@ -93,20 +93,35 @@ impl Address {
         }
     }
 
+    /// Describes an inbound network packet arriving on `interface_index`.
+    ///
+    /// Injecting a packet the stack never saw needs an address built by hand.
+    /// `LAYER_NETWORK` and the packet event are both zero, and leaving the
+    /// outbound bit clear is what marks the packet as arriving rather than
+    /// leaving. `WinDivert` delivers it to whichever socket is bound to the
+    /// destination, which is how translated tunnel traffic reaches the
+    /// application that asked for it.
+    pub(crate) fn for_inbound(interface_index: u32, sub_interface_index: u32) -> Self {
+        let mut address = Self::zeroed();
+        address.bitfield = LAYER_NETWORK;
+        let network = NetworkData {
+            if_idx: interface_index,
+            sub_if_idx: sub_interface_index,
+        };
+        // SAFETY: `payload` is 64 bytes and `NetworkData` is two `u32`s, so the
+        // write stays well inside the union.
+        unsafe {
+            ptr::write_unaligned(address.payload.as_mut_ptr().cast::<NetworkData>(), network);
+        }
+        address
+    }
+
     pub(crate) const fn layer(&self) -> u32 {
         self.bitfield & 0xFF
     }
 
     pub(crate) const fn event(&self) -> u32 {
         (self.bitfield >> 8) & 0xFF
-    }
-
-    pub(crate) const fn outbound(&self) -> bool {
-        (self.bitfield >> 17) & 1 == 1
-    }
-
-    pub(crate) const fn loopback(&self) -> bool {
-        (self.bitfield >> 18) & 1 == 1
     }
 
     pub(crate) const fn ipv6(&self) -> bool {
@@ -127,19 +142,12 @@ impl Address {
         })
     }
 
-    /// Reinterprets the union as network data.
-    pub(crate) fn network(&self) -> Option<NetworkData> {
-        (self.layer() == LAYER_NETWORK).then(|| {
-            // SAFETY: as above, for the two-`u32` network member.
-            unsafe { ptr::read_unaligned(self.payload.as_ptr().cast::<NetworkData>()) }
-        })
-    }
 }
 
-/// The loaded `WinDivert.dll` and the entry points MouseVPN uses.
+/// The loaded `WinDivert.dll` and the entry points `MouseVPN` uses.
 ///
 /// The library is resolved next to the running executable rather than embedded
-/// and extracted like `wintun.dll`. WinDivert is used under the LGPL, which
+/// and extracted like `wintun.dll`. `WinDivert` is used under the LGPL, which
 /// requires that a user be able to drop in their own build; a copy rewritten
 /// from the executable on every launch would defeat that. It also lets
 /// `WinDivert.dll` find `WinDivert64.sys` beside itself, which is how it
@@ -168,7 +176,7 @@ impl Library {
     /// # Errors
     ///
     /// Returns [`ClientError::Platform`] when the DLL is missing, cannot be
-    /// loaded, or does not export the expected WinDivert 2.2 entry points.
+    /// loaded, or does not export the expected `WinDivert` 2.2 entry points.
     pub(crate) fn load() -> Result<Arc<Self>, ClientError> {
         let path = library_path()?;
         let wide = path
@@ -214,7 +222,7 @@ impl Library {
         Ok(Arc::new(library))
     }
 
-    /// Opens a WinDivert handle for `filter` on `layer`.
+    /// Opens a `WinDivert` handle for `filter` on `layer`.
     ///
     /// Opening a handle is what installs and starts the driver service, so the
     /// first call on a machine is also the one that surfaces a missing or
@@ -249,9 +257,9 @@ impl Library {
     }
 }
 
-/// An open WinDivert handle.
+/// An open `WinDivert` handle.
 ///
-/// Dropping the handle closes it, which is also what lets WinDivert stop the
+/// Dropping the handle closes it, which is also what lets `WinDivert` stop the
 /// driver service once the last handle in the system goes away. A helper that
 /// crashes therefore cannot leave the machine diverting packets to nowhere.
 pub(crate) struct Handle {
@@ -340,7 +348,7 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Platform`] when WinDivert cannot parse the packet.
+    /// Returns [`ClientError::Platform`] when `WinDivert` cannot parse the packet.
     pub(crate) fn calc_checksums(
         &self,
         packet: &mut [u8],
@@ -469,13 +477,11 @@ mod tests {
     #[test]
     fn decodes_the_packed_layer_and_event_word() {
         let mut address = Address::zeroed();
-        // Layer occupies the low byte, Event the next, and Outbound is bit 17.
-        address.bitfield = LAYER_FLOW | (EVENT_FLOW_ESTABLISHED << 8) | (1 << 17);
+        // Layer occupies the low byte and Event the next; bit 20 is IPv6.
+        address.bitfield = LAYER_FLOW | (EVENT_FLOW_ESTABLISHED << 8) | (1 << 20);
         assert_eq!(address.layer(), LAYER_FLOW);
         assert_eq!(address.event(), EVENT_FLOW_ESTABLISHED);
-        assert!(address.outbound());
-        assert!(!address.ipv6());
-        assert!(address.network().is_none());
+        assert!(address.ipv6());
         assert!(address.flow().is_some());
     }
 
@@ -484,6 +490,14 @@ mod tests {
         let mut address = Address::zeroed();
         address.bitfield = LAYER_NETWORK;
         assert!(address.flow().is_none());
-        assert!(address.network().is_some());
+    }
+
+    #[test]
+    fn builds_an_inbound_address_carrying_the_interface() {
+        let address = Address::for_inbound(17, 0);
+        // Layer network, and the outbound bit clear is what marks it inbound.
+        assert_eq!(address.layer(), LAYER_NETWORK);
+        assert_eq!(address.bitfield >> 17 & 1, 0);
+        assert_eq!(address.payload[..4], 17_u32.to_ne_bytes());
     }
 }

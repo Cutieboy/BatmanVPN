@@ -1,4 +1,4 @@
-#![doc = "Tracks which process owns each network flow, using the WinDivert flow layer."]
+﻿#![doc = "Tracks which process owns each network flow, using the `WinDivert` flow layer."]
 
 use std::{
     collections::HashMap,
@@ -102,7 +102,7 @@ impl FlowWatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Platform`] when the WinDivert flow handle cannot
+    /// Returns [`ClientError::Platform`] when the `WinDivert` flow handle cannot
     /// be opened.
     pub(crate) fn start(
         library: &Arc<Library>,
@@ -193,7 +193,7 @@ fn run(
 /// This is a diagnostic, not part of the connection path. It answers three
 /// questions that only a real machine can: whether the vendored driver loads
 /// without test signing, whether the flow layer reports process ids in time,
-/// and whether the address layout this module assumes is the one WinDivert
+/// and whether the address layout this module assumes is the one `WinDivert`
 /// actually uses.
 ///
 /// Every event is printed with both the decoded tuple and the raw address
@@ -285,7 +285,7 @@ pub fn probe(seconds: u64) -> Result<(), ClientError> {
 /// same PID reappears for every flow a busy application creates, so the answer
 /// is memoised. PIDs are recycled by Windows, but only after the process exits,
 /// and a stale entry can at worst misroute flows of a process that inherited
-/// the number — bounded by clearing the cache on reconnect.
+/// the number, bounded by clearing the cache on reconnect.
 struct Classifier {
     mode: AppRoutingMode,
     apps: Vec<PathBuf>,
@@ -354,7 +354,9 @@ fn process_path(process_id: u32) -> Option<PathBuf> {
     if process.is_null() {
         return None;
     }
-    let mut buffer = [0_u16; 32_768];
+    // Windows paths reach 32767 characters, which is far too much to put on
+    // the stack for a call made on every new process.
+    let mut buffer = vec![0_u16; 32_768];
     let mut length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     // SAFETY: `length` describes `buffer`, and the handle is valid until the
     // close below.
@@ -379,9 +381,9 @@ fn process_path(process_id: u32) -> Option<PathBuf> {
     Some(normalize_windows_path(Path::new(&path)))
 }
 
-/// Builds a flow key from the WinDivert flow data.
+/// Builds a flow key from the `WinDivert` flow data.
 ///
-/// WinDivert reports flow addresses as IPv4-mapped IPv6 in its host-order
+/// `WinDivert` reports flow addresses as IPv4-mapped IPv6 in its host-order
 /// representation, where word 0 holds the least significant part. An IPv4 flow
 /// therefore arrives as `[addr, 0xffff, 0, 0]`.
 fn flow_key(flow: &super::FlowData, ipv6: bool) -> Option<FlowKey> {
