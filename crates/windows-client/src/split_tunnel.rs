@@ -281,7 +281,15 @@ impl ReceiveLoop<'_> {
 
         while !stopping.load(Ordering::Acquire) {
             match self.transport.receive(&mut buffers.encrypted) {
-                Ok(length) => self.deliver(length, &mut buffers, &mut liveness, &mut diagnostics),
+                Ok(length) => {
+                    // Timed because this is the only stretch where the socket
+                    // is unattended. How long it lasts decides whether the
+                    // datagrams missing from the sequence were dropped here or
+                    // never arrived.
+                    let started = Instant::now();
+                    self.deliver(length, &mut buffers, &mut liveness, &mut diagnostics);
+                    diagnostics.processed(started.elapsed());
+                }
                 Err(error) if is_transient_io(&error) => {}
                 Err(error) if is_peer_unavailable(&error) => {
                     liveness.connection_lost(Instant::now());

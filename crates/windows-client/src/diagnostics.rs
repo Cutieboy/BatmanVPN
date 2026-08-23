@@ -156,6 +156,17 @@ pub(crate) struct Diagnostics {
     probes_sent: u64,
     probes_answered: u64,
     outstanding: Option<Instant>,
+    /// The longest and the total time one datagram took to process.
+    ///
+    /// This is the measurement that separates loss we cause from loss we only
+    /// observe. Everything between two receives happens on one thread, and
+    /// while it runs the socket's buffer is filling. If the longest pause is
+    /// microseconds, the buffer cannot have overflowed and the datagrams went
+    /// missing before they reached this machine. If it is milliseconds, they
+    /// went missing here.
+    busy_max: Duration,
+    busy_total: Duration,
+    busy_count: u64,
     rtt: Rtt,
     sequence: Sequence,
 }
@@ -183,9 +194,19 @@ impl Diagnostics {
             probes_sent: 0,
             probes_answered: 0,
             outstanding: None,
+            busy_max: Duration::ZERO,
+            busy_total: Duration::ZERO,
+            busy_count: 0,
             rtt: Rtt::default(),
             sequence: Sequence::default(),
         }
+    }
+
+    /// Records how long one datagram occupied the receive loop.
+    pub(crate) fn processed(&mut self, elapsed: Duration) {
+        self.busy_max = self.busy_max.max(elapsed);
+        self.busy_total = self.busy_total.saturating_add(elapsed);
+        self.busy_count = self.busy_count.saturating_add(1);
     }
 
     /// Records one datagram accepted from the server.
@@ -244,7 +265,8 @@ impl Diagnostics {
         eprintln!(
             "MOUSEVPN_DIAG=up_pkt={up_packets} up_kb={} up_fail={up_failed} \
              down_pkt={} down_kb={} down_lost={lost}/{expected} down_loss_pct={} \
-             down_bad={} ping_ms={} ping_min={} ping_max={} probes={}/{}",
+             down_bad={} ping_ms={} ping_min={} ping_max={} probes={}/{} \
+             busy_avg_us={} busy_max_us={}",
             up_bytes / 1024,
             self.packets,
             self.bytes / 1024,
@@ -255,6 +277,8 @@ impl Diagnostics {
             millis(self.rtt.max),
             self.probes_answered,
             self.probes_sent,
+            micros(self.busy_total) / self.busy_count.max(1),
+            micros(self.busy_max),
         );
 
         self.packets = 0;
@@ -262,8 +286,15 @@ impl Diagnostics {
         self.rejected = 0;
         self.probes_sent = 0;
         self.probes_answered = 0;
+        self.busy_max = Duration::ZERO;
+        self.busy_total = Duration::ZERO;
+        self.busy_count = 0;
         self.rtt = Rtt::default();
     }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Formats microseconds as milliseconds with one decimal, in integers.
