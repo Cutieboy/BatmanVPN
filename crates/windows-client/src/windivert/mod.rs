@@ -1,6 +1,7 @@
 #![doc = "Dynamic bindings to the vendored WinDivert 2.2 user-mode library."]
 
 pub(crate) mod flow;
+pub(crate) mod packet;
 
 use std::{
     ffi::CString,
