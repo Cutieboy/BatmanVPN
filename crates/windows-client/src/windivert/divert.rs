@@ -25,16 +25,40 @@ pub(crate) enum Outcome {
     /// The packet belongs to an application that stays on the physical link.
     /// It has not been touched and must be reinjected exactly as captured.
     PassThrough,
+    /// The packet belongs to a routed application but cannot be tunnelled.
+    /// It must be discarded rather than handed back, because reinjecting it
+    /// would send traffic the user asked to protect out in the clear.
+    Discard,
 }
 
-/// The two addresses the split tunnel substitutes between.
+/// How the split tunnel translates between the two ends of a session.
 ///
 /// Applications only ever see `physical`, because every packet is translated
 /// before it reaches them. `tunnel` exists solely on the wire to the server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Addresses {
+pub(crate) struct Translation {
     pub(crate) physical: IpAddr,
     pub(crate) tunnel: IpAddr,
+    /// The largest TCP segment the tunnel can carry, clamped into the
+    /// handshake of every routed connection.
+    pub(crate) max_segment_size: u16,
+}
+
+impl Translation {
+    /// Derives the segment limit from the tunnel's MTU.
+    ///
+    /// A full-tunnel session hands this MTU to the Wintun adapter and the stack
+    /// sizes everything accordingly. There is no adapter here, so the limit has
+    /// to be imposed on the connections themselves.
+    pub(crate) fn new(physical: IpAddr, tunnel: IpAddr, tunnel_mtu: u16) -> Self {
+        // IPv4 and TCP headers, twenty bytes each, come off the top.
+        const HEADERS: u16 = 40;
+        Self {
+            physical,
+            tunnel,
+            max_segment_size: tunnel_mtu.saturating_sub(HEADERS),
+        }
+    }
 }
 
 /// Builds the capture filter.
@@ -93,7 +117,7 @@ fn filter(server: SocketAddr) -> String {
 pub(crate) fn prepare_outbound(
     bytes: &mut [u8],
     table: &FlowTable,
-    addresses: Addresses,
+    translation: Translation,
 ) -> Outcome {
     let Some(mut packet) = Packet::parse(bytes) else {
         return Outcome::PassThrough;
@@ -117,9 +141,15 @@ pub(crate) fn prepare_outbound(
     // The application bound to the physical address, but the server only
     // recognises the tunnel one. Anything else would come back to the wrong
     // place, if it came back at all.
-    if !packet.set_source(addresses.tunnel) {
-        return Outcome::PassThrough;
+    //
+    // This fails when the flow is IPv6, because the session only assigns an
+    // IPv4 address. Handing such a packet back would put traffic the policy
+    // routes through the tunnel onto the physical link instead, so it is
+    // dropped: the application sees the address family fail and falls back.
+    if !packet.set_source(translation.tunnel) {
+        return Outcome::Discard;
     }
+    packet.clamp_mss(translation.max_segment_size);
     Outcome::Tunnel
 }
 
@@ -127,21 +157,21 @@ pub(crate) fn prepare_outbound(
 ///
 /// Returns `false` when the packet is not addressed to the tunnel address, so
 /// traffic meant for something else is never redirected at an application.
-pub(crate) fn prepare_inbound(bytes: &mut [u8], addresses: Addresses) -> bool {
+pub(crate) fn prepare_inbound(bytes: &mut [u8], translation: Translation) -> bool {
     let Some(mut packet) = Packet::parse(bytes) else {
         return false;
     };
-    if packet.destination() != addresses.tunnel {
+    if packet.destination() != translation.tunnel {
         return false;
     }
-    packet.set_destination(addresses.physical)
+    packet.set_destination(translation.physical)
 }
 
 /// Captures outbound packets and feeds the routed ones to the tunnel.
 pub(crate) struct Diverter {
     handle: Arc<Handle>,
     table: Arc<FlowTable>,
-    addresses: Addresses,
+    translation: Translation,
 }
 
 impl Diverter {
@@ -154,7 +184,7 @@ impl Diverter {
     pub(crate) fn open(
         library: &Arc<Library>,
         table: Arc<FlowTable>,
-        addresses: Addresses,
+        translation: Translation,
         server: SocketAddr,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
@@ -163,7 +193,7 @@ impl Diverter {
         Ok(Self {
             handle,
             table,
-            addresses,
+            translation,
         })
     }
 
@@ -184,17 +214,27 @@ impl Diverter {
     ) -> Result<(), ClientError> {
         let mut buffer = vec![0_u8; MTU_MAX];
         let mut address = Address::zeroed();
+        let mut discarded = 0_u64;
         while !stopping.load(Ordering::Acquire) {
             let Some(length) = self.handle.recv(&mut buffer, &mut address)? else {
                 return Ok(());
             };
             let packet = &mut buffer[..length];
-            match prepare_outbound(packet, &self.table, self.addresses) {
+            match prepare_outbound(packet, &self.table, self.translation) {
                 Outcome::PassThrough => {
                     // Captured but unmodified, so the checksums the stack
                     // computed are still correct and reinjection is a
                     // straight handback.
                     self.reinject(packet, &address);
+                }
+                Outcome::Discard => {
+                    discarded = discarded.saturating_add(1);
+                    if discarded.is_power_of_two() {
+                        eprintln!(
+                            "MOUSEVPN_DIVERT_WARNING=discarded {discarded} packet(s) of routed \
+                             applications that this session cannot carry, usually IPv6"
+                        );
+                    }
                 }
                 Outcome::Tunnel => {
                     // The source address changed, which invalidates the IP and
@@ -246,22 +286,19 @@ impl Diverter {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter, prepare_inbound, prepare_outbound, Addresses, Outcome};
+    use super::{filter, prepare_inbound, prepare_outbound, Outcome, Translation};
     use crate::windivert::{
         flow::{Disposition, FlowKey, FlowTable},
         packet::PROTOCOL_UDP,
     };
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     const PHYSICAL: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 189));
     const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 77, 0, 22));
     const REMOTE: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-    fn addresses() -> Addresses {
-        Addresses {
-            physical: PHYSICAL,
-            tunnel: TUNNEL,
-        }
+    fn addresses() -> Translation {
+        Translation::new(PHYSICAL, TUNNEL, 1280)
     }
 
     fn udp_packet(source: IpAddr, destination: IpAddr) -> Vec<u8> {
@@ -356,6 +393,43 @@ mod tests {
         assert!(filter.contains("51820"));
         assert!(filter.contains("outbound"));
         assert!(filter.contains("!loopback"));
+    }
+
+    #[test]
+    fn derives_the_segment_limit_from_the_tunnel_mtu() {
+        // 1280 less twenty bytes of IPv4 header and twenty of TCP.
+        assert_eq!(addresses().max_segment_size, 1240);
+        // A nonsensically small MTU must not wrap around into a huge limit.
+        assert_eq!(Translation::new(PHYSICAL, TUNNEL, 8).max_segment_size, 0);
+    }
+
+    #[test]
+    fn discards_a_routed_flow_it_cannot_translate() {
+        // An IPv6 flow of a routed application has no tunnel address to take.
+        // Handing it back would put protected traffic on the physical link.
+        let mut packet = vec![0_u8; 60];
+        packet[0] = 0x60;
+        packet[6] = PROTOCOL_UDP;
+        packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        packet[40..42].copy_from_slice(&54_518_u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&53_u16.to_be_bytes());
+
+        let table = FlowTable::default();
+        table.insert_for_test(
+            FlowKey {
+                protocol: PROTOCOL_UDP,
+                local: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                local_port: 54_518,
+                remote: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                remote_port: 53,
+            },
+            Disposition::Tunnel,
+        );
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses()),
+            Outcome::Discard
+        );
     }
 
     #[test]

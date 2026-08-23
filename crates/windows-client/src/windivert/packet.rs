@@ -130,6 +130,73 @@ impl<'a> Packet<'a> {
         Some((source, destination))
     }
 
+    /// Lowers the TCP maximum segment size option to at most `limit`.
+    ///
+    /// Without an adapter to advertise the tunnel's MTU, applications size
+    /// their segments for the physical link and produce packets the tunnel
+    /// cannot carry. Dropping those silently creates a path MTU black hole:
+    /// small requests succeed, bulk transfers stall forever, and discovery
+    /// cannot correct it because no ICMP is sent back.
+    ///
+    /// Clamping the option on the handshake stops both ends from ever building
+    /// an oversized segment, which is the standard fix and needs no state.
+    ///
+    /// Returns `true` when an option was rewritten.
+    pub(crate) fn clamp_mss(&mut self, limit: u16) -> bool {
+        const SYN: u8 = 0x02;
+        const END_OF_OPTIONS: u8 = 0;
+        const NO_OPERATION: u8 = 1;
+        const MAXIMUM_SEGMENT_SIZE: u8 = 2;
+        const MSS_LENGTH: u8 = 4;
+
+        if self.protocol() != PROTOCOL_TCP || !self.is_first_fragment() {
+            return false;
+        }
+        let Some(transport) = self.bytes.get(self.header_length..) else {
+            return false;
+        };
+        // A minimal TCP header is 20 bytes; options live beyond that.
+        if transport.len() < 20 || transport[13] & SYN == 0 {
+            return false;
+        }
+        let data_offset = usize::from(transport[12] >> 4) * 4;
+        if data_offset <= 20 || data_offset > transport.len() {
+            return false;
+        }
+
+        let options = self.header_length + 20;
+        let end = self.header_length + data_offset;
+        let mut index = options;
+        while index < end {
+            match self.bytes[index] {
+                END_OF_OPTIONS => return false,
+                NO_OPERATION => index += 1,
+                kind => {
+                    // Every other option carries its own length, and a bogus
+                    // one would send this walk off into the payload.
+                    let Some(&length) = self.bytes.get(index + 1) else {
+                        return false;
+                    };
+                    let length = usize::from(length);
+                    if length < 2 || index + length > end {
+                        return false;
+                    }
+                    if kind == MAXIMUM_SEGMENT_SIZE && length == usize::from(MSS_LENGTH) {
+                        let offered =
+                            u16::from_be_bytes([self.bytes[index + 2], self.bytes[index + 3]]);
+                        if offered <= limit {
+                            return false;
+                        }
+                        self.bytes[index + 2..index + 4].copy_from_slice(&limit.to_be_bytes());
+                        return true;
+                    }
+                    index += length;
+                }
+            }
+        }
+        false
+    }
+
     /// Reports whether this packet carries the transport header.
     ///
     /// Only the first fragment of a fragmented IPv4 datagram does. The later
@@ -272,6 +339,75 @@ mod tests {
         // The addresses are still rewritable, which is what keeps a fragmented
         // datagram intact end to end.
         assert_eq!(packet.source(), IpAddr::V4(Ipv4Addr::new(10, 77, 0, 22)));
+    }
+
+    /// An IPv4 SYN carrying window scale, an MSS of 1460, and NOP padding.
+    fn ipv4_syn_with_mss(mss: u16) -> Vec<u8> {
+        let mut packet = vec![0_u8; 20 + 28];
+        packet[0] = 0x45;
+        packet[9] = PROTOCOL_TCP;
+        packet[12..16].copy_from_slice(&Ipv4Addr::new(192, 168, 0, 189).octets());
+        packet[16..20].copy_from_slice(&Ipv4Addr::new(1, 1, 1, 1).octets());
+        packet[20..22].copy_from_slice(&51_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        // Seven 32-bit words of TCP header, SYN set.
+        packet[32] = 7 << 4;
+        packet[33] = 0x02;
+        // Window scale, then NOP padding, then the MSS option.
+        packet[40] = 3;
+        packet[41] = 3;
+        packet[42] = 7;
+        packet[43] = 1;
+        packet[44] = 2;
+        packet[45] = 4;
+        packet[46..48].copy_from_slice(&mss.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn clamps_an_oversized_mss_past_other_options() {
+        let mut bytes = ipv4_syn_with_mss(1460);
+        let mut packet = Packet::parse(&mut bytes).expect("parses");
+        assert!(packet.clamp_mss(1240));
+        assert_eq!(u16::from_be_bytes([bytes[46], bytes[47]]), 1240);
+        // The window scale option must survive untouched.
+        assert_eq!(&bytes[40..43], &[3, 3, 7]);
+    }
+
+    #[test]
+    fn leaves_an_mss_that_already_fits() {
+        let mut bytes = ipv4_syn_with_mss(1200);
+        let original = bytes.clone();
+        let mut packet = Packet::parse(&mut bytes).expect("parses");
+        assert!(!packet.clamp_mss(1240));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn only_clamps_the_handshake() {
+        let mut bytes = ipv4_syn_with_mss(1460);
+        // Clear SYN: a mid-stream segment has no MSS option to speak of, and
+        // these bytes mean something else entirely.
+        bytes[33] = 0x10;
+        let original = bytes.clone();
+        let mut packet = Packet::parse(&mut bytes).expect("parses");
+        assert!(!packet.clamp_mss(1240));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn refuses_to_walk_past_a_malformed_option() {
+        let mut bytes = ipv4_syn_with_mss(1460);
+        // A length of zero would loop forever; one that overruns the header
+        // would read the payload as options.
+        bytes[41] = 0;
+        let mut packet = Packet::parse(&mut bytes).expect("parses");
+        assert!(!packet.clamp_mss(1240));
+
+        let mut bytes = ipv4_syn_with_mss(1460);
+        bytes[41] = 200;
+        let mut packet = Packet::parse(&mut bytes).expect("parses");
+        assert!(!packet.clamp_mss(1240));
     }
 
     #[test]

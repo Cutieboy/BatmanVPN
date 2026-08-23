@@ -20,7 +20,7 @@ use crate::{
     netcfg, network, packet_loop,
     platform::ensure_supported_runtime,
     windivert::{
-        divert::{prepare_inbound, Addresses, Diverter},
+        divert::{prepare_inbound, Diverter, Translation},
         flow::FlowWatcher,
         Address, Library,
     },
@@ -66,10 +66,11 @@ pub fn run_split_tunnel(
     // Both addresses are fixed for the life of the session, which is what
     // makes the translation stateless.
     let physical = network::physical_addresses()?.ipv4;
-    let addresses = Addresses {
-        physical: IpAddr::V4(physical),
-        tunnel: IpAddr::V4(parameters.client_address),
-    };
+    let translation = Translation::new(
+        IpAddr::V4(physical),
+        IpAddr::V4(parameters.client_address),
+        parameters.mtu,
+    );
     // Inbound injection has to name the interface the packet should look like
     // it arrived on, so translated replies reach the application's socket.
     let route = netcfg::default_ipv4_route(None)?;
@@ -81,7 +82,7 @@ pub fn run_split_tunnel(
     let diverter = Arc::new(Diverter::open(
         &library,
         watcher.table(),
-        addresses,
+        translation,
         config.server,
     )?);
 
@@ -102,6 +103,7 @@ pub fn run_split_tunnel(
             move || {
                 let mut encrypted = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
                 let mut datagram = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
+                let mut oversized = 0_u64;
                 diverter.run(&stopping, |packet| {
                     let encoded = sender
                         .lock()
@@ -120,7 +122,20 @@ pub fn run_split_tunnel(
                         });
                     match encoded {
                         Ok(()) => {}
-                        Err(Skip) => return,
+                        Err(Skip) => {
+                            // Clamping the segment size keeps TCP within the
+                            // tunnel, so anything still arriving oversized is
+                            // a datagram protocol probing upwards. Counting it
+                            // is what turns a silent black hole into evidence.
+                            oversized = oversized.saturating_add(1);
+                            if oversized.is_power_of_two() {
+                                eprintln!(
+                                    "MOUSEVPN_SPLIT_WARNING=dropped {oversized} packet(s) larger \
+                                     than the tunnel MTU"
+                                );
+                            }
+                            return;
+                        }
                         Err(Fatal(error)) => {
                             eprintln!("MOUSEVPN_SPLIT_WARNING={error}");
                             return;
@@ -144,7 +159,7 @@ pub fn run_split_tunnel(
         ReceiveContext {
             transport: incoming,
             wire: &wire,
-            addresses,
+            translation,
             interface_index: route.interface_index,
             diverter: &diverter,
         },
@@ -166,7 +181,7 @@ pub fn run_split_tunnel(
 struct ReceiveContext<'a> {
     transport: mousevpn_transport::UdpTransport,
     wire: &'a ClientWire,
-    addresses: Addresses,
+    translation: Translation,
     interface_index: u32,
     diverter: &'a Diverter,
 }
@@ -213,7 +228,7 @@ fn receive_loop(
         // A packet addressed to anything but the tunnel address is not ours to
         // deliver, and injecting it could hand an application traffic it never
         // asked for.
-        if !prepare_inbound(&mut packet, context.addresses) {
+        if !prepare_inbound(&mut packet, context.translation) {
             continue;
         }
         context.diverter.inject_inbound(&mut packet, address);
