@@ -18,6 +18,7 @@ use mousevpn_transport::{DatagramTransport, UdpTransport};
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
 use crate::{
+    diagnostics::{Diagnostics, SendCounters},
     handshake::connect,
     liveness::{Action, Liveness},
     netcfg, network,
@@ -91,6 +92,7 @@ pub fn run_split_tunnel(
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
     let (transport_tx, transport_rx) = mpsc::sync_channel(1);
+    let counters = Arc::new(SendCounters::default());
 
     eprintln!("MOUSEVPN_STATE=connected");
     eprintln!("MOUSEVPN_MODE=split_tunnel");
@@ -102,6 +104,7 @@ pub fn run_split_tunnel(
         wire.clone(),
         outgoing,
         transport_rx,
+        &counters,
     )?;
 
     let result = ReceiveLoop {
@@ -113,6 +116,7 @@ pub fn run_split_tunnel(
         translation: &translation,
         table: &table,
         diverter: &diverter,
+        counters: &counters,
         outbound_transport: &transport_tx,
         inbound: Address::for_inbound(netcfg::default_ipv4_route(None)?.interface_index, 0),
     }
@@ -137,10 +141,12 @@ fn spawn_outbound(
     wire: ClientWire,
     mut transport: UdpTransport,
     replacements: mpsc::Receiver<UdpTransport>,
+    counters: &Arc<SendCounters>,
 ) -> Result<thread::JoinHandle<Result<(), ClientError>>, ClientError> {
     let diverter = Arc::clone(diverter);
     let sender = Arc::clone(sender);
     let stopping = Arc::clone(stopping);
+    let counters = Arc::clone(counters);
     thread::Builder::new()
         .name("mousevpn-split-outbound".to_owned())
         .spawn(move || {
@@ -171,6 +177,7 @@ fn spawn_outbound(
                 match encoded {
                     Ok(()) => {}
                     Err(Skip) => {
+                        counters.failed();
                         // Clamping the segment size keeps TCP within the
                         // tunnel, so anything still arriving oversized is a
                         // datagram protocol probing upwards. Counting it is
@@ -191,6 +198,7 @@ fn spawn_outbound(
                         return;
                     }
                     Err(Fatal(error)) => {
+                        counters.failed();
                         eprintln!("MOUSEVPN_SPLIT_WARNING={error}");
                         return;
                     }
@@ -200,12 +208,18 @@ fn spawn_outbound(
                     .map_err(ClientError::from)
                     .and_then(|()| transport.send(&datagram).map_err(ClientError::from))
                 {
-                    Ok(()) => {}
+                    Ok(()) => counters.sent(datagram.len()),
                     // The receive loop notices the same silence and rebuilds
                     // the session; reporting every packet would drown it out.
                     Err(ClientError::Io(error))
-                        if is_peer_unavailable(&error) || is_transient_io(&error) => {}
-                    Err(error) => eprintln!("MOUSEVPN_SPLIT_WARNING={error}"),
+                        if is_peer_unavailable(&error) || is_transient_io(&error) =>
+                    {
+                        counters.failed();
+                    }
+                    Err(error) => {
+                        counters.failed();
+                        eprintln!("MOUSEVPN_SPLIT_WARNING={error}");
+                    }
                 }
             })
         })
@@ -224,29 +238,60 @@ struct ReceiveLoop<'a> {
     translation: &'a Arc<RwLock<Translation>>,
     table: &'a Arc<FlowTable>,
     diverter: &'a Diverter,
+    counters: &'a Arc<SendCounters>,
     outbound_transport: &'a mpsc::SyncSender<UdpTransport>,
     inbound: Address,
 }
 
+/// The scratch space one session reuses for every packet.
+///
+/// Sized once when the loop starts, so the receive path allocates nothing
+/// afterwards. Kept together because passing six buffers individually says
+/// nothing that "the buffers" does not.
+struct Buffers {
+    encrypted: Vec<u8>,
+    payload: Vec<u8>,
+    plaintext: Vec<u8>,
+    /// Injection rewrites the packet, and the decoded one is borrowed from
+    /// `plaintext`. One buffer for that copy is what keeps the inbound path
+    /// from allocating per packet.
+    injectable: Vec<u8>,
+    keepalive: Vec<u8>,
+    wire_keepalive: Vec<u8>,
+}
+
+impl Buffers {
+    fn new() -> Self {
+        Self {
+            encrypted: vec![0_u8; MAX_WIRE_DATAGRAM_LEN],
+            payload: Vec::with_capacity(DATAGRAM_BUFFER_LEN),
+            plaintext: Vec::with_capacity(DATAGRAM_BUFFER_LEN),
+            injectable: Vec::with_capacity(DATAGRAM_BUFFER_LEN),
+            keepalive: Vec::with_capacity(128),
+            wire_keepalive: Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN),
+        }
+    }
+}
+
 impl ReceiveLoop<'_> {
     fn run(&mut self, stopping: &AtomicBool) -> Result<(), ClientError> {
-        let mut encrypted = vec![0_u8; MAX_WIRE_DATAGRAM_LEN];
-        let mut payload = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
-        let mut plaintext = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
-        let mut keepalive = Vec::with_capacity(128);
-        let mut wire_keepalive = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
+        let mut buffers = Buffers::new();
         let mut liveness = Liveness::new(Instant::now());
+        let mut diagnostics = Diagnostics::start();
 
         while !stopping.load(Ordering::Acquire) {
-            match self.transport.receive(&mut encrypted) {
-                Ok(length) => self.deliver(length, &encrypted, &mut payload, &mut plaintext, &mut liveness),
+            match self.transport.receive(&mut buffers.encrypted) {
+                Ok(length) => self.deliver(length, &mut buffers, &mut liveness, &mut diagnostics),
                 Err(error) if is_transient_io(&error) => {}
                 Err(error) if is_peer_unavailable(&error) => {
                     liveness.connection_lost(Instant::now());
                 }
                 Err(error) => return Err(error.into()),
             }
-            self.maintain(&mut liveness, &mut keepalive, &mut wire_keepalive)?;
+            self.maintain(&mut liveness, &mut buffers, &mut diagnostics)?;
+            // The receive timeout bounds how long this can be deferred, so a
+            // silent tunnel still reports its silence on schedule.
+            diagnostics.report(self.counters);
         }
         Ok(())
     }
@@ -255,46 +300,65 @@ impl ReceiveLoop<'_> {
     fn deliver(
         &mut self,
         length: usize,
-        encrypted: &[u8],
-        payload: &mut Vec<u8>,
-        plaintext: &mut Vec<u8>,
+        buffers: &mut Buffers,
         liveness: &mut Liveness,
+        diagnostics: &mut Diagnostics,
     ) {
-        let decoded = self
+        let framed = self
             .wire
-            .decode(&encrypted[..length], payload)
+            .decode(&buffers.encrypted[..length], &mut buffers.payload)
             .ok()
             .filter(|decoded| *decoded)
-            .and_then(|_| Datagram::decode(payload).ok())
-            .map(|datagram| self.receiver.decode_into(datagram, plaintext));
-        let packet = match decoded {
-            Some(Ok(Decoded::Ip(packet))) => packet,
+            .and_then(|_| Datagram::decode(&buffers.payload).ok());
+        let Some(datagram) = framed else {
+            diagnostics.rejected();
+            return;
+        };
+        // Read before the datagram is consumed: the header numbers every
+        // datagram the server sends, which is the only way from here to tell
+        // a packet the network dropped from one that was never sent.
+        let sequence = datagram.header.sequence;
+        let packet = match self.receiver.decode_into(datagram, &mut buffers.plaintext) {
+            Ok(Decoded::Ip(packet)) => {
+                diagnostics.received(sequence, length);
+                packet
+            }
             // A keepalive proves the peer is there, which is its entire job.
-            Some(Ok(Decoded::Keepalive)) => {
-                liveness.packet_received(Instant::now());
+            // It is also the reply to a probe we timed, and so the session's
+            // round-trip time.
+            Ok(Decoded::Keepalive) => {
+                let now = Instant::now();
+                diagnostics.received(sequence, length);
+                diagnostics.probe_answered(now);
+                liveness.packet_received(now);
                 return;
             }
-            Some(Err(_)) | None => return,
+            Err(_) => {
+                diagnostics.rejected();
+                return;
+            }
         };
         liveness.packet_received(Instant::now());
 
         let Ok(translation) = self.translation.read().map(|guard| *guard) else {
             return;
         };
-        let mut packet = packet.to_vec();
+        buffers.injectable.clear();
+        buffers.injectable.extend_from_slice(packet);
         // A packet addressed to anything but the tunnel address is not ours to
         // deliver, and injecting it could hand an application traffic it never
         // asked for.
-        if prepare_inbound(&mut packet, translation) {
-            self.diverter.inject_inbound(&mut packet, self.inbound);
+        if prepare_inbound(&mut buffers.injectable, translation) {
+            self.diverter
+                .inject_inbound(&mut buffers.injectable, self.inbound);
         }
     }
 
     fn maintain(
         &mut self,
         liveness: &mut Liveness,
-        keepalive: &mut Vec<u8>,
-        wire_keepalive: &mut Vec<u8>,
+        buffers: &mut Buffers,
+        diagnostics: &mut Diagnostics,
     ) -> Result<(), ClientError> {
         let now = Instant::now();
         match liveness.action(now) {
@@ -303,10 +367,17 @@ impl ReceiveLoop<'_> {
                 let mut sender = self.sender.lock().map_err(|_| {
                     ClientError::Platform("the split tunnel sender lock was poisoned".to_owned())
                 })?;
-                sender.encode_keepalive_into(keepalive)?;
-                self.wire.encode(keepalive, wire_keepalive)?;
-                match self.transport.send(wire_keepalive) {
-                    Ok(()) => liveness.keepalive_sent(now),
+                sender.encode_keepalive_into(&mut buffers.keepalive)?;
+                self.wire
+                    .encode(&buffers.keepalive, &mut buffers.wire_keepalive)?;
+                match self.transport.send(&buffers.wire_keepalive) {
+                    Ok(()) => {
+                        liveness.keepalive_sent(now);
+                        // The server answers a keepalive with a keepalive, so
+                        // this is the outbound half of a real round trip and
+                        // not an estimate derived from anything else.
+                        diagnostics.probe_sent(now);
+                    }
                     Err(error) if is_peer_unavailable(&error) => liveness.connection_lost(now),
                     Err(error) => return Err(error.into()),
                 }
@@ -318,6 +389,9 @@ impl ReceiveLoop<'_> {
                 match self.establish() {
                     Ok(()) => {
                         liveness.reconnected(Instant::now());
+                        // The new session numbers its datagrams from zero, so
+                        // anything measured against the old one is now noise.
+                        diagnostics.session_restarted();
                         eprintln!("MOUSEVPN_STATE=reconnected");
                     }
                     Err(error) => eprintln!("MOUSEVPN_RECONNECT_ERROR={error}"),

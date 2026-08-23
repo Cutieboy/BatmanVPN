@@ -9,6 +9,8 @@ mod app_bypass;
 #[cfg(not(windows))]
 #[path = "app_bypass_stub.rs"]
 mod app_bypass;
+// Temporary: see the module documentation for what removing it involves.
+mod diagnostics;
 mod error;
 mod handshake;
 mod liveness;
