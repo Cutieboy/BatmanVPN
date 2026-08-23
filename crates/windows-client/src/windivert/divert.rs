@@ -13,11 +13,101 @@ use std::{
 use super::{
     flow::{Disposition, FlowKey, FlowTable},
     packet::{Packet, PROTOCOL_TCP, PROTOCOL_UDP},
-    Address, Handle, Library, LAYER_NETWORK, MTU_MAX,
+    Address, Handle, Library, BATCH_MAX, LAYER_NETWORK, MTU_MAX,
 };
 use crate::ClientError;
 
 const DNS_PORT: u16 = 53;
+
+/// The staging buffer for one batch, in bytes.
+///
+/// Wide enough for a full batch of ordinary frames, and on its own wide enough
+/// for the largest packet `WinDivert` will ever hand over, so a segment-offload
+/// giant cannot wedge the loop by never fitting.
+const CAPTURE_BUFFER: usize = 512 * 1024;
+const _: () = assert!(CAPTURE_BUFFER > MTU_MAX);
+
+/// Staging for packets that stay on the physical link.
+///
+/// Excluded applications are the majority of what the capture loop sees, and
+/// every one of their packets has to be handed back untouched. Handing them
+/// back individually costs a kernel transition each, charged to applications
+/// the user asked the tunnel to leave alone. Copying them into one buffer and
+/// injecting the lot costs a memory copy each instead, which is roughly two
+/// orders of magnitude cheaper.
+struct Reinject {
+    packets: Vec<u8>,
+    addresses: Vec<Address>,
+    /// Where the boundaries between the staged packets fall.
+    ///
+    /// Only needed when a batch is refused and has to be retried one packet at
+    /// a time, which is exactly when the boundaries are no longer recoverable
+    /// from anything else.
+    lengths: Vec<usize>,
+}
+
+impl Reinject {
+    fn new() -> Self {
+        Self {
+            packets: Vec::with_capacity(CAPTURE_BUFFER),
+            addresses: Vec::with_capacity(BATCH_MAX),
+            lengths: Vec::with_capacity(BATCH_MAX),
+        }
+    }
+
+    /// Reports whether one more packet of `length` bytes would overrun either
+    /// limit `WinDivert` places on a batch.
+    fn is_full(&self, length: usize) -> bool {
+        self.addresses.len() >= BATCH_MAX
+            || self.packets.len().saturating_add(length) > CAPTURE_BUFFER
+    }
+
+    fn push(&mut self, packet: &[u8], address: Address) {
+        self.packets.extend_from_slice(packet);
+        self.addresses.push(address);
+        self.lengths.push(packet.len());
+    }
+
+    /// Hands the staged packets back to the stack, reporting drops without
+    /// stopping.
+    ///
+    /// Losing packets here is survivable — TCP and QUIC both recover — whereas
+    /// returning an error would take down the tunnel. Losing a whole batch is
+    /// a different matter: `WinDivert` refuses a batch as a unit, so a single
+    /// packet it objects to would cost up to two hundred and fifty-four
+    /// innocent ones belonging to applications the user excluded from the
+    /// tunnel entirely. The retry below narrows that back down to the packet
+    /// actually at fault.
+    fn flush(&mut self, handle: &Handle) {
+        if self.addresses.is_empty() {
+            return;
+        }
+        if handle.send_batch(&self.packets, &self.addresses).is_err() {
+            self.flush_individually(handle);
+        }
+        self.packets.clear();
+        self.addresses.clear();
+        self.lengths.clear();
+    }
+
+    /// Reinjects the staged packets one at a time after a batch was refused.
+    fn flush_individually(&self, handle: &Handle) {
+        let mut offset = 0_usize;
+        let mut refused = 0_u64;
+        for (length, address) in self.lengths.iter().zip(&self.addresses) {
+            let end = offset.saturating_add(*length).min(self.packets.len());
+            if handle.send(&self.packets[offset..end], address).is_err() {
+                refused = refused.saturating_add(1);
+            }
+            offset = end;
+        }
+        eprintln!(
+            "MOUSEVPN_DIVERT_WARNING=WinDivert refused a batch of {} packet(s); resent them \
+             individually and lost {refused}",
+            self.addresses.len()
+        );
+    }
+}
 
 /// How often the capture loop reports what it has been doing.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -31,6 +121,7 @@ struct Stats {
     tunnelled: u64,
     passed: u64,
     discarded: u64,
+    batches: u64,
     reported: Instant,
 }
 
@@ -40,6 +131,7 @@ impl Stats {
             tunnelled: 0,
             passed: 0,
             discarded: 0,
+            batches: 0,
             reported: Instant::now(),
         }
     }
@@ -49,9 +141,26 @@ impl Stats {
             return;
         }
         self.reported = Instant::now();
+        // Packets per batch is the number to watch. A figure near one means
+        // the loop is keeping up and every packet costs a kernel transition;
+        // a figure in the tens or hundreds means the queue is filling faster
+        // than user mode drains it, which is what precedes packet loss.
+        let handled = self
+            .tunnelled
+            .saturating_add(self.passed)
+            .saturating_add(self.discarded);
+        // Tenths, in integers: the ratio is only ever read by eye, and a float
+        // here would be the one lossy cast in the packet path.
+        let tenths = handled.saturating_mul(10) / self.batches.max(1);
         eprintln!(
-            "MOUSEVPN_DIVERT_STATS=tunnelled={} passed={} discarded={}",
-            self.tunnelled, self.passed, self.discarded
+            "MOUSEVPN_DIVERT_STATS=tunnelled={} passed={} discarded={} batches={} \
+             packets_per_batch={}.{}",
+            self.tunnelled,
+            self.passed,
+            self.discarded,
+            self.batches,
+            tenths / 10,
+            tenths % 10
         );
     }
 }
@@ -258,6 +367,9 @@ impl Diverter {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
         // and nothing here depends on winning against another filter.
         let handle = Arc::new(library.open(&filter(server), LAYER_NETWORK, 0, 0)?);
+        // This handle carries every packet the machine sends, not only the
+        // tunnelled ones, so it is the one that overflows first.
+        handle.tune_queues();
         Ok(Self {
             handle,
             table,
@@ -269,7 +381,16 @@ impl Diverter {
     ///
     /// `sink` receives every packet bound for the tunnel, already rewritten.
     /// Packets that stay on the physical link are reinjected before `sink` is
-    /// consulted, so a slow data plane cannot stall unrelated traffic.
+    /// consulted for any of them, so a slow data plane cannot stall unrelated
+    /// traffic.
+    ///
+    /// Packets are drained a batch at a time rather than one by one. With
+    /// seven applications routed and the rest direct, the great majority of
+    /// what this loop sees is traffic it will hand straight back, and the cost
+    /// of handing it back is what excluded applications feel as the tunnel
+    /// slowing them down. One kernel transition per batch instead of two per
+    /// packet is the difference between that cost scaling with the machine's
+    /// packet rate and scaling with how often the loop runs.
     ///
     /// # Errors
     ///
@@ -280,64 +401,95 @@ impl Diverter {
         stopping: &AtomicBool,
         mut sink: impl FnMut(&[u8]),
     ) -> Result<(), ClientError> {
-        let mut buffer = vec![0_u8; MTU_MAX];
-        let mut address = Address::zeroed();
+        let mut buffer = vec![0_u8; CAPTURE_BUFFER];
+        let mut addresses = vec![Address::zeroed(); BATCH_MAX];
+        let mut reinject = Reinject::new();
+        // Where each tunnelled packet ended up in `buffer`, so the whole batch
+        // can be reinjected before any of it is encrypted. Recording ranges
+        // rather than copying keeps that ordering free.
+        let mut tunnelled: Vec<(usize, usize)> = Vec::with_capacity(BATCH_MAX);
         let mut discarded = 0_u64;
+        let mut unsplittable = 0_u64;
         let mut stats = Stats::new();
         while !stopping.load(Ordering::Acquire) {
             stats.report();
-            let Some(length) = self.handle.recv(&mut buffer, &mut address)? else {
+            let Some((bytes, count)) = self.handle.recv_batch(&mut buffer, &mut addresses)? else {
                 return Ok(());
             };
-            // Read once per packet: a reconnect may have replaced the
-            // addresses since the last one arrived.
+            stats.batches = stats.batches.saturating_add(1);
+            // Read once per batch: a reconnect may have replaced the addresses
+            // since the last one arrived, but it cannot do so mid-batch.
             let Ok(translation) = self.translation.read().map(|guard| *guard) else {
                 return Err(ClientError::Platform(
                     "the split tunnel translation lock was poisoned".to_owned(),
                 ));
             };
-            let packet = &mut buffer[..length];
-            match prepare_outbound(packet, &self.table, translation) {
-                Outcome::PassThrough => {
-                    stats.passed = stats.passed.saturating_add(1);
-                    // Captured but unmodified, so the checksums the stack
-                    // computed are still correct and reinjection is a
-                    // straight handback.
-                    self.reinject(packet, &address);
+            let mut offset = 0_usize;
+            for address in addresses.iter().take(count) {
+                if offset >= bytes {
+                    break;
                 }
-                Outcome::Discard => {
-                    stats.discarded = stats.discarded.saturating_add(1);
-                    discarded = discarded.saturating_add(1);
-                    if discarded.is_power_of_two() {
+                // A batch has no framing of its own, so a packet whose bounds
+                // cannot be found takes every packet behind it with it. The
+                // alternative — guessing — would corrupt them instead.
+                let Some(length) = self.handle.first_packet_len(&buffer[offset..bytes]) else {
+                    unsplittable = unsplittable.saturating_add(1);
+                    if unsplittable.is_power_of_two() {
                         eprintln!(
-                            "MOUSEVPN_DIVERT_WARNING=discarded {discarded} packet(s) of routed \
-                             applications that this session cannot carry, usually IPv6"
+                            "MOUSEVPN_DIVERT_WARNING=abandoned {unsplittable} batch(es) after a \
+                             packet WinDivert could not parse"
                         );
                     }
-                }
-                Outcome::Tunnel => {
-                    stats.tunnelled = stats.tunnelled.saturating_add(1);
-                    // The source address changed, which invalidates the IP and
-                    // transport checksums the stack had already filled in.
-                    if let Err(error) = self.handle.calc_checksums(packet, &mut address) {
-                        eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
-                        continue;
+                    break;
+                };
+                let start = offset;
+                let end = offset.saturating_add(length).min(bytes);
+                let packet = &mut buffer[start..end];
+                offset = end;
+                match prepare_outbound(packet, &self.table, translation) {
+                    Outcome::PassThrough => {
+                        stats.passed = stats.passed.saturating_add(1);
+                        // Captured but unmodified, so the checksums the stack
+                        // computed are still correct and reinjection is a
+                        // straight handback.
+                        if reinject.is_full(packet.len()) {
+                            reinject.flush(&self.handle);
+                        }
+                        reinject.push(packet, *address);
                     }
-                    sink(packet);
+                    Outcome::Discard => {
+                        stats.discarded = stats.discarded.saturating_add(1);
+                        discarded = discarded.saturating_add(1);
+                        if discarded.is_power_of_two() {
+                            eprintln!(
+                                "MOUSEVPN_DIVERT_WARNING=discarded {discarded} packet(s) of \
+                                 routed applications that this session cannot carry, usually IPv6"
+                            );
+                        }
+                    }
+                    Outcome::Tunnel => {
+                        stats.tunnelled = stats.tunnelled.saturating_add(1);
+                        // The source address changed, which invalidates the IP
+                        // and transport checksums the stack had already filled
+                        // in.
+                        let mut owned = *address;
+                        if let Err(error) = self.handle.calc_checksums(packet, &mut owned) {
+                            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+                            continue;
+                        }
+                        tunnelled.push((start, end));
+                    }
                 }
+            }
+            // Before a single packet is encrypted: `sink` encrypts and sends
+            // on the wire, and an application the user excluded from the
+            // tunnel must not wait behind the tunnel's own round trip.
+            reinject.flush(&self.handle);
+            for (start, end) in tunnelled.drain(..) {
+                sink(&buffer[start..end]);
             }
         }
         Ok(())
-    }
-
-    /// Hands a packet back to the stack, reporting drops without stopping.
-    ///
-    /// A failed reinjection loses one packet. Both TCP and QUIC recover from
-    /// that, whereas returning an error here would take down the tunnel.
-    fn reinject(&self, packet: &[u8], address: &Address) {
-        if let Err(error) = self.handle.send(packet, address) {
-            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
-        }
     }
 
     /// Delivers a translated packet from the tunnel to the local stack.
@@ -366,7 +518,7 @@ impl Diverter {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter, prepare_inbound, prepare_outbound, Outcome, Translation};
+    use super::{filter, prepare_inbound, prepare_outbound, Address, Outcome, Translation};
     use crate::windivert::{
         flow::{Disposition, FlowKey, FlowTable},
         packet::PROTOCOL_UDP,
@@ -409,6 +561,38 @@ mod tests {
             disposition,
         );
         table
+    }
+
+    #[test]
+    fn stages_pass_through_packets_end_to_end() {
+        // The batch carries no framing, so the packets must land in the buffer
+        // back to back and in the order they were captured. Anything else and
+        // WinDivert injects the wrong bytes against the wrong address.
+        let mut reinject = super::Reinject::new();
+        reinject.push(&[1, 2, 3], Address::zeroed());
+        reinject.push(&[4, 5], Address::zeroed());
+        assert_eq!(reinject.packets, [1, 2, 3, 4, 5]);
+        assert_eq!(reinject.addresses.len(), 2);
+    }
+
+    #[test]
+    fn refuses_more_than_windivert_accepts_in_one_batch() {
+        // Exceeding either limit is not a partial send: WinDivert rejects the
+        // whole call, which would drop a full batch of excluded traffic.
+        let mut reinject = super::Reinject::new();
+        for _ in 0..super::BATCH_MAX {
+            assert!(!reinject.is_full(64));
+            reinject.push(&[0; 64], Address::zeroed());
+        }
+        assert!(reinject.is_full(64));
+    }
+
+    #[test]
+    fn refuses_a_packet_that_would_overrun_the_staging_buffer() {
+        let mut reinject = super::Reinject::new();
+        reinject.push(&vec![0; super::CAPTURE_BUFFER - 8], Address::zeroed());
+        assert!(reinject.is_full(9));
+        assert!(!reinject.is_full(8));
     }
 
     #[test]
