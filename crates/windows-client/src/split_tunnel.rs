@@ -177,9 +177,15 @@ fn spawn_outbound(
                         // what turns a silent black hole into evidence.
                         oversized = oversized.saturating_add(1);
                         if oversized.is_power_of_two() {
+                            // Naming the protocol and size separates a
+                            // datagram protocol probing for a larger path,
+                            // which corrects itself, from a stream the segment
+                            // clamp failed to hold down, which does not.
+                            let protocol = packet.get(9).copied().unwrap_or(0);
                             eprintln!(
                                 "MOUSEVPN_SPLIT_WARNING=dropped {oversized} packet(s) larger \
-                                 than the tunnel MTU"
+                                 than the tunnel MTU; last was protocol {protocol}, {} bytes",
+                                packet.len()
                             );
                         }
                         return;
