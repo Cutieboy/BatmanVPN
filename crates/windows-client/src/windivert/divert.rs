@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -17,6 +18,43 @@ use super::{
 use crate::ClientError;
 
 const DNS_PORT: u16 = 53;
+
+/// How often the capture loop reports what it has been doing.
+const STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Running totals for the capture loop.
+///
+/// A split tunnel fails in ways that look identical from outside: an
+/// application left on the physical link and one whose packets vanish both
+/// present as "it does not work". These counts tell them apart.
+struct Stats {
+    tunnelled: u64,
+    passed: u64,
+    discarded: u64,
+    reported: Instant,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            tunnelled: 0,
+            passed: 0,
+            discarded: 0,
+            reported: Instant::now(),
+        }
+    }
+
+    fn report(&mut self) {
+        if self.reported.elapsed() < STATS_INTERVAL {
+            return;
+        }
+        self.reported = Instant::now();
+        eprintln!(
+            "MOUSEVPN_DIVERT_STATS=tunnelled={} passed={} discarded={}",
+            self.tunnelled, self.passed, self.discarded
+        );
+    }
+}
 
 /// What to do with a captured outbound packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,7 +283,9 @@ impl Diverter {
         let mut buffer = vec![0_u8; MTU_MAX];
         let mut address = Address::zeroed();
         let mut discarded = 0_u64;
+        let mut stats = Stats::new();
         while !stopping.load(Ordering::Acquire) {
+            stats.report();
             let Some(length) = self.handle.recv(&mut buffer, &mut address)? else {
                 return Ok(());
             };
@@ -259,12 +299,14 @@ impl Diverter {
             let packet = &mut buffer[..length];
             match prepare_outbound(packet, &self.table, translation) {
                 Outcome::PassThrough => {
+                    stats.passed = stats.passed.saturating_add(1);
                     // Captured but unmodified, so the checksums the stack
                     // computed are still correct and reinjection is a
                     // straight handback.
                     self.reinject(packet, &address);
                 }
                 Outcome::Discard => {
+                    stats.discarded = stats.discarded.saturating_add(1);
                     discarded = discarded.saturating_add(1);
                     if discarded.is_power_of_two() {
                         eprintln!(
@@ -274,6 +316,7 @@ impl Diverter {
                     }
                 }
                 Outcome::Tunnel => {
+                    stats.tunnelled = stats.tunnelled.saturating_add(1);
                     // The source address changed, which invalidates the IP and
                     // transport checksums the stack had already filled in.
                     if let Err(error) = self.handle.calc_checksums(packet, &mut address) {
