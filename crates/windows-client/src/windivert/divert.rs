@@ -164,7 +164,15 @@ pub(crate) fn prepare_inbound(bytes: &mut [u8], translation: Translation) -> boo
     if packet.destination() != translation.tunnel {
         return false;
     }
-    packet.set_destination(translation.physical)
+    if !packet.set_destination(translation.physical) {
+        return false;
+    }
+    // Clamping only the outbound handshake limits what the peer sends us, not
+    // what we send it: our segment size comes from the option in its reply.
+    // Leaving that alone lets the stack build packets too large for the tunnel,
+    // so downloads work while anything we upload disappears.
+    packet.clamp_mss(translation.max_segment_size);
+    true
 }
 
 /// Captures outbound packets and feeds the routed ones to the tunnel.
@@ -384,6 +392,38 @@ mod tests {
     fn restores_the_physical_address_on_the_way_back() {
         let mut packet = udp_packet(REMOTE, TUNNEL);
         assert!(prepare_inbound(&mut packet, addresses()));
+        assert_eq!(&packet[16..20], &[192, 168, 0, 189]);
+    }
+
+    /// A SYN-ACK arriving from the tunnel, offering a segment size sized for a
+    /// physical link.
+    fn inbound_syn_ack(mss: u16) -> Vec<u8> {
+        let (IpAddr::V4(remote), IpAddr::V4(tunnel)) = (REMOTE, TUNNEL) else {
+            unreachable!("tests use IPv4")
+        };
+        let mut packet = vec![0_u8; 20 + 24];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&remote.octets());
+        packet[16..20].copy_from_slice(&tunnel.octets());
+        packet[20..22].copy_from_slice(&443_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&51_000_u16.to_be_bytes());
+        // Six words of header, SYN and ACK set.
+        packet[32] = 6 << 4;
+        packet[33] = 0x12;
+        packet[40] = 2;
+        packet[41] = 4;
+        packet[42..44].copy_from_slice(&mss.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn clamps_the_segment_size_the_peer_offers_us() {
+        // Without this the peer's own limit governs what we send, and every
+        // upload larger than the tunnel's MTU vanishes while downloads work.
+        let mut packet = inbound_syn_ack(1460);
+        assert!(prepare_inbound(&mut packet, addresses()));
+        assert_eq!(u16::from_be_bytes([packet[42], packet[43]]), 1240);
         assert_eq!(&packet[16..20], &[192, 168, 0, 189]);
     }
 
