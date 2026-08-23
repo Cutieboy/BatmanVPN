@@ -179,6 +179,9 @@ pub use runtime::{diagnose, network_report, repair_network, run_with_stop, Runti
 pub use split_tunnel::run_split_tunnel;
 
 #[cfg(windows)]
+pub use windivert::divert::check_capture_filters;
+
+#[cfg(windows)]
 pub use windivert::flow::probe as probe_split_tunnel_flows;
 
 #[cfg(test)]

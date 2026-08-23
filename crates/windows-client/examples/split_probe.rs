@@ -4,7 +4,7 @@
 //! settings, so trying this out cannot disturb the configuration the installed
 //! client uses.
 //!
-//! Requires Administrator, no other MouseVPN session running, and
+//! Requires Administrator, no other `MouseVPN` session running, and
 //! `WinDivert.dll` and `WinDivert64.sys` beside this executable.
 //!
 //! ```text

@@ -43,6 +43,8 @@ type SendFn = unsafe extern "system" fn(HANDLE, *const u8, u32, *mut u32, *const
 type ShutdownFn = unsafe extern "system" fn(HANDLE, u32) -> i32;
 type CloseFn = unsafe extern "system" fn(HANDLE) -> i32;
 type CalcChecksumsFn = unsafe extern "system" fn(*mut u8, u32, *mut Address, u64) -> i32;
+type CompileFilterFn =
+    unsafe extern "system" fn(*const i8, u32, *mut i8, u32, *mut *const i8, *mut u32) -> i32;
 
 /// A `WinDivert` address, mirroring `WINDIVERT_ADDRESS`.
 ///
@@ -162,6 +164,7 @@ pub(crate) struct Library {
     shutdown: ShutdownFn,
     close: CloseFn,
     calc_checksums: CalcChecksumsFn,
+    compile_filter: CompileFilterFn,
 }
 
 // SAFETY: the module handle is only held to keep the DLL loaded, and every
@@ -217,9 +220,58 @@ impl Library {
                     module,
                     c"WinDivertHelperCalcChecksums",
                 )?),
+                compile_filter: std::mem::transmute::<*const (), CompileFilterFn>(resolve(
+                    module,
+                    c"WinDivertHelperCompileFilter",
+                )?),
             }
         };
         Ok(Arc::new(library))
+    }
+
+    /// Compiles `filter` without opening a handle, to explain a rejection.
+    ///
+    /// `WinDivertOpen` reports a bad filter as a bare `ERROR_INVALID_PARAMETER`,
+    /// which says nothing about what is wrong with it. The filter compiler
+    /// reports the reason and the offset it failed at, and needs neither the
+    /// driver nor elevation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Platform`] naming the offending position when the
+    /// filter does not compile.
+    pub(crate) fn check_filter(&self, filter: &str, layer: u32) -> Result<(), ClientError> {
+        let text = CString::new(filter).map_err(|_| {
+            ClientError::Platform("WinDivert filter contained an interior NUL".to_owned())
+        })?;
+        let mut reason: *const i8 = ptr::null();
+        let mut position = 0_u32;
+        // SAFETY: `text` outlives the call, and passing a null object buffer
+        // with zero length asks for validation only.
+        let compiled = unsafe {
+            (self.compile_filter)(
+                text.as_ptr(),
+                layer,
+                ptr::null_mut(),
+                0,
+                &raw mut reason,
+                &raw mut position,
+            )
+        };
+        if compiled != 0 {
+            return Ok(());
+        }
+        let detail = if reason.is_null() {
+            "no reason reported".to_owned()
+        } else {
+            // SAFETY: on failure WinDivert points this at a static string.
+            unsafe { std::ffi::CStr::from_ptr(reason) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Err(ClientError::Platform(format!(
+            "WinDivert rejected the capture filter at position {position}: {detail}; filter was: {filter}"
+        )))
     }
 
     /// Opens a `WinDivert` handle for `filter` on `layer`.
@@ -248,7 +300,14 @@ impl Library {
         // copies the compiled filter into the driver before returning.
         let handle = unsafe { (self.open)(filter.as_ptr(), layer, priority, flags) };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(open_error(&std::io::Error::last_os_error()));
+            const ERROR_INVALID_PARAMETER: i32 = 87;
+            let error = std::io::Error::last_os_error();
+            // The most common cause of this code is a filter the driver will
+            // not accept, and the compiler can say exactly why.
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                self.check_filter(filter.to_str().unwrap_or_default(), layer)?;
+            }
+            return Err(open_error(&error));
         }
         Ok(Handle {
             library: Arc::clone(self),

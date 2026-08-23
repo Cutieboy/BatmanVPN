@@ -1,6 +1,7 @@
 ﻿#![doc = "Moves selected applications' packets between the stack and the tunnel."]
 
 use std::{
+    fmt::Write as _,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -42,11 +43,41 @@ pub(crate) struct Addresses {
 /// captured, or every packet we send would come straight back to us and the
 /// client would wedge itself. Loopback is excluded because local traffic has no
 /// business crossing a VPN and capturing it only costs latency.
+/// Compiles the built-in filter plus any extras, reporting each verdict.
+///
+/// Exposed for the `filter_check` example: a filter the driver rejects is
+/// otherwise only visible as `ERROR_INVALID_PARAMETER` at connection time.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Platform`] when `WinDivert.dll` cannot be loaded.
+pub fn check_capture_filters(extra: &[String]) -> Result<String, ClientError> {
+    let library = Library::load()?;
+    let server: SocketAddr = "203.0.113.10:51820".parse().unwrap_or_else(|_| {
+        unreachable!("the sample endpoint is a literal");
+    });
+    let mut report = String::new();
+    let built_in = filter(server);
+    for candidate in std::iter::once(&built_in).chain(extra) {
+        let verdict = match library.check_filter(candidate, LAYER_NETWORK) {
+            Ok(()) => "OK  ".to_owned(),
+            Err(error) => format!("FAIL {error}\n     "),
+        };
+        let _ = writeln!(report, "{verdict}{candidate}");
+    }
+    Ok(report)
+}
+
+/// The exclusion is written as a disjunction rather than the more obvious
+/// `not (udp and dst == server and port == p)`. `WinDivert` applies negation to
+/// a single test, not to a parenthesised group, and rejects the latter with a
+/// parse error that surfaces only as `ERROR_INVALID_PARAMETER` when the handle
+/// is opened. De Morgan's law gives the same meaning in a form it accepts.
 fn filter(server: SocketAddr) -> String {
     let family = if server.is_ipv4() { "ip" } else { "ipv6" };
     format!(
-        "outbound and !loopback and ({family}) and (tcp or udp) and \
-         not (udp and {family}.DstAddr == {} and udp.DstPort == {})",
+        "outbound and !loopback and {family} and \
+         (tcp or (udp and ({family}.DstAddr != {} or udp.DstPort != {})))",
         server.ip(),
         server.port()
     )
@@ -325,5 +356,27 @@ mod tests {
         assert!(filter.contains("51820"));
         assert!(filter.contains("outbound"));
         assert!(filter.contains("!loopback"));
+    }
+
+    #[test]
+    fn never_negates_a_parenthesised_group() {
+        // WinDivert negates a single test, not a group, and reports the
+        // difference only as ERROR_INVALID_PARAMETER from WinDivertOpen. Both
+        // spellings of negation are checked so neither creeps back in.
+        for server in ["203.0.113.10:51820", "[2001:db8::1]:51820"] {
+            let filter = filter(server.parse().expect("address"));
+            assert!(!filter.contains("not ("), "{filter}");
+            assert!(!filter.contains("!("), "{filter}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_tunnel_exclusion_scoped_to_udp() {
+        // Hoisting the address test out of the udp branch would exclude TCP to
+        // the server as well, and silently stop tunnelling it.
+        let server: SocketAddr = "203.0.113.10:51820".parse().expect("address");
+        let filter = filter(server);
+        let udp_branch = filter.split("tcp or ").nth(1).expect("udp branch");
+        assert!(udp_branch.contains("203.0.113.10"));
     }
 }
