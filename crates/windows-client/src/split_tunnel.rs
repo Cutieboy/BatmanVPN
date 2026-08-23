@@ -1,7 +1,7 @@
 #![doc = "Runs a per-application tunnel that needs no adapter and no routes."]
 
 use std::{
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, RwLock,
@@ -15,6 +15,7 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::Datagram;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
 use crate::{
     handshake::connect,
@@ -64,11 +65,16 @@ pub fn run_split_tunnel(
 
     // Shared rather than copied: a reconnect can change the tunnel address,
     // the MTU, and, if the machine moved networks, the physical address too.
+    let route = netcfg::default_ipv4_route(None)?;
     let translation = Arc::new(RwLock::new(Translation::new(
         IpAddr::V4(network::physical_addresses()?.ipv4),
         IpAddr::V4(parameters.client_address),
+        IpAddr::V4(parameters.dns),
         parameters.mtu,
     )));
+    // Installed before capture starts: a query sent to the old resolver in the
+    // gap would go out untunnelled.
+    let _dns = DnsGuard::install(route.interface_luid, parameters.dns)?;
 
     let library = Library::load()?;
     // The watcher must be running before the diverter captures anything:
@@ -329,6 +335,7 @@ impl ReceiveLoop<'_> {
         let replacement = Translation::new(
             physical,
             IpAddr::V4(parameters.client_address),
+            IpAddr::V4(parameters.dns),
             parameters.mtu,
         );
         {
@@ -359,6 +366,43 @@ impl ReceiveLoop<'_> {
         // would have used, which may not be the one the session started on.
         self.inbound = Address::for_inbound(route.interface_index, 0);
         Ok(())
+    }
+}
+
+/// Points the physical interface at the session's resolver for the duration.
+///
+/// A full tunnel gives its adapter the resolver and Windows follows. There is
+/// no adapter here, so the physical interface has to carry it, and the packets
+/// it produces are recognised by destination and sent through the tunnel.
+///
+/// Without this the machine keeps whatever resolver its network offers. That is
+/// usually fine and sometimes fatal: a router that does not answer at all
+/// leaves every application unable to resolve a name, while a browser with its
+/// own encrypted resolver carries on and hides the fault.
+struct DnsGuard {
+    alias: String,
+}
+
+impl DnsGuard {
+    /// # Errors
+    ///
+    /// Returns an error when the interface cannot be named or netsh refuses.
+    fn install(interface: NET_LUID_LH, resolver: Ipv4Addr) -> Result<Self, ClientError> {
+        let alias = netcfg::interface_alias(interface)?;
+        netcfg::set_tunnel_dns(&alias, resolver)?;
+        eprintln!("MOUSEVPN_STATE=dns_configured");
+        Ok(Self { alias })
+    }
+}
+
+impl Drop for DnsGuard {
+    fn drop(&mut self) {
+        // Leaving a resolver behind that only existed inside the tunnel would
+        // break name resolution on a machine that is no longer connected, so a
+        // failure here is worth reporting loudly.
+        if let Err(error) = netcfg::reset_tunnel_dns(&self.alias) {
+            eprintln!("MOUSEVPN_RUNTIME_WARNING=failed to restore DNS on {}: {error}", self.alias);
+        }
     }
 }
 

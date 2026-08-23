@@ -13,7 +13,8 @@ use std::{
 use windows_sys::Win32::{
     NetworkManagement::{
         IpHelper::{
-            ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
+            ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToIndex,
+            CreateIpForwardEntry2,
             CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry,
             FreeMibTable, GetBestRoute2, GetIpForwardTable2, GetIpInterfaceEntry,
             GetUnicastIpAddressTable, InitializeIpForwardEntry, InitializeUnicastIpAddressEntry,
@@ -114,6 +115,26 @@ pub(crate) fn interface_index(luid: NET_LUID_LH) -> Result<u32, ClientError> {
     } else {
         Err(win32_error("resolve the MouseVPN interface index", status))
     }
+}
+
+/// Resolves a LUID to the interface name `netsh` expects.
+///
+/// # Errors
+///
+/// Returns an error when the interface has disappeared or its name does not
+/// fit the buffer Windows documents as sufficient.
+pub(crate) fn interface_alias(luid: NET_LUID_LH) -> Result<String, ClientError> {
+    // NDIS_IF_MAX_STRING_SIZE plus the terminator, which Windows documents as
+    // enough for any interface alias.
+    let mut buffer = [0_u16; 257];
+    let status = unsafe {
+        ConvertInterfaceLuidToAlias(&raw const luid, buffer.as_mut_ptr(), buffer.len())
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error("resolve the interface name", status));
+    }
+    let length = buffer.iter().position(|value| *value == 0).unwrap_or(0);
+    Ok(String::from_utf16_lossy(&buffer[..length]))
 }
 
 /// Finds the physical IPv4 default route the tunnel must not displace.

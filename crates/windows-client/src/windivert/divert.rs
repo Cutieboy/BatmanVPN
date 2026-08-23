@@ -16,6 +16,8 @@ use super::{
 };
 use crate::ClientError;
 
+const DNS_PORT: u16 = 53;
+
 /// What to do with a captured outbound packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Outcome {
@@ -39,6 +41,9 @@ pub(crate) enum Outcome {
 pub(crate) struct Translation {
     pub(crate) physical: IpAddr,
     pub(crate) tunnel: IpAddr,
+    /// The resolver the session provides. Traffic to it always takes the
+    /// tunnel, whichever process sent it.
+    pub(crate) resolver: IpAddr,
     /// The largest TCP segment the tunnel can carry, clamped into the
     /// handshake of every routed connection.
     pub(crate) max_segment_size: u16,
@@ -50,12 +55,18 @@ impl Translation {
     /// A full-tunnel session hands this MTU to the Wintun adapter and the stack
     /// sizes everything accordingly. There is no adapter here, so the limit has
     /// to be imposed on the connections themselves.
-    pub(crate) fn new(physical: IpAddr, tunnel: IpAddr, tunnel_mtu: u16) -> Self {
+    pub(crate) fn new(
+        physical: IpAddr,
+        tunnel: IpAddr,
+        resolver: IpAddr,
+        tunnel_mtu: u16,
+    ) -> Self {
         // IPv4 and TCP headers, twenty bytes each, come off the top.
         const HEADERS: u16 = 40;
         Self {
             physical,
             tunnel,
+            resolver,
             max_segment_size: tunnel_mtu.saturating_sub(HEADERS),
         }
     }
@@ -135,7 +146,14 @@ pub(crate) fn prepare_outbound(
         remote: packet.destination(),
         remote_port: destination_port,
     };
-    if table.lookup(&key) != Some(Disposition::Tunnel) {
+    // Name resolution is the one thing that cannot follow the per-application
+    // policy. Windows resolves through a shared service, so a query carries no
+    // trace of which application wanted the name, and the session's resolver
+    // only exists at the far end of the tunnel: sent any other way the query
+    // would be routed at an address that does not answer. Every application
+    // therefore resolves through the tunnel, including excluded ones.
+    let resolving = packet.destination() == translation.resolver && destination_port == DNS_PORT;
+    if !resolving && table.lookup(&key) != Some(Disposition::Tunnel) {
         return Outcome::PassThrough;
     }
     // The application bound to the physical address, but the server only
@@ -315,9 +333,10 @@ mod tests {
     const PHYSICAL: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 189));
     const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 77, 0, 22));
     const REMOTE: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    const RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 77, 0, 1));
 
     fn addresses() -> Translation {
-        Translation::new(PHYSICAL, TUNNEL, 1280)
+        Translation::new(PHYSICAL, TUNNEL, RESOLVER, 1280)
     }
 
     fn udp_packet(source: IpAddr, destination: IpAddr) -> Vec<u8> {
@@ -451,7 +470,37 @@ mod tests {
         // 1280 less twenty bytes of IPv4 header and twenty of TCP.
         assert_eq!(addresses().max_segment_size, 1240);
         // A nonsensically small MTU must not wrap around into a huge limit.
-        assert_eq!(Translation::new(PHYSICAL, TUNNEL, 8).max_segment_size, 0);
+        assert_eq!(
+            Translation::new(PHYSICAL, TUNNEL, RESOLVER, 8).max_segment_size,
+            0
+        );
+    }
+
+    #[test]
+    fn tunnels_name_resolution_whatever_the_policy_says() {
+        // Windows resolves through a shared service, so the query carries no
+        // trace of which application wanted the name. An unclassified flow to
+        // the session's resolver still has to take the tunnel: the resolver
+        // exists nowhere else.
+        let mut packet = udp_packet(PHYSICAL, RESOLVER);
+        packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        assert_eq!(
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            Outcome::Tunnel
+        );
+        assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
+    }
+
+    #[test]
+    fn leaves_other_traffic_to_the_resolver_alone() {
+        // Only port 53 is name resolution. The resolver may run other services
+        // and an unclassified flow to one of them is not ours to redirect.
+        let mut packet = udp_packet(PHYSICAL, RESOLVER);
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        assert_eq!(
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            Outcome::PassThrough
+        );
     }
 
     #[test]
