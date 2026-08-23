@@ -726,6 +726,12 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn settings_path() -> Result<PathBuf, String> {
+    // A preview build has to be able to keep its application list away from
+    // the installed client's. The two disagree about how routing is enforced,
+    // and a list written by one of them stops the other from connecting.
+    if let Some(directory) = std::env::var_os("MOUSEVPN_SETTINGS_DIR") {
+        return Ok(PathBuf::from(directory).join("settings.toml"));
+    }
     dirs::config_dir()
         .map(|directory| directory.join("MouseVPN").join("settings.toml"))
         .ok_or_else(|| "Не удалось определить каталог настроек".to_owned())

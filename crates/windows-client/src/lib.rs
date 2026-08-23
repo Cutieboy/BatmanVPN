@@ -65,6 +65,22 @@ pub struct AppRoutingPolicy {
     pub package_sids: Vec<String>,
 }
 
+impl AppRoutingPolicy {
+    /// Reports whether this policy asks for per-application routing.
+    ///
+    /// Excluding nothing is the same as tunnelling everything, so an empty
+    /// denylist runs as a plain full tunnel: no capture, no translation, and
+    /// the kill switch and routes that come with it. An include list is always
+    /// per-application, even when empty, because "tunnel only these" with
+    /// nothing chosen still means the rest of the machine stays direct.
+    #[must_use]
+    pub fn is_per_application(&self) -> bool {
+        matches!(self.mode, AppRoutingMode::Include)
+            || !self.apps.is_empty()
+            || !self.package_sids.is_empty()
+    }
+}
+
 #[cfg(windows)]
 /// Derives the `AppContainer` SID string used by WFP and Windows Firewall.
 ///

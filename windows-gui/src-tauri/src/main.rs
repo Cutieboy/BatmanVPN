@@ -482,7 +482,15 @@ fn run_helper(path: &Path) -> Result<(), String> {
     let mut backoff = std::time::Duration::from_secs(1);
     eprintln!("MOUSEVPN_STATE=connecting");
     loop {
-        match mousevpn_windows_client::run_with_stop(&config, &stopping, &app_routing) {
+        // Per-application routing runs an entirely different session: WinDivert
+        // lifts the selected traffic out of the stack instead of an adapter and
+        // routes carrying all of it.
+        let session = if app_routing.is_per_application() {
+            mousevpn_windows_client::run_split_tunnel(&config, &stopping, &app_routing)
+        } else {
+            mousevpn_windows_client::run_with_stop(&config, &stopping, &app_routing)
+        };
+        match session {
             Ok(()) => return Ok(()),
             Err(_) if stopping.load(Ordering::Acquire) => return Ok(()),
             Err(error) => {
