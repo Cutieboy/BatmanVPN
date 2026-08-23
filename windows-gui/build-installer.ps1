@@ -1,12 +1,18 @@
 param(
     [switch]$UseTestSignedDriver,
-    [switch]$FullTunnelOnly
+    [switch]$FullTunnelOnly,
+    # Enforces per-application routing with WinDivert rather than our own
+    # callout driver. WinDivert ships with a Microsoft attestation signature,
+    # so the package installs on a normal machine: no test signing, and Secure
+    # Boot left on.
+    [switch]$WinDivert
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($UseTestSignedDriver -and $FullTunnelOnly) {
-    throw "-UseTestSignedDriver and -FullTunnelOnly are mutually exclusive."
+$selected = @($UseTestSignedDriver, $FullTunnelOnly, $WinDivert) | Where-Object { $_ }
+if ($selected.Count -gt 1) {
+    throw "-UseTestSignedDriver, -FullTunnelOnly and -WinDivert are mutually exclusive."
 }
 
 $repository = Split-Path -Parent $PSScriptRoot
@@ -23,7 +29,38 @@ if (-not (Test-Path -LiteralPath $cargo) -or -not (Test-Path -LiteralPath $rustu
     throw "Rustup and Cargo were not found under $cargoHome."
 }
 
-if (-not $FullTunnelOnly) {
+if ($WinDivert) {
+    $bundleConfig = "tauri.windivert.conf.json"
+    $windivertDirectory = Join-Path $repository "crates\windows-client\vendor\windivert"
+    $windivertDriver = Join-Path $windivertDirectory "WinDivert64.sys"
+    foreach ($file in @("WinDivert.dll", "WinDivert64.sys", "LICENSE.txt")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $windivertDirectory $file))) {
+            throw "Vendored WinDivert is incomplete: $file is missing."
+        }
+    }
+
+    # An Authenticode signature alone does not load a driver on Windows 10 or
+    # later. The kernel wants Microsoft's own attestation signature, which
+    # WinDivert carries as a second signature, and shipping a build without it
+    # would demand test signing from every user.
+    $signTool = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if (-not $signTool) {
+        throw "SignTool was not found; it is needed to verify the WinDivert driver signature."
+    }
+    $verification = & $signTool.FullName verify /pa /all /v $windivertDriver 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "The vendored WinDivert driver failed signature verification:`n$verification"
+    }
+    if ($verification -notmatch "Microsoft Windows Hardware Compatibility Publisher") {
+        throw "The vendored WinDivert driver has no Microsoft attestation signature; it would require test signing."
+    }
+    Write-Host "WinDivert driver carries a Microsoft attestation signature."
+}
+
+if (-not $FullTunnelOnly -and -not $WinDivert) {
     if ($UseTestSignedDriver) {
         & "$repository\windows-driver\build-test-signed.ps1"
     } else {
