@@ -215,8 +215,9 @@ fn run(
 ///
 /// Returns [`ClientError::Platform`] when the library or the flow handle
 /// cannot be opened.
-pub fn probe(seconds: u64) -> Result<(), ClientError> {
+pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError> {
     let library = Library::load()?;
+    let classifier = Classifier::new(policy);
     println!("WinDivert.dll loaded");
     let handle = Arc::new(library.open("true", LAYER_FLOW, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?);
     println!("flow handle open; the WinDivert driver service is running");
@@ -259,9 +260,15 @@ pub fn probe(seconds: u64) -> Result<(), ClientError> {
         printed += 1;
         let path = process_path(flow.process_id)
             .map_or_else(|| "<unknown>".to_owned(), |path| path.display().to_string());
+        // The verdict is the whole point: a routed application whose flows read
+        // DIRECT is a policy mismatch, not a tunnel fault.
+        let verdict = match classifier.classify(flow.process_id) {
+            Disposition::Tunnel => "TUNNEL",
+            Disposition::Direct => "direct",
+        };
         match decoded {
             Some(key) => println!(
-                "{event:<11} pid={:<6} proto={:<3} {}:{} -> {}:{}  {path}",
+                "{verdict} {event:<11} pid={:<6} proto={:<3} {}:{} -> {}:{}  {path}",
                 flow.process_id,
                 key.protocol,
                 key.local,
@@ -270,7 +277,7 @@ pub fn probe(seconds: u64) -> Result<(), ClientError> {
                 key.remote_port
             ),
             None => println!(
-                "{event:<11} pid={:<6} proto={:<3} UNDECODED ipv6={} local={:08x?} remote={:08x?}  {path}",
+                "{verdict} {event:<11} pid={:<6} proto={:<3} UNDECODED ipv6={} local={:08x?} remote={:08x?}  {path}",
                 flow.process_id,
                 flow.protocol,
                 address.ipv6(),
