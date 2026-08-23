@@ -29,6 +29,8 @@ mod platform;
 mod platform_stub;
 #[cfg(windows)]
 mod runtime;
+#[cfg(windows)]
+mod windivert;
 
 pub use error::ClientError;
 
@@ -154,6 +156,9 @@ pub use platform_stub::{
 };
 #[cfg(windows)]
 pub use runtime::{diagnose, network_report, repair_network, run_with_stop, RuntimeDiagnostics};
+
+#[cfg(windows)]
+pub use windivert::flow::probe as probe_split_tunnel_flows;
 
 #[cfg(test)]
 mod tests {
