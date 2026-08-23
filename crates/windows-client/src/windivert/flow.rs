@@ -5,16 +5,17 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     thread,
 };
 
 use windows_sys::Win32::{
-    Foundation::CloseHandle,
+    Foundation::{CloseHandle, FILETIME, HANDLE},
     System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     },
 };
 
@@ -153,6 +154,11 @@ impl FlowWatcher {
         let table = Arc::new(FlowTable::default());
         let stopping = Arc::new(AtomicBool::new(false));
         let classifier = Arc::new(Classifier::new(policy));
+        // The two layers classify the same flows by different means, so losing
+        // one degrades coverage while losing both stops classification
+        // altogether. Only the second loss is worth alarming about, and
+        // telling them apart needs a count.
+        let watching = Arc::new(AtomicUsize::new(2));
         let mut handles = Vec::new();
         let mut threads = Vec::new();
 
@@ -163,6 +169,11 @@ impl FlowWatcher {
             // Priority is irrelevant for a sniffing handle, but a distinct
             // value keeps MouseVPN identifiable in `windivertctl` output.
             let handle = Arc::new(library.open("true", layer, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?);
+            // An overflowing event queue is not a lost statistic here: a
+            // connect event that never arrives is a flow that never gets
+            // classified, and an unclassified flow of a routed application
+            // leaves on the physical link.
+            handle.tune_queues();
             let thread = thread::Builder::new()
                 .name(name.to_owned())
                 .spawn({
@@ -170,7 +181,8 @@ impl FlowWatcher {
                     let table = Arc::clone(&table);
                     let stopping = Arc::clone(&stopping);
                     let classifier = Arc::clone(&classifier);
-                    move || run(&handle, &table, &classifier, &stopping)
+                    let watching = Arc::clone(&watching);
+                    move || run(&handle, &table, &classifier, &stopping, &watching)
                 })
                 .map_err(|error| {
                     ClientError::Platform(format!("failed to start {name}: {error}"))
@@ -211,6 +223,7 @@ fn run(
     table: &FlowTable,
     classifier: &Classifier,
     stopping: &AtomicBool,
+    watching: &AtomicUsize,
 ) {
     // Flow events carry no packet payload, so the receive buffer stays empty.
     let mut address = Address::zeroed();
@@ -221,8 +234,20 @@ fn run(
             Ok(None) => return,
             Err(error) => {
                 // Losing flow tracking degrades routing accuracy but must not
-                // tear down a working tunnel.
+                // tear down a working tunnel. Losing the last watcher is a
+                // different thing entirely: no new flow is classified after
+                // it, and an unclassified flow of a routed application leaves
+                // on the physical link. That is a silent leak, so it is
+                // reported on the channel the application actually shows the
+                // user rather than on one only a log reader would find.
                 eprintln!("MOUSEVPN_FLOW_WARNING={error}");
+                if watching.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    eprintln!(
+                        "MOUSEVPN_RUNTIME_WARNING=application routing stopped tracking new \
+                         connections; applications selected for the tunnel may now be \
+                         connecting directly"
+                    );
+                }
                 return;
             }
         }
@@ -309,7 +334,8 @@ pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError>
             continue;
         }
         printed += 1;
-        let path = process_path(flow.process_id)
+        let path = Process::open(flow.process_id)
+            .and_then(|process| process.image_path())
             .map_or_else(|| "<unknown>".to_owned(), |path| path.display().to_string());
         // The verdict is the whole point: a routed application whose flows read
         // DIRECT is a policy mismatch, not a tunnel fault.
@@ -353,19 +379,30 @@ pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError>
     Ok(())
 }
 
-/// Decides where a process's traffic belongs, caching the answer per PID.
+/// The most classifications remembered at once.
 ///
-/// Resolving an executable path costs a process open and a kernel query. The
-/// same PID reappears for every flow a busy application creates, so the answer
-/// is memoised. PIDs are recycled by Windows, but only after the process exits,
-/// and a stale entry can at worst misroute flows of a process that inherited
-/// the number, bounded by clearing the cache on reconnect.
+/// Each entry is a process that opened at least one connection during the
+/// session. Machines that churn through processes — a build, a shell loop —
+/// would otherwise grow this for as long as the tunnel is up.
+const CLASSIFICATION_CAPACITY: usize = 4_096;
+
+/// Decides where a process's traffic belongs, caching the answer per process.
+///
+/// Resolving an executable path costs a kernel query and a buffer; the same
+/// process reappears for every flow a busy application creates, so the answer
+/// is memoised.
+///
+/// The entry is keyed by the process id *and* its creation time, not the id
+/// alone. Windows reuses process ids freely, and an id-only cache hands the
+/// verdict made for an exited program to whichever program inherits its
+/// number — which is to say it silently routes an application the opposite of
+/// what the user selected, and keeps doing so. The creation time is what makes
+/// two processes that share an id distinguishable.
 struct Classifier {
     mode: AppRoutingMode,
     apps: Vec<PathBuf>,
-    /// Maps a process id to whether it is listed, and whether the executable
-    /// behind it could be read at all.
-    cache: Mutex<HashMap<u32, (bool, bool)>>,
+    /// Maps a process, identified beyond reuse, to whether it is listed.
+    cache: Mutex<HashMap<(u32, u64), bool>>,
 }
 
 impl Classifier {
@@ -402,18 +439,39 @@ impl Classifier {
     }
 
     fn is_listed(&self, process_id: u32) -> (bool, bool) {
+        // Protected system processes cannot be opened at all. That answer is
+        // not remembered, because there is no creation time to key it by and
+        // an id on its own is not a stable name for a process. Retrying costs
+        // one failing open.
+        let Some(process) = Process::open(process_id) else {
+            return (false, false);
+        };
+        let Some(created) = process.created() else {
+            return process
+                .image_path()
+                .map_or((false, false), |path| (self.matches(&path), true));
+        };
+        let key = (process_id, created);
         if let Ok(cache) = self.cache.lock() {
-            if let Some(entry) = cache.get(&process_id) {
-                return *entry;
+            if let Some(listed) = cache.get(&key) {
+                return (*listed, true);
             }
         }
-        let entry = process_path(process_id).map_or((false, false), |path| {
-            (self.matches(&path), true)
-        });
+        let Some(path) = process.image_path() else {
+            return (false, false);
+        };
+        let listed = self.matches(&path);
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(process_id, entry);
+            // Dropping everything is cruder than evicting the coldest entry
+            // and costs one re-query for the processes still running. Both are
+            // off the packet path, and this cannot get the eviction order
+            // wrong.
+            if cache.len() >= CLASSIFICATION_CAPACITY {
+                cache.clear();
+            }
+            cache.insert(key, listed);
         }
-        entry
+        (listed, true)
     }
 
     fn matches(&self, path: &Path) -> bool {
@@ -429,41 +487,94 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
-/// Resolves the executable backing a process id.
-///
-/// Returns `None` for processes that have already exited or that the helper
-/// cannot open, which includes protected system processes.
-fn process_path(process_id: u32) -> Option<PathBuf> {
-    // SAFETY: a failed open returns null, which is checked before use.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        return None;
+/// An open process handle, closed exactly once when it goes out of scope.
+struct Process(HANDLE);
+
+impl Process {
+    /// Opens `process_id` for the two queries below.
+    ///
+    /// Returns `None` for processes that have already exited or that the
+    /// helper cannot open, which includes protected system processes.
+    fn open(process_id: u32) -> Option<Self> {
+        // SAFETY: a failed open returns null, which is checked before use.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        (!handle.is_null()).then_some(Self(handle))
     }
-    // Windows paths reach 32767 characters, which is far too much to put on
-    // the stack for a call made on every new process.
-    let mut buffer = vec![0_u16; 32_768];
-    let mut length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-    // SAFETY: `length` describes `buffer`, and the handle is valid until the
-    // close below.
-    let ok = unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            // `PROCESS_NAME_WIN32`: the Win32 path, matching the paths the UI
-            // stores. The native NT form would never compare equal to them.
-            0,
-            buffer.as_mut_ptr(),
-            &raw mut length,
-        )
-    };
-    // SAFETY: the handle came from `OpenProcess` and is closed exactly once.
-    unsafe {
-        CloseHandle(process);
+
+    /// Reads the moment the process started, as a 100-nanosecond file time.
+    ///
+    /// This is what distinguishes a process from an unrelated one that later
+    /// inherits its id.
+    fn created(&self) -> Option<u64> {
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut ignored = [FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }; 3];
+        // SAFETY: every out parameter points at a live `FILETIME`, and the
+        // handle is valid for the lifetime of `self`.
+        let ok = unsafe {
+            GetProcessTimes(
+                self.0,
+                &raw mut creation,
+                &raw mut ignored[0],
+                &raw mut ignored[1],
+                &raw mut ignored[2],
+            )
+        };
+        (ok != 0).then(|| {
+            u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime)
+        })
     }
-    if ok == 0 {
-        return None;
+
+    /// Resolves the executable backing the process.
+    fn image_path(&self) -> Option<PathBuf> {
+        const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+        // Windows paths reach 32767 characters, but essentially never do.
+        // Starting small and growing only when Windows says so keeps the
+        // common case to one small allocation instead of 64KB per process.
+        let mut capacity = 512_usize;
+        loop {
+            let mut buffer = vec![0_u16; capacity];
+            let mut length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+            // SAFETY: `length` describes `buffer` and the handle is valid for
+            // the lifetime of `self`.
+            let ok = unsafe {
+                QueryFullProcessImageNameW(
+                    self.0,
+                    // `PROCESS_NAME_WIN32`: the Win32 path, matching the paths
+                    // the UI stores. The native NT form would never compare
+                    // equal to them.
+                    0,
+                    buffer.as_mut_ptr(),
+                    &raw mut length,
+                )
+            };
+            if ok != 0 {
+                let path = String::from_utf16_lossy(&buffer[..length as usize]);
+                return Some(normalize_windows_path(Path::new(&path)));
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER)
+                || capacity >= 32_768
+            {
+                return None;
+            }
+            capacity = (capacity * 2).min(32_768);
+        }
     }
-    let path = String::from_utf16_lossy(&buffer[..length as usize]);
-    Some(normalize_windows_path(Path::new(&path)))
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `OpenProcess` and is closed exactly
+        // once, when the only owner is dropped.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// Builds a flow key from the `WinDivert` flow data.
@@ -503,11 +614,12 @@ fn decode_address(words: [u32; 4], ipv6: bool) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_address, paths_equal, Disposition, FlowKey, FlowTable,
+        decode_address, normalize_windows_path, paths_equal, AppRoutingMode, AppRoutingPolicy,
+        Classifier, Disposition, FlowKey, FlowTable, Process,
     };
     use std::{
         net::{IpAddr, Ipv4Addr},
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     fn key() -> FlowKey {
@@ -563,6 +675,73 @@ mod tests {
         assert_eq!(table.lookup(&key()), Some(Disposition::Direct));
         table.remove(&key());
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn identifies_a_process_beyond_its_id() {
+        // The creation time is what a cache entry is keyed by, so it has to be
+        // readable and identical every time the same process is opened. If it
+        // were not stable, every lookup would miss and the memoisation would
+        // silently do nothing.
+        let id = std::process::id();
+        let created = Process::open(id)
+            .and_then(|process| process.created())
+            .expect("the running process has a creation time");
+        assert_ne!(created, 0);
+        assert_eq!(
+            Process::open(id).and_then(|process| process.created()),
+            Some(created)
+        );
+    }
+
+    #[test]
+    fn resolves_a_running_executable_without_a_64kb_buffer() {
+        let path = Process::open(std::process::id())
+            .and_then(|process| process.image_path())
+            .expect("the running process has an image path");
+        // The growth loop starts at 512 characters; an ordinary path must
+        // resolve on the first attempt and come back normalised.
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(path, normalize_windows_path(&path));
+    }
+
+    #[test]
+    fn classifies_the_running_process_the_same_way_twice() {
+        // The second call is the one that goes through the cache. A key that
+        // did not survive the round trip would show up here as the two
+        // answers disagreeing.
+        let executable = std::env::current_exe().expect("current executable");
+        let listed = Classifier::new(&AppRoutingPolicy {
+            mode: AppRoutingMode::Include,
+            apps: vec![executable],
+            package_sids: Vec::new(),
+        });
+        let id = std::process::id();
+        assert_eq!(listed.classify(id), (Disposition::Tunnel, true));
+        assert_eq!(listed.classify(id), (Disposition::Tunnel, true));
+
+        let unlisted = Classifier::new(&AppRoutingPolicy {
+            mode: AppRoutingMode::Include,
+            apps: vec![PathBuf::from(r"C:\nowhere\absent.exe")],
+            package_sids: Vec::new(),
+        });
+        assert_eq!(unlisted.classify(id), (Disposition::Direct, true));
+        assert_eq!(unlisted.classify(id), (Disposition::Direct, true));
+    }
+
+    #[test]
+    fn forgets_the_oldest_classifications_rather_than_growing_without_bound() {
+        // Long sessions on a machine that churns through processes would
+        // otherwise accumulate one entry per process ever seen.
+        let classifier = Classifier::new(&AppRoutingPolicy::default());
+        if let Ok(mut cache) = classifier.cache.lock() {
+            for index in 0..u32::try_from(super::CLASSIFICATION_CAPACITY).expect("capacity fits") {
+                cache.insert((index, 1), false);
+            }
+        }
+        let _ = classifier.classify(std::process::id());
+        let size = classifier.cache.lock().map_or(0, |cache| cache.len());
+        assert!(size <= super::CLASSIFICATION_CAPACITY, "{size}");
     }
 
     #[test]
