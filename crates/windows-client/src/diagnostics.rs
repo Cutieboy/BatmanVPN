@@ -1,21 +1,22 @@
-#![doc = "Temporary field diagnostics for the split tunnel."]
+#![doc = "On-demand field diagnostics for the split tunnel."]
 #![cfg_attr(not(windows), allow(dead_code))]
 //!
-//! # This module is scaffolding
+//! Answers, from a user's own machine, how much traffic crosses the tunnel,
+//! how far away the server is, and how much is lost on the way. It was written
+//! to settle one report of the tunnel feeling slow and did: the client, its
+//! network card and the server all measured clean, and the loss turned out to
+//! be on the path to one particular server, which nothing here could have
+//! fixed. That is the shape of question it is for — telling apart faults that
+//! present identically from outside.
 //!
-//! It exists to answer one question on real machines — how much traffic
-//! actually crosses the tunnel, how far away the server is, and how much is
-//! lost on the way — and is meant to be deleted once that question is
-//! answered. Removing it is this file, its `mod` line, and the call sites in
-//! [`crate::split_tunnel`].
+//! Off unless `MOUSEVPN_DIAG=1` is set in the helper's environment. A summary
+//! every five seconds is roughly 150KB an hour, which is a great deal of log
+//! to write for a question nobody is asking.
 //!
-//! Everything it emits goes to stderr as `MOUSEVPN_DIAG=` lines, which the
-//! desktop application already copies verbatim into
+//! What it emits goes to stderr as `MOUSEVPN_DIAG=` lines, which the desktop
+//! application already copies verbatim into
 //! `%LOCALAPPDATA%\MouseVPN\logs\helper.log`. Nothing in the installer or the
-//! packaging has to change for the numbers to reach a user's log.
-//!
-//! Set `MOUSEVPN_DIAG=0` in the helper's environment to silence it without
-//! rebuilding.
+//! packaging has to change for the numbers to reach a user.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -172,15 +173,12 @@ pub(crate) struct Diagnostics {
 }
 
 impl Diagnostics {
-    /// Starts collecting unless `MOUSEVPN_DIAG` switches it off.
+    /// Starts collecting only when `MOUSEVPN_DIAG` asks for it.
     pub(crate) fn start() -> Self {
-        let enabled = !matches!(
-            std::env::var("MOUSEVPN_DIAG").as_deref(),
-            Ok("0" | "off" | "false")
-        );
+        let enabled = asked_for(std::env::var("MOUSEVPN_DIAG").ok().as_deref());
         if enabled {
             eprintln!(
-                "MOUSEVPN_DIAG=started interval_s={} note=set MOUSEVPN_DIAG=0 to silence",
+                "MOUSEVPN_DIAG=started interval_s={}",
                 REPORT_INTERVAL.as_secs()
             );
         }
@@ -200,6 +198,16 @@ impl Diagnostics {
             rtt: Rtt::default(),
             sequence: Sequence::default(),
         }
+    }
+
+    /// Reports whether anything will read what is collected.
+    ///
+    /// Every other measurement here is a handful of integer additions, cheap
+    /// enough to take unconditionally. Timing the receive loop is not: it
+    /// costs two clock reads on every datagram, which is not a price to pay
+    /// for a number that will be discarded.
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Records how long one datagram occupied the receive loop.
@@ -293,6 +301,15 @@ impl Diagnostics {
     }
 }
 
+/// Decides whether the environment asked for diagnostics.
+///
+/// Absence means off. Anything unrecognised also means off: a value nobody
+/// meant as a switch should not quietly start writing a summary every five
+/// seconds into a user's log.
+fn asked_for(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "on" | "true"))
+}
+
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -317,7 +334,7 @@ fn percent(part: u64, whole: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{millis, percent, Diagnostics, SendCounters, Sequence};
+    use super::{asked_for, millis, percent, Diagnostics, SendCounters, Sequence};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -398,6 +415,25 @@ mod tests {
         counters.sent(300);
         counters.failed();
         assert_eq!(counters.snapshot(), (2, 1_500, 1));
+    }
+
+    #[test]
+    fn stays_silent_unless_it_is_asked_for() {
+        // The default decides what every user's log looks like, so it is worth
+        // a test of its own rather than a reading of the expression.
+        assert!(!asked_for(None));
+        assert!(!asked_for(Some("")));
+        assert!(!asked_for(Some("0")));
+        assert!(!asked_for(Some("off")));
+        // An unrecognised value is not an invitation either.
+        assert!(!asked_for(Some("yes")));
+        assert!(!asked_for(Some("2")));
+
+        assert!(asked_for(Some("1")));
+        assert!(asked_for(Some("on")));
+        assert!(asked_for(Some("true")));
+        // Set through a shell or a GUI, a value easily arrives padded.
+        assert!(asked_for(Some(" 1 ")));
     }
 
     #[test]

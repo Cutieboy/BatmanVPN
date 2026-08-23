@@ -285,10 +285,13 @@ impl ReceiveLoop<'_> {
                     // Timed because this is the only stretch where the socket
                     // is unattended. How long it lasts decides whether the
                     // datagrams missing from the sequence were dropped here or
-                    // never arrived.
-                    let started = Instant::now();
+                    // never arrived. Read the clock only when something will
+                    // read the answer.
+                    let started = diagnostics.enabled().then(Instant::now);
                     self.deliver(length, &mut buffers, &mut liveness, &mut diagnostics);
-                    diagnostics.processed(started.elapsed());
+                    if let Some(started) = started {
+                        diagnostics.processed(started.elapsed());
+                    }
                 }
                 Err(error) if is_transient_io(&error) => {}
                 Err(error) if is_peer_unavailable(&error) => {
