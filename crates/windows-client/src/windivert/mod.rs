@@ -22,10 +22,13 @@ use crate::ClientError;
 /// Layer identifiers from `WINDIVERT_LAYER`.
 pub(crate) const LAYER_NETWORK: u32 = 0;
 pub(crate) const LAYER_FLOW: u32 = 2;
+pub(crate) const LAYER_SOCKET: u32 = 3;
 
 /// Event identifiers from `WINDIVERT_EVENT`.
 pub(crate) const EVENT_FLOW_ESTABLISHED: u32 = 1;
 pub(crate) const EVENT_FLOW_DELETED: u32 = 2;
+pub(crate) const EVENT_SOCKET_CONNECT: u32 = 4;
+pub(crate) const EVENT_SOCKET_CLOSE: u32 = 7;
 
 /// Handle flags from `WINDIVERT_FLAG_*`.
 pub(crate) const FLAG_SNIFF: u64 = 0x0001;
@@ -132,10 +135,11 @@ impl Address {
 
     /// Reinterprets the union as flow data.
     ///
-    /// Returns `None` unless the address came from the flow layer, so a
-    /// mismatched layer cannot be read as the wrong union member.
+    /// The socket layer shares this member's layout exactly, and both are read
+    /// the same way. Any other layer returns `None`, so a mismatched one cannot
+    /// be read as the wrong union member.
     pub(crate) fn flow(&self) -> Option<FlowData> {
-        (self.layer() == LAYER_FLOW).then(|| {
+        (self.layer() == LAYER_FLOW || self.layer() == LAYER_SOCKET).then(|| {
             // SAFETY: `FlowData` is 64 bytes of plain integers with no
             // padding requirements beyond 8-byte alignment, `payload` is 64
             // bytes inside a structure aligned to 8, and the layer check above

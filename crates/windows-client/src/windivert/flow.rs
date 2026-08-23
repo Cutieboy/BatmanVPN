@@ -18,8 +18,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{Address, Handle, Library, EVENT_FLOW_DELETED, EVENT_FLOW_ESTABLISHED, FLAG_RECV_ONLY,
-    FLAG_SNIFF, LAYER_FLOW};
+use super::{
+    Address, Handle, Library, EVENT_FLOW_DELETED, EVENT_FLOW_ESTABLISHED, EVENT_SOCKET_CLOSE,
+    EVENT_SOCKET_CONNECT, FLAG_RECV_ONLY, FLAG_SNIFF, LAYER_FLOW, LAYER_SOCKET,
+};
 use crate::{normalize_windows_path, AppRoutingMode, AppRoutingPolicy, ClientError};
 
 /// Identifies one flow by the tuple the packet layer can also observe.
@@ -119,10 +121,10 @@ impl FlowTable {
 /// never delay or drop a connection. A stall here would be indistinguishable
 /// from a broken network.
 pub(crate) struct FlowWatcher {
-    handle: Arc<Handle>,
+    handles: Vec<Arc<Handle>>,
     table: Arc<FlowTable>,
     stopping: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl FlowWatcher {
@@ -132,34 +134,56 @@ impl FlowWatcher {
     ///
     /// Returns [`ClientError::Platform`] when the `WinDivert` flow handle cannot
     /// be opened.
+    /// Watches both the socket and the flow layer.
+    ///
+    /// The socket layer is what makes a blocked destination reachable at all.
+    /// Its connect event fires before the SYN leaves, so the first packet is
+    /// already classified. The flow layer only reports a flow once it is
+    /// established, which never happens for a destination that is blocked
+    /// without the tunnel: the SYN would go out untunnelled, draw no reply,
+    /// and the flow that would have classified it never exists.
+    ///
+    /// The flow layer is still worth watching. It covers unconnected datagram
+    /// sockets, which never raise a connect event, and its delete event is
+    /// what retires an entry.
     pub(crate) fn start(
         library: &Arc<Library>,
         policy: &AppRoutingPolicy,
     ) -> Result<Self, ClientError> {
-        // Priority is irrelevant for a sniffing handle, but a distinct value
-        // keeps MouseVPN identifiable in `windivertctl` output.
-        let handle = Arc::new(library.open("true", LAYER_FLOW, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?);
         let table = Arc::new(FlowTable::default());
         let stopping = Arc::new(AtomicBool::new(false));
-        let classifier = Classifier::new(policy);
+        let classifier = Arc::new(Classifier::new(policy));
+        let mut handles = Vec::new();
+        let mut threads = Vec::new();
 
-        let thread = thread::Builder::new()
-            .name("mousevpn-flow-watcher".to_owned())
-            .spawn({
-                let handle = Arc::clone(&handle);
-                let table = Arc::clone(&table);
-                let stopping = Arc::clone(&stopping);
-                move || run(&handle, &table, &classifier, &stopping)
-            })
-            .map_err(|error| {
-                ClientError::Platform(format!("failed to start the flow watcher: {error}"))
-            })?;
+        for (layer, name) in [
+            (LAYER_SOCKET, "mousevpn-socket-watcher"),
+            (LAYER_FLOW, "mousevpn-flow-watcher"),
+        ] {
+            // Priority is irrelevant for a sniffing handle, but a distinct
+            // value keeps MouseVPN identifiable in `windivertctl` output.
+            let handle = Arc::new(library.open("true", layer, 0, FLAG_SNIFF | FLAG_RECV_ONLY)?);
+            let thread = thread::Builder::new()
+                .name(name.to_owned())
+                .spawn({
+                    let handle = Arc::clone(&handle);
+                    let table = Arc::clone(&table);
+                    let stopping = Arc::clone(&stopping);
+                    let classifier = Arc::clone(&classifier);
+                    move || run(&handle, &table, &classifier, &stopping)
+                })
+                .map_err(|error| {
+                    ClientError::Platform(format!("failed to start {name}: {error}"))
+                })?;
+            handles.push(handle);
+            threads.push(thread);
+        }
 
         Ok(Self {
-            handle,
+            handles,
             table,
             stopping,
-            thread: Some(thread),
+            threads,
         })
     }
 
@@ -171,10 +195,12 @@ impl FlowWatcher {
 impl Drop for FlowWatcher {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        // The watcher parks inside `recv`, so it only observes `stopping`
-        // after the shutdown drains the queue and wakes it.
-        self.handle.shutdown();
-        if let Some(thread) = self.thread.take() {
+        // Each watcher parks inside `recv`, so it only observes `stopping`
+        // after the shutdown drains its queue and wakes it.
+        for handle in &self.handles {
+            handle.shutdown();
+        }
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
@@ -207,7 +233,10 @@ fn run(
             continue;
         };
         match address.event() {
-            EVENT_FLOW_ESTABLISHED => {
+            // A connect event carries the process before the first packet is
+            // sent, which is the only moment that helps a destination that is
+            // unreachable without the tunnel.
+            EVENT_SOCKET_CONNECT | EVENT_FLOW_ESTABLISHED => {
                 let (disposition, attributed) = classifier.classify(flow.process_id);
                 if attributed {
                     table.insert(key, disposition);
@@ -215,7 +244,7 @@ fn run(
                     table.insert_unattributed(key, disposition);
                 }
             }
-            EVENT_FLOW_DELETED => table.remove(&key),
+            EVENT_SOCKET_CLOSE | EVENT_FLOW_DELETED => table.remove(&key),
             _ => {}
         }
     }
