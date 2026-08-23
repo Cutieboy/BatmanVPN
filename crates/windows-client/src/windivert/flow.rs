@@ -77,6 +77,12 @@ impl FlowTable {
     fn len(&self) -> usize {
         self.entries.read().map_or(0, |entries| entries.len())
     }
+
+    /// Seeds a decision so the diverter can be tested without a live watcher.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, key: FlowKey, disposition: Disposition) {
+        self.insert(key, disposition);
+    }
 }
 
 /// Watches flow establishment and classifies each flow against the policy.

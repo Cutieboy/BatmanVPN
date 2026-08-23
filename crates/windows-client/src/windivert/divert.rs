@@ -1,0 +1,311 @@
+#![doc = "Moves selected applications' packets between the stack and the tunnel."]
+
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+use super::{
+    flow::{Disposition, FlowKey, FlowTable},
+    packet::{Packet, PROTOCOL_TCP, PROTOCOL_UDP},
+    Address, Handle, Library, LAYER_NETWORK, MTU_MAX,
+};
+use crate::ClientError;
+
+/// What to do with a captured outbound packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Outcome {
+    /// The packet belongs to a routed application: it has been rewritten to
+    /// carry the tunnel's source address and must go to the data plane.
+    Tunnel,
+    /// The packet belongs to an application that stays on the physical link.
+    /// It has not been touched and must be reinjected exactly as captured.
+    PassThrough,
+}
+
+/// The two addresses the split tunnel substitutes between.
+///
+/// Applications only ever see `physical`, because every packet is translated
+/// before it reaches them. `tunnel` exists solely on the wire to the server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Addresses {
+    pub(crate) physical: IpAddr,
+    pub(crate) tunnel: IpAddr,
+}
+
+/// Builds the capture filter.
+///
+/// Two exclusions are load-bearing. Our own tunnel datagrams must never be
+/// captured, or every packet we send would come straight back to us and the
+/// client would wedge itself. Loopback is excluded because local traffic has no
+/// business crossing a VPN and capturing it only costs latency.
+fn filter(server: SocketAddr) -> String {
+    let family = if server.is_ipv4() { "ip" } else { "ipv6" };
+    format!(
+        "outbound and !loopback and ({family}) and (tcp or udp) and \
+         not (udp and {family}.DstAddr == {} and udp.DstPort == {})",
+        server.ip(),
+        server.port()
+    )
+}
+
+/// Rewrites a captured outbound packet when it belongs in the tunnel.
+///
+/// Returns [`Outcome::PassThrough`] for anything not positively identified as
+/// routed: unparseable packets, protocols without ports, and flows the watcher
+/// has not classified. Defaulting to "leave it alone" means an unknown packet
+/// keeps working over the physical link instead of vanishing into a tunnel
+/// that may not expect it.
+pub(crate) fn prepare_outbound(
+    bytes: &mut [u8],
+    table: &FlowTable,
+    addresses: Addresses,
+) -> Outcome {
+    let Some(mut packet) = Packet::parse(bytes) else {
+        return Outcome::PassThrough;
+    };
+    if !matches!(packet.protocol(), PROTOCOL_TCP | PROTOCOL_UDP) {
+        return Outcome::PassThrough;
+    }
+    let Some((source_port, destination_port)) = packet.ports() else {
+        return Outcome::PassThrough;
+    };
+    let key = FlowKey {
+        protocol: packet.protocol(),
+        local: packet.source(),
+        local_port: source_port,
+        remote: packet.destination(),
+        remote_port: destination_port,
+    };
+    if table.lookup(&key) != Some(Disposition::Tunnel) {
+        return Outcome::PassThrough;
+    }
+    // The application bound to the physical address, but the server only
+    // recognises the tunnel one. Anything else would come back to the wrong
+    // place, if it came back at all.
+    if !packet.set_source(addresses.tunnel) {
+        return Outcome::PassThrough;
+    }
+    Outcome::Tunnel
+}
+
+/// Restores the physical destination on a packet arriving from the tunnel.
+///
+/// Returns `false` when the packet is not addressed to the tunnel address, so
+/// traffic meant for something else is never redirected at an application.
+pub(crate) fn prepare_inbound(bytes: &mut [u8], addresses: Addresses) -> bool {
+    let Some(mut packet) = Packet::parse(bytes) else {
+        return false;
+    };
+    if packet.destination() != addresses.tunnel {
+        return false;
+    }
+    packet.set_destination(addresses.physical)
+}
+
+/// Captures outbound packets and feeds the routed ones to the tunnel.
+pub(crate) struct Diverter {
+    handle: Arc<Handle>,
+    table: Arc<FlowTable>,
+    addresses: Addresses,
+}
+
+impl Diverter {
+    /// Opens the network-layer handle used for capture and injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Platform`] when the handle cannot be opened,
+    /// which includes a filter the driver rejects.
+    pub(crate) fn open(
+        library: &Arc<Library>,
+        table: Arc<FlowTable>,
+        addresses: Addresses,
+        server: SocketAddr,
+    ) -> Result<Self, ClientError> {
+        // Priority 0 keeps MouseVPN below tools that deliberately sit high,
+        // and nothing here depends on winning against another filter.
+        let handle = Arc::new(library.open(&filter(server), LAYER_NETWORK, 0, 0)?);
+        Ok(Self {
+            handle,
+            table,
+            addresses,
+        })
+    }
+
+    /// Runs the capture loop until [`Diverter::stop`] is called.
+    ///
+    /// `sink` receives every packet bound for the tunnel, already rewritten.
+    /// Packets that stay on the physical link are reinjected before `sink` is
+    /// consulted, so a slow data plane cannot stall unrelated traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Platform`] when the capture fails. A shutdown is
+    /// not a failure and returns `Ok(())`.
+    pub(crate) fn run(
+        &self,
+        stopping: &AtomicBool,
+        mut sink: impl FnMut(&[u8]),
+    ) -> Result<(), ClientError> {
+        let mut buffer = vec![0_u8; MTU_MAX];
+        let mut address = Address::zeroed();
+        while !stopping.load(Ordering::Acquire) {
+            let Some(length) = self.handle.recv(&mut buffer, &mut address)? else {
+                return Ok(());
+            };
+            let packet = &mut buffer[..length];
+            match prepare_outbound(packet, &self.table, self.addresses) {
+                Outcome::PassThrough => {
+                    // Captured but unmodified, so the checksums the stack
+                    // computed are still correct and reinjection is a
+                    // straight handback.
+                    self.reinject(packet, &address);
+                }
+                Outcome::Tunnel => {
+                    // The source address changed, which invalidates the IP and
+                    // transport checksums the stack had already filled in.
+                    if let Err(error) = self.handle.calc_checksums(packet, &mut address) {
+                        eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+                        continue;
+                    }
+                    sink(packet);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hands a packet back to the stack, reporting drops without stopping.
+    ///
+    /// A failed reinjection loses one packet. Both TCP and QUIC recover from
+    /// that, whereas returning an error here would take down the tunnel.
+    fn reinject(&self, packet: &[u8], address: &Address) {
+        if let Err(error) = self.handle.send(packet, address) {
+            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+        }
+    }
+
+    /// Unblocks the capture loop.
+    pub(crate) fn stop(&self) {
+        self.handle.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter, prepare_inbound, prepare_outbound, Addresses, Outcome};
+    use crate::windivert::{
+        flow::{Disposition, FlowKey, FlowTable},
+        packet::PROTOCOL_UDP,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    const PHYSICAL: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 189));
+    const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 77, 0, 22));
+    const REMOTE: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+    fn addresses() -> Addresses {
+        Addresses {
+            physical: PHYSICAL,
+            tunnel: TUNNEL,
+        }
+    }
+
+    fn udp_packet(source: IpAddr, destination: IpAddr) -> Vec<u8> {
+        let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, destination) else {
+            unreachable!("tests use IPv4")
+        };
+        let mut packet = vec![0_u8; 28];
+        packet[0] = 0x45;
+        packet[9] = PROTOCOL_UDP;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..22].copy_from_slice(&54_518_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        packet
+    }
+
+    fn table_with(disposition: Disposition) -> FlowTable {
+        let table = FlowTable::default();
+        table.insert_for_test(
+            FlowKey {
+                protocol: PROTOCOL_UDP,
+                local: PHYSICAL,
+                local_port: 54_518,
+                remote: REMOTE,
+                remote_port: 53,
+            },
+            disposition,
+        );
+        table
+    }
+
+    #[test]
+    fn rewrites_a_routed_packet_onto_the_tunnel_address() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = table_with(Disposition::Tunnel);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses()),
+            Outcome::Tunnel
+        );
+        assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
+        // The destination and ports must survive untouched.
+        assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
+        assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x00, 0x35]);
+    }
+
+    #[test]
+    fn leaves_an_excluded_packet_byte_for_byte_alone() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let original = packet.clone();
+        let table = table_with(Disposition::Direct);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses()),
+            Outcome::PassThrough
+        );
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn passes_through_a_flow_the_watcher_has_not_classified() {
+        // Racing the flow layer must not swallow traffic: an unknown packet
+        // keeps working on the physical link.
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let original = packet.clone();
+        assert_eq!(
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            Outcome::PassThrough
+        );
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn restores_the_physical_address_on_the_way_back() {
+        let mut packet = udp_packet(REMOTE, TUNNEL);
+        assert!(prepare_inbound(&mut packet, addresses()));
+        assert_eq!(&packet[16..20], &[192, 168, 0, 189]);
+    }
+
+    #[test]
+    fn refuses_inbound_packets_addressed_elsewhere() {
+        let mut packet = udp_packet(REMOTE, PHYSICAL);
+        let original = packet.clone();
+        assert!(!prepare_inbound(&mut packet, addresses()));
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn excludes_our_own_tunnel_datagrams_from_capture() {
+        let server: SocketAddr = "203.0.113.10:51820".parse().expect("address");
+        let filter = filter(server);
+        // Without this exclusion every datagram we send would be recaptured.
+        assert!(filter.contains("203.0.113.10"));
+        assert!(filter.contains("51820"));
+        assert!(filter.contains("outbound"));
+        assert!(filter.contains("!loopback"));
+    }
+}
