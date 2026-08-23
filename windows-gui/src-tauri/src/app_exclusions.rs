@@ -363,9 +363,45 @@ fn load_resolved() -> Result<StoredSettings, String> {
 }
 
 fn resolve_claude_code_paths(paths: &mut Vec<PathBuf>) -> bool {
-    dirs::config_dir().is_some_and(|directory| {
-        resolve_claude_code_paths_at(paths, &directory.join("Claude").join("claude-code"))
-    })
+    let mut changed = false;
+    for root in claude_code_roots(paths) {
+        if resolve_claude_code_paths_at(paths, &root) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Lists the directories a Claude Code helper can live in.
+///
+/// A packaged Claude does not write to the real `%APPDATA%`. Windows redirects
+/// it into the package's own `LocalCache\Roaming`, and the helper that performs
+/// the network requests lives there, under a path that shares nothing with the
+/// `WindowsApps` executable the user picked. Searching only the unredirected
+/// location finds nothing, and the helper then routes itself.
+fn claude_code_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(directory) = dirs::config_dir() {
+        roots.push(directory.join("Claude").join("claude-code"));
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        for family in paths
+            .iter()
+            .filter_map(|path| windowsapps_package_family(path))
+        {
+            roots.push(
+                local
+                    .join("Packages")
+                    .join(&family)
+                    .join("LocalCache")
+                    .join("Roaming")
+                    .join("Claude")
+                    .join("claude-code"),
+            );
+        }
+    }
+    roots.retain(|root| root.is_dir());
+    roots
 }
 
 fn resolve_claude_code_paths_at(paths: &mut Vec<PathBuf>, root: &Path) -> bool {

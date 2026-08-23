@@ -67,6 +67,23 @@ impl FlowTable {
         }
     }
 
+    /// Records a decision that could not be attributed to a process.
+    ///
+    /// The flow layer reports some flows twice: once for the application that
+    /// owns them and once for a process we cannot open, which on this machine
+    /// is the System process reporting a flow that also crosses another
+    /// tunnel's adapter. Both carry the same five-tuple, so a plain insert
+    /// lets whichever arrives last decide, and an unattributable event can
+    /// quietly downgrade a routed application to the physical link.
+    ///
+    /// An answer derived from no process therefore never replaces one derived
+    /// from a real executable.
+    fn insert_unattributed(&self, key: FlowKey, disposition: Disposition) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.entry(key).or_insert(disposition);
+        }
+    }
+
     fn remove(&self, key: &FlowKey) {
         if let Ok(mut entries) = self.entries.write() {
             entries.remove(key);
@@ -191,7 +208,12 @@ fn run(
         };
         match address.event() {
             EVENT_FLOW_ESTABLISHED => {
-                table.insert(key, classifier.classify(flow.process_id));
+                let (disposition, attributed) = classifier.classify(flow.process_id);
+                if attributed {
+                    table.insert(key, disposition);
+                } else {
+                    table.insert_unattributed(key, disposition);
+                }
             }
             EVENT_FLOW_DELETED => table.remove(&key),
             _ => {}
@@ -263,8 +285,13 @@ pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError>
         // The verdict is the whole point: a routed application whose flows read
         // DIRECT is a policy mismatch, not a tunnel fault.
         let verdict = match classifier.classify(flow.process_id) {
-            Disposition::Tunnel => "TUNNEL",
-            Disposition::Direct => "direct",
+            (Disposition::Tunnel, true) => "TUNNEL",
+            (Disposition::Direct, true) => "direct",
+            // A flow the layer reports twice appears once for a process that
+            // cannot be opened. Marking it keeps that from reading as a
+            // policy decision about the application.
+            (Disposition::Tunnel, false) => "tunnel?",
+            (Disposition::Direct, false) => "direct?",
         };
         match decoded {
             Some(key) => println!(
@@ -307,7 +334,9 @@ pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError>
 struct Classifier {
     mode: AppRoutingMode,
     apps: Vec<PathBuf>,
-    cache: Mutex<HashMap<u32, bool>>,
+    /// Maps a process id to whether it is listed, and whether the executable
+    /// behind it could be read at all.
+    cache: Mutex<HashMap<u32, (bool, bool)>>,
 }
 
 impl Classifier {
@@ -323,9 +352,15 @@ impl Classifier {
         }
     }
 
-    fn classify(&self, process_id: u32) -> Disposition {
-        let listed = self.is_listed(process_id);
-        match (self.mode, listed) {
+    /// Decides where a flow belongs, and reports whether a process backed the
+    /// decision.
+    ///
+    /// The second value matters because an unattributable flow still gets a
+    /// default, and that default must not overrule a decision made from a real
+    /// executable for the same five-tuple.
+    fn classify(&self, process_id: u32) -> (Disposition, bool) {
+        let (listed, attributed) = self.is_listed(process_id);
+        let disposition = match (self.mode, listed) {
             // Selected applications bypass the tunnel; everything else uses it.
             (AppRoutingMode::Exclude, true) | (AppRoutingMode::Include, false) => {
                 Disposition::Direct
@@ -333,20 +368,23 @@ impl Classifier {
             (AppRoutingMode::Exclude, false) | (AppRoutingMode::Include, true) => {
                 Disposition::Tunnel
             }
-        }
+        };
+        (disposition, attributed)
     }
 
-    fn is_listed(&self, process_id: u32) -> bool {
+    fn is_listed(&self, process_id: u32) -> (bool, bool) {
         if let Ok(cache) = self.cache.lock() {
-            if let Some(listed) = cache.get(&process_id) {
-                return *listed;
+            if let Some(entry) = cache.get(&process_id) {
+                return *entry;
             }
         }
-        let listed = process_path(process_id).is_some_and(|path| self.matches(&path));
+        let entry = process_path(process_id).map_or((false, false), |path| {
+            (self.matches(&path), true)
+        });
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(process_id, listed);
+            cache.insert(process_id, entry);
         }
-        listed
+        entry
     }
 
     fn matches(&self, path: &Path) -> bool {
@@ -468,6 +506,24 @@ mod tests {
         // Guards the host-order assumption: a network-order layout would put
         // the mapping prefix in a different word and must not decode silently.
         assert_eq!(decode_address([0, 0, 0xffff, 12345], false), None);
+    }
+
+    #[test]
+    fn an_unattributed_event_never_downgrades_a_classified_flow() {
+        // The flow layer reports some flows twice, once for a process that
+        // cannot be opened. Letting that second event win sends a routed
+        // application out on the physical link.
+        let table = FlowTable::default();
+        table.insert(key(), Disposition::Tunnel);
+        table.insert_unattributed(key(), Disposition::Direct);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
+    }
+
+    #[test]
+    fn an_unattributed_event_still_seeds_an_unknown_flow() {
+        let table = FlowTable::default();
+        table.insert_unattributed(key(), Disposition::Tunnel);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
     }
 
     #[test]
