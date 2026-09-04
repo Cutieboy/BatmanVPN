@@ -12,8 +12,17 @@ android {
         applicationId = "dev.mousevpn.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "0.1.13"
+        versionCode = 15
+        versionName = "0.1.14"
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("../mousevpn-android-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {

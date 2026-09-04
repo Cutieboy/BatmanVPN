@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>aysekurt874816@gmail.com</email>
+		<name>MouseVPN packaging</name>
+	</maintainer>
+	<longdescription lang="en">
+		MouseVPN carries IPv4 through an authenticated encrypted UDP tunnel
+		with Noise IK, X25519 and ChaCha20-Poly1305, and supports several
+		independently revocable device keys. This package builds the Linux
+		terminal client, the loopback SOCKS5 proxy client, the profile tool
+		and optionally the Tauri desktop client and the multi-device server.
+
+		MouseVPN is an early MVP. It has not received an independent security
+		audit and must not be presented as anonymous, unblockable or
+		production-hardened software.
+	</longdescription>
+	<use>
+		<flag name="client">Install the terminal client and the loopback SOCKS5 proxy client</flag>
+		<flag name="gui">Install the Tauri desktop client (pulls in <pkg>net-libs/webkit-gtk</pkg>)</flag>
+		<flag name="server">Install the multi-device TUN/NAT server and the device provisioning tool</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">Zumka1991/MouseVPN</remote-id>
+	</upstream>
+</pkgmetadata>

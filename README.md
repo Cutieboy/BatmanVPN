@@ -52,5 +52,7 @@ cargo test --workspace
 ```
 
 The Android build instructions are in [android/README.md](android/README.md).
+The Gentoo ebuild and its build and install script are documented in
+[packaging/gentoo/README.md](packaging/gentoo/README.md).
 Deployment drafts live under `deploy/`; review and adapt every network and
 systemd setting for the target host before use.

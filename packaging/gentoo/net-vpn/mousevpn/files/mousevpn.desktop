@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MouseVPN
+GenericName=VPN client
+Comment=Fast private MouseVPN client
+Exec=mousevpn-linux-gui
+Icon=mousevpn
+Terminal=false
+Categories=Network;Security;
+StartupWMClass=MouseVPN
+Keywords=VPN;tunnel;privacy;

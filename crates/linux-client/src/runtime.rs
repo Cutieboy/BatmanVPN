@@ -125,7 +125,7 @@ fn run_mode(
     flag::register(SIGTERM, Arc::clone(&stopping))?;
     let mut network = match mode {
         Mode::FullTunnel => NetworkGuard::Full {
-            _firewall: FirewallGuard::install(server_ip, config.server.port(), &tun_name)
+            _firewall: FirewallGuard::install(server_ip, &tun_name)
                 .map_err(|error| context("installing the MouseVPN firewall", &error))?,
             routes: RouteGuard::install(server_ip, &tun_name)
                 .map_err(|error| context("installing VPN routes", &error))?,

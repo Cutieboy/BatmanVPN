@@ -23,6 +23,10 @@ Desktop client built with Tauri 2 and the existing MouseVPN Rust runtime.
   discovery;
 - keeps IPv4 DHCP renewal working while connected, so a lease expiring mid
   session no longer takes the tunnel down with it;
+- allows direct access to the VPN server's IPv4 address on all ports, so websites
+  and other services on that address remain reachable while connected. This
+  traffic bypasses the tunnel; other destinations remain subject to the kill
+  switch;
 - starts a privileged watchdog that removes only MouseVPN's nftables table and
   marked server route if the tunnel helper is killed before Rust cleanup runs;
 - shows reconnect progress in the GUI and keeps a rotated helper log under

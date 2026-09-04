@@ -23,9 +23,13 @@ For an installable internal release build:
 ```
 
 The APK is written to `app/build/outputs/apk/release/app-release.apk`. Internal
-MVP releases use the local Android debug certificate so they can update the
-development installation. Create and protect a dedicated release keystore
-before any public distribution.
+MVP releases use `../mousevpn-android-debug.keystore` (alias `androiddebugkey`,
+standard debug store/key password `android`). The project explicitly selects
+this certificate instead of a machine-generated key. The owner requested that
+this internal key be tracked in Git for repeatable updates. Version 0.1.14 starts
+a new signing identity: older APKs signed with the lost key require uninstalling
+before installing this APK; preserve VPN configuration keys first.
+Create and protect a dedicated release keystore before any public distribution.
 
 Create an encrypted profile key from an existing desktop client config:
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=MouseVPN client (%i)
+Documentation=file:/usr/share/doc/mousevpn/MANUAL.md.bz2
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+Requires=systemd-resolved.service
+ConditionPathExists=/etc/mousevpn/%i.toml
+
+[Service]
+Type=simple
+# The client opens /dev/net/tun, installs routes, changes the resolver through
+# resolvectl and loads its own nftables table, so it runs as root.
+ExecStart=/usr/bin/mousevpn-linux-client --config /etc/mousevpn/%i.toml
+# SIGTERM does what Ctrl+C does in the manual: the client removes its routes,
+# DNS settings and nftables table before exiting.
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=3s
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

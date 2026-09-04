@@ -161,7 +161,11 @@ class MouseVpnService : VpnService() {
             handle = prepared.getLong("handle")
             ensureAttemptActive(generation)
             val serverMtu = prepared.getInt("mtu")
-            val mtu = tunnelMtu(serverMtu)
+            val mtu = calculateTunnelMtu(
+                serverMtu,
+                underlyingMtu(),
+                profile.protocol != VpnProtocol.LEGACY,
+            )
             val builder = Builder()
                 .setSession("MouseVPN")
                 .setMtu(mtu)
@@ -256,30 +260,10 @@ class MouseVpnService : VpnService() {
     }
 
     /**
-     * Lowers the tunnel MTU to what the current network can actually carry.
-     *
-     * The server picks one MTU for everybody, and it has to assume the usual
-     * 1500-byte path. Mobile networks routinely carry less because of the
-     * operator's own encapsulation, and a tunnel datagram that no longer fits
-     * gets fragmented — often into fragments that carrier NAT then drops. The
-     * result is not a clean failure: small requests succeed while anything
-     * large stalls, so heavy apps break while light ones look fine.
-     *
-     * This can only reduce the value, never raise it above what the server
-     * negotiated, and it is skipped entirely when Android does not report the
-     * underlying MTU.
-     */
-    private fun tunnelMtu(serverMtu: Int): Int {
-        val underlying = underlyingMtu() ?: return serverMtu
-        val fits = underlying - OUTER_OVERHEAD
-        return serverMtu.coerceAtMost(fits).coerceAtLeast(MINIMUM_MTU)
-    }
-
-    /**
      * MTU of the network carrying the tunnel, or null when it is unknown.
      *
-     * Read before `establish`, so the active network is still the underlying
-     * one rather than the VPN itself.
+     * Use the physical network selected for bindSocket. activeNetwork can
+     * still be a VPN during reconnect and report the old tunnel's MTU.
      *
      * Android only exposes the link MTU from API 29; on anything older the
      * tunnel keeps the value the server negotiated.
@@ -287,9 +271,9 @@ class MouseVpnService : VpnService() {
     private fun underlyingMtu(): Int? {
         if (Build.VERSION.SDK_INT < 29) return null
         val manager = getSystemService(ConnectivityManager::class.java)
-        val network = manager.activeNetwork ?: return null
+        val network = synchronized(this) { selectedUnderlyingNetwork } ?: return null
         val mtu = manager.getLinkProperties(network)?.mtu ?: return null
-        return mtu.takeIf { it >= MINIMUM_MTU }
+        return mtu.takeIf { it > 0 }
     }
 
     /**
@@ -598,14 +582,6 @@ class MouseVpnService : VpnService() {
         var connectedSinceElapsedRealtime: Long = 0L
             private set
 
-        /**
-         * Bytes wrapped around every tunnelled packet: 20 outer IPv4, 8 UDP,
-         * 20 protocol header, 1 inner packet kind and a 16-byte AEAD tag.
-         */
-        private const val OUTER_OVERHEAD = 65
-
-        /** Floor for the tunnel MTU; every path is expected to carry this. */
-        private const val MINIMUM_MTU = 1_280
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
         private const val DIAGNOSTIC_CHECKPOINT_MS = 60_000L
         private const val RECONNECT_BACKOFF_RESET_MS = 60_000L

@@ -206,6 +206,9 @@ struct MorphRoute {
 #[derive(Default)]
 struct MorphRouter {
     epoch: Option<u64>,
+    // The static shared key does not change when routing tags rotate. Avoid
+    // repeating X25519 for every device in the receive loop once per second.
+    keys: HashMap<PublicKey, MorphKey>,
     routes: HashMap<[u8; 8], MorphRoute>,
     ambiguous: HashSet<[u8; 8]>,
 }
@@ -231,22 +234,31 @@ impl MorphRouter {
         config: &ValidatedServerConfig,
         authorized: &SharedDeviceRegistry,
     ) -> Result<(), ()> {
-        let devices = authorized.list().map_err(|_| ())?;
+        let devices: HashSet<_> = authorized
+            .list()
+            .map_err(|_| ())?
+            .iter()
+            .filter_map(|device| decode_public_key(&device.public_key).ok())
+            .collect();
+        self.keys
+            .retain(|public_key, _| devices.contains(public_key));
         self.routes.clear();
         self.ambiguous.clear();
-        for device in devices {
-            let Ok(public_key) = decode_public_key(&device.public_key) else {
-                continue;
+        for public_key in devices {
+            let key = match self.keys.entry(public_key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let Ok(key) = derive_morph_key(
+                        &config.server_private_key,
+                        &public_key,
+                        &config.server_public_key,
+                        &public_key,
+                    ) else {
+                        continue;
+                    };
+                    entry.insert(MorphKey::from_bytes(key))
+                }
             };
-            let Ok(key) = derive_morph_key(
-                &config.server_private_key,
-                &public_key,
-                &config.server_public_key,
-                &public_key,
-            ) else {
-                continue;
-            };
-            let key = MorphKey::from_bytes(key);
             for profile in [Profile::Quiet, Profile::Balanced, Profile::Paranoid] {
                 let Ok(profile_epoch) = current_epoch(profile) else {
                     continue;
@@ -646,7 +658,9 @@ fn handle_handshake(
     let Ok(mut guard) = services.sessions.write() else {
         return;
     };
-    guard.replace_client(datagram.header.session_id, session);
+    if !guard.replace_client(datagram.header.session_id, session) {
+        return;
+    }
     drop(guard);
 
     let header = Header {
@@ -997,13 +1011,137 @@ fn find_session_by_address(
 
 impl Sessions {
     /// Installs a session, replacing any previous one for the same device.
-    fn replace_client(&mut self, session_id: u64, session: Arc<RuntimeSession>) {
+    fn replace_client(&mut self, session_id: u64, session: Arc<RuntimeSession>) -> bool {
         let address = session.client_address;
+        // The session ID is chosen by the client, not an authorization token.
+        // Reject collisions before changing either index, including the
+        // reconnecting device's own previous session.
+        if self
+            .by_id
+            .get(&session_id)
+            .is_some_and(|existing| existing.client_address != address)
+        {
+            return false;
+        }
         if let Some(previous) = self.by_address.insert(address, Arc::clone(&session)) {
             self.by_id
                 .retain(|_, existing| !Arc::ptr_eq(existing, &previous));
         }
         self.by_id.insert(session_id, session);
+        true
+    }
+}
+
+#[cfg(test)]
+mod session_isolation_tests {
+    use std::{
+        collections::HashMap,
+        net::UdpSocket,
+        sync::{Arc, RwLock},
+    };
+
+    use mousevpn_admin_api::{SeedDevice, SharedDeviceRegistry, TrafficStore};
+    use mousevpn_config::{ServerTunConfig, ValidatedServerConfig};
+    use mousevpn_crypto::{ClientHandshake, KeyPair, ProtocolContext};
+    use mousevpn_protocol::{Datagram, Header, PacketKind};
+
+    use super::{handle_handshake, HandshakeServices, Sessions, WireMode};
+
+    #[test]
+    fn a_device_cannot_replace_another_devices_session_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = KeyPair::generate().unwrap();
+        let clients = [KeyPair::generate().unwrap(), KeyPair::generate().unwrap()];
+        let config = ValidatedServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            public_endpoint: None,
+            server_public_key: server.public,
+            context: ProtocolContext::for_server(&server.public),
+            server_private_key: server.secret,
+            tun: ServerTunConfig {
+                name: "mousevpn0".to_owned(),
+                address: "10.77.0.1".parse().unwrap(),
+                prefix_len: 24,
+                mtu: 1280,
+                dns: "1.1.1.1".parse().unwrap(),
+            },
+            clients: Vec::new(),
+        };
+        let addresses = ["10.77.0.2".parse().unwrap(), "10.77.0.3".parse().unwrap()];
+        let registry = SharedDeviceRegistry::open(
+            directory.path().join("devices.toml"),
+            clients
+                .iter()
+                .zip(addresses)
+                .enumerate()
+                .map(|(index, (key, address))| SeedDevice {
+                    name: format!("device-{index}"),
+                    public_key: key.public,
+                    address,
+                })
+                .collect(),
+            config.tun.address,
+            config.tun.prefix_len,
+        )
+        .unwrap();
+        let traffic = TrafficStore::open(directory.path().join("traffic.sqlite")).unwrap();
+        let sessions = Arc::new(RwLock::new(Sessions::default()));
+        let socket = UdpSocket::bind(config.listen).unwrap();
+        let peer = UdpSocket::bind(config.listen)
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut cache = HashMap::new();
+        let mut connect = |client: usize, session_id: u64| {
+            let mut handshake = ClientHandshake::new(
+                &clients[client].secret,
+                &config.server_public_key,
+                &config.context,
+            )
+            .unwrap();
+            let initial = handshake.write_initial(&[]).unwrap();
+            handle_handshake(
+                &socket,
+                peer,
+                Datagram::new(
+                    Header {
+                        kind: PacketKind::HandshakeInit,
+                        flags: 0,
+                        session_id,
+                        sequence: 0,
+                    },
+                    &initial,
+                ),
+                HandshakeServices {
+                    config: &config,
+                    authorized: &registry,
+                    traffic: &traffic,
+                    sessions: &sessions,
+                },
+                &WireMode::Legacy,
+                &mut cache,
+            );
+        };
+        connect(0, 11);
+        connect(1, 22);
+        let victim = Arc::clone(&sessions.read().unwrap().by_id[&11]);
+        let other = Arc::clone(&sessions.read().unwrap().by_id[&22]);
+        connect(1, 11);
+        {
+            let guard = sessions.read().unwrap();
+            assert!(Arc::ptr_eq(&guard.by_id[&11], &victim));
+            assert!(Arc::ptr_eq(&guard.by_id[&22], &other));
+            assert!(Arc::ptr_eq(&guard.by_address[&addresses[0]], &victim));
+            assert!(Arc::ptr_eq(&guard.by_address[&addresses[1]], &other));
+        }
+        // A normal reconnect still replaces only this device's previous session.
+        connect(1, 33);
+        let guard = sessions.read().unwrap();
+        assert!(!guard.by_id.contains_key(&22));
+        assert!(guard.by_id.contains_key(&33));
+        assert!(Arc::ptr_eq(&guard.by_id[&11], &victim));
+        assert_eq!(guard.by_id.len(), 2);
+        assert_eq!(guard.by_address.len(), 2);
     }
 }
 
@@ -1150,5 +1288,24 @@ mod admin_listener_tests {
             Some(WireMode::Legacy)
         ));
         assert_eq!(decoded, legacy);
+
+        // Rotating tags must keep working with cached keys, and revocation
+        // must remove both the routing tags and their cached secret material.
+        let codec = MorphCodec::new(MorphKey::from_bytes(key), Profile::Quiet);
+        let mut frame = Vec::new();
+        codec
+            .encode_payload(b"probe", Direction::ClientToServer, &mut frame)
+            .unwrap();
+        router.refresh(0, &config, &registry).unwrap();
+        assert!(router.resolve(&frame, &config, &registry).is_some());
+        registry
+            .provision("replacement", mousevpn_admin_api::DevicePlatform::Android)
+            .unwrap();
+        registry
+            .revoke(&mousevpn_config::encode_public_key(&client_public))
+            .unwrap();
+        router.refresh(0, &config, &registry).unwrap();
+        assert!(router.resolve(&frame, &config, &registry).is_none());
+        assert!(!router.keys.contains_key(&client_public));
     }
 }

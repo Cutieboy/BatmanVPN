@@ -1,0 +1,19 @@
+[Unit]
+Description=MouseVPN SOCKS5 proxy client (%i)
+Documentation=file:/usr/share/doc/mousevpn/docs/PROXY_CLIENT.md.bz2
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/mousevpn/%i.toml
+
+[Service]
+Type=simple
+# The listener is IPv4 loopback only and has no password; do not publish it.
+Environment=MOUSEVPN_PROXY_PORT=1080
+ExecStart=/usr/bin/mousevpn-proxy-client --config /etc/mousevpn/%i.toml --port ${MOUSEVPN_PROXY_PORT}
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=3s
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target
