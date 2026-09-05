@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
 use mousevpn_config::{ClientConfig, ClientProtocol, ValidatedClientConfig};
 use mousevpn_data_plane::{
     looks_like_protocol_datagram, Decoded, TunnelReceiver, TunnelSender, TUNNEL_OVERHEAD,
@@ -33,6 +34,7 @@ pub struct ReceiveBatch {
 struct Outbound {
     transport: UdpTransport,
     sender: TunnelSender,
+    inner: Vec<u8>,
     datagram: Vec<u8>,
 }
 
@@ -40,6 +42,7 @@ struct Inbound {
     transport: UdpTransport,
     receiver: TunnelReceiver,
     datagram: Vec<u8>,
+    inner: Vec<u8>,
     plaintext: Vec<u8>,
 }
 
@@ -48,6 +51,7 @@ pub struct AppleSession {
     outbound: Mutex<Outbound>,
     inbound: Mutex<Inbound>,
     interrupt: UdpTransport,
+    wire: ClientWire,
 }
 
 impl AppleSession {
@@ -61,7 +65,32 @@ impl AppleSession {
         server_public_key: String,
         client_private_key: String,
     ) -> Result<Self, AppleClientError> {
-        Self::connect_from(endpoint, server_public_key, client_private_key, None)
+        Self::connect_with_protocol(
+            endpoint,
+            server_public_key,
+            client_private_key,
+            ClientProtocol::Legacy,
+        )
+    }
+
+    /// Connects using the selected legacy or `MouseMorph` v2 wire profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid profile data, socket setup, timeout, or authentication failure.
+    pub fn connect_with_protocol(
+        endpoint: &str,
+        server_public_key: String,
+        client_private_key: String,
+        protocol: ClientProtocol,
+    ) -> Result<Self, AppleClientError> {
+        Self::connect_from_with_protocol(
+            endpoint,
+            server_public_key,
+            client_private_key,
+            None,
+            protocol,
+        )
     }
 
     /// Connects while binding the outer UDP socket to a specific local address.
@@ -78,6 +107,27 @@ impl AppleSession {
         client_private_key: String,
         local_address: Option<IpAddr>,
     ) -> Result<Self, AppleClientError> {
+        Self::connect_from_with_protocol(
+            endpoint,
+            server_public_key,
+            client_private_key,
+            local_address,
+            ClientProtocol::Legacy,
+        )
+    }
+
+    /// Connects from a selected local address using the requested wire profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid profile data, socket setup, timeout, or authentication failure.
+    pub fn connect_from_with_protocol(
+        endpoint: &str,
+        server_public_key: String,
+        client_private_key: String,
+        local_address: Option<IpAddr>,
+        protocol: ClientProtocol,
+    ) -> Result<Self, AppleClientError> {
         let addresses = endpoint
             .to_socket_addrs()
             .map_err(|error| AppleClientError::new(format!("invalid endpoint: {error}")))?;
@@ -90,7 +140,7 @@ impl AppleSession {
             server_public_key,
             client_private_key,
             tun_name: "utun".to_owned(),
-            protocol: ClientProtocol::Legacy,
+            protocol,
         }
         .validate()?;
         Self::connect_validated(&config, local_address)
@@ -100,7 +150,8 @@ impl AppleSession {
         config: &ValidatedClientConfig,
         local_address: Option<IpAddr>,
     ) -> Result<Self, AppleClientError> {
-        let (transport, plane, negotiated) = handshake::connect(config, local_address)?;
+        let wire = ClientWire::from_config(config)?;
+        let (transport, plane, negotiated) = handshake::connect(config, local_address, &wire)?;
         let outbound_transport = transport.try_clone()?;
         let interrupt_transport = transport.try_clone()?;
         let (sender, receiver) = plane.split();
@@ -111,15 +162,18 @@ impl AppleSession {
             outbound: Mutex::new(Outbound {
                 transport: outbound_transport,
                 sender,
+                inner: Vec::with_capacity(packet_capacity),
                 datagram: Vec::with_capacity(packet_capacity),
             }),
             inbound: Mutex::new(Inbound {
                 transport,
                 receiver,
-                datagram: vec![0_u8; packet_capacity],
+                datagram: vec![0_u8; MAX_WIRE_DATAGRAM_LEN],
+                inner: Vec::with_capacity(packet_capacity),
                 plaintext: Vec::with_capacity(packet_capacity),
             }),
             interrupt: interrupt_transport,
+            wire,
         })
     }
 
@@ -143,9 +197,11 @@ impl AppleSession {
             let Outbound {
                 transport,
                 sender,
+                inner,
                 datagram,
             } = &mut *outbound;
-            sender.encode_ip_into(packet, datagram)?;
+            sender.encode_ip_into(packet, inner)?;
+            self.wire.encode(inner, datagram)?;
             transport
                 .send(datagram)
                 .map_err(AppleClientError::from)
@@ -181,6 +237,7 @@ impl AppleSession {
                 transport,
                 receiver,
                 datagram,
+                inner,
                 plaintext,
             } = &mut *inbound;
             let length = match transport.receive(datagram) {
@@ -191,7 +248,10 @@ impl AppleSession {
                         .context("receiving encrypted UDP packet failed"));
                 }
             };
-            let input = &datagram[..length];
+            let Ok(true) = self.wire.decode(&datagram[..length], inner) else {
+                continue;
+            };
+            let input = inner.as_slice();
             if !looks_like_protocol_datagram(input) {
                 continue;
             }
@@ -229,9 +289,11 @@ impl AppleSession {
         let Outbound {
             transport,
             sender,
+            inner,
             datagram,
         } = &mut *outbound;
-        sender.encode_keepalive_into(datagram)?;
+        sender.encode_keepalive_into(inner)?;
+        self.wire.encode(inner, datagram)?;
         transport
             .send(datagram)
             .map_err(AppleClientError::from)

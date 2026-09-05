@@ -65,7 +65,11 @@ final class VPNController: ObservableObject {
         try profile.validate()
         let helper = try helperPaths().helper
         let input = try JSONEncoder().encode(
-            HelperProfile(token: profile.token, password: profile.password)
+            HelperProfile(
+                token: profile.token,
+                password: profile.password,
+                mouseVPNProtocol: profile.mouseVPNProtocol
+            )
         )
         return try await Task.detached {
             let process = Process()
@@ -107,7 +111,11 @@ final class VPNController: ObservableObject {
             if FileManager.default.fileExists(atPath: paths.stopFile.path) {
                 try FileManager.default.removeItem(at: paths.stopFile)
             }
-            let config = HelperProfile(token: profile.token, password: profile.password)
+            let config = HelperProfile(
+                token: profile.token,
+                password: profile.password,
+                mouseVPNProtocol: profile.mouseVPNProtocol
+            )
             let encoded = try JSONEncoder().encode(config)
             try encoded.write(to: paths.profile, options: .atomic)
             try FileManager.default.setAttributes(
@@ -349,6 +357,12 @@ final class VPNController: ObservableObject {
 private struct HelperProfile: Codable {
     let token: String
     let password: String
+    let mouseVPNProtocol: MouseVPNProtocol
+
+    private enum CodingKeys: String, CodingKey {
+        case token, password
+        case mouseVPNProtocol = "protocol"
+    }
 }
 
 struct ProfileMetadata: Codable {

@@ -6,6 +6,38 @@ struct StoredVPNProfile: Codable, Equatable, Identifiable {
     var name: String
     var endpoint: String
     var token: String
+    var mouseVPNProtocol: MouseVPNProtocol
+
+    init(
+        id: String,
+        name: String,
+        endpoint: String,
+        token: String,
+        mouseVPNProtocol: MouseVPNProtocol = .legacy
+    ) {
+        self.id = id
+        self.name = name
+        self.endpoint = endpoint
+        self.token = token
+        self.mouseVPNProtocol = mouseVPNProtocol
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, endpoint, token
+        case mouseVPNProtocol = "protocol"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        endpoint = try values.decode(String.self, forKey: .endpoint)
+        token = try values.decode(String.self, forKey: .token)
+        mouseVPNProtocol = try values.decodeIfPresent(
+            MouseVPNProtocol.self,
+            forKey: .mouseVPNProtocol
+        ) ?? .legacy
+    }
 }
 
 @MainActor
@@ -39,7 +71,9 @@ final class ProfileStore: ObservableObject {
             id: metadata.id,
             name: metadata.name,
             endpoint: metadata.endpoint,
-            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+            mouseVPNProtocol: profiles.first(where: { $0.id == metadata.id })?
+                .mouseVPNProtocol ?? .legacy
         )
         try ProfilePasswordKeychain.store(password, profileID: stored.id)
         if let index = profiles.firstIndex(where: { $0.id == stored.id }) {
@@ -54,6 +88,12 @@ final class ProfileStore: ObservableObject {
 
     func password(for profile: StoredVPNProfile) throws -> String {
         try ProfilePasswordKeychain.load(profileID: profile.id)
+    }
+
+    func setProtocol(_ mouseVPNProtocol: MouseVPNProtocol, for id: String) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        profiles[index].mouseVPNProtocol = mouseVPNProtocol
+        try persist()
     }
 
     func deleteSelected() throws {

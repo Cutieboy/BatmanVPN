@@ -25,6 +25,8 @@ use std::{
 #[cfg(target_os = "macos")]
 use mousevpn_apple::AppleSession;
 #[cfg(target_os = "macos")]
+use mousevpn_config::ClientProtocol;
+#[cfg(target_os = "macos")]
 use mousevpn_profile_cli::decrypt_profile;
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,8 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(16);
 struct HelperProfile {
     token: String,
     password: String,
+    #[serde(default)]
+    protocol: ClientProtocol,
 }
 
 #[cfg(target_os = "macos")]
@@ -67,6 +71,7 @@ struct ResolvedProfile {
     endpoint: String,
     server_public_key: String,
     client_private_key: String,
+    protocol: ClientProtocol,
 }
 
 #[cfg(target_os = "macos")]
@@ -196,6 +201,7 @@ fn decode_profile(bytes: &[u8]) -> Result<ResolvedProfile, io::Error> {
         endpoint,
         server_public_key,
         client_private_key,
+        protocol: wrapper.protocol,
     })
 }
 
@@ -205,6 +211,7 @@ fn run_tunnel(
     state: &StateWriter,
     stop_file: &Path,
 ) -> Result<(), io::Error> {
+    eprintln!("MOUSEVPN_PROTOCOL={}", protocol_name(profile.protocol));
     state.write(
         "connecting",
         &format!("Подключение профиля {}", profile.name),
@@ -213,11 +220,12 @@ fn run_tunnel(
     let physical_address = primary_ipv4()?;
     eprintln!("MOUSEVPN_OUTER_ADDRESS={physical_address}");
     let session = Arc::new(
-        AppleSession::connect_from(
+        AppleSession::connect_from_with_protocol(
             &profile.endpoint,
             profile.server_public_key.clone(),
             profile.client_private_key.clone(),
             Some(physical_address.into()),
+            profile.protocol,
         )
         .map_err(io::Error::other)?,
     );
@@ -282,6 +290,16 @@ fn run_tunnel(
         stop_file,
     }
     .run()
+}
+
+#[cfg(target_os = "macos")]
+const fn protocol_name(protocol: ClientProtocol) -> &'static str {
+    match protocol {
+        ClientProtocol::Legacy => "legacy",
+        ClientProtocol::MorphQuiet => "morph_quiet",
+        ClientProtocol::MorphBalanced => "morph_balanced",
+        ClientProtocol::MorphParanoid => "morph_paranoid",
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -461,11 +479,12 @@ fn reconnect(
             network.refresh_server_route(server_ip)?;
             let physical_address = primary_ipv4()?;
             let replacement = Arc::new(
-                AppleSession::connect_from(
+                AppleSession::connect_from_with_protocol(
                     &profile.endpoint,
                     profile.server_public_key.clone(),
                     profile.client_private_key.clone(),
                     Some(physical_address.into()),
+                    profile.protocol,
                 )
                 .map_err(io::Error::other)?,
             );
@@ -572,6 +591,7 @@ impl Drop for PidFileGuard {
 mod tests {
     use std::{fs, time::SystemTime};
 
+    use mousevpn_config::ClientProtocol;
     use mousevpn_profile_cli::{encrypt_profile, PortableProfile};
     use serde_json::json;
 
@@ -607,7 +627,23 @@ mod tests {
         assert_eq!(resolved.endpoint, "198.51.100.9:51820");
         assert_eq!(resolved.server_public_key, "server-key");
         assert_eq!(resolved.client_private_key, "client-key");
+        assert_eq!(resolved.protocol, ClientProtocol::Legacy);
         assert!(!path.exists());
+
+        let morph_path = directory.join("morph-profile.json");
+        fs::write(
+            &morph_path,
+            serde_json::to_vec(&json!({
+                "token": token,
+                "password": "correct horse",
+                "protocol": "morph_balanced"
+            }))
+            .expect("serialize Morph wrapper"),
+        )
+        .expect("write Morph wrapper");
+        let resolved = load_profile(&morph_path).expect("decrypt Morph wrapper");
+        assert_eq!(resolved.protocol, ClientProtocol::MorphBalanced);
+        assert!(!morph_path.exists());
         fs::remove_dir(directory).expect("remove test directory");
     }
 }

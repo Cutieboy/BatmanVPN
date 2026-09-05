@@ -71,7 +71,11 @@ struct MenuBarView: View {
         }
         do {
             let password = try profiles.password(for: selected)
-            let profile = VPNProfile(token: selected.token, password: password)
+            let profile = VPNProfile(
+                token: selected.token,
+                password: password,
+                mouseVPNProtocol: selected.mouseVPNProtocol
+            )
             Task { _ = await vpn.installAndConnect(profile) }
         } catch {
             vpn.presentError(error)

@@ -8,9 +8,10 @@ interface, routing and DNS configuration.
 This is an early implementation and has not received an independent security
 audit. It currently imports the same encrypted `MV1.…` profile as Android,
 supports full IPv4 routing, DNS replacement, IPv6 bypass blocking, background
-operation, multiple profiles, automatic session reconnect and safe route/DNS
-rollback on normal termination. Immediate sleep/network-change handling and a
-production installer are still pending.
+operation, multiple profiles, MouseMorph v2 (Quiet, Balanced and Paranoid),
+automatic session reconnect and safe route/DNS rollback on normal termination.
+Immediate sleep/network-change handling and a production installer are still
+pending.
 
 The old `PacketTunnel` sources remain in the repository so the same packet
 engine can be returned to `NEPacketTunnelProvider` if an eligible Apple
@@ -57,6 +58,9 @@ and reopens the main window. Closing the window keeps the tunnel running, while
 **Завершить MouseVPN** or Command-Q closes the GUI normally; its termination
 callback writes a stop request so the helper restores routes and DNS in the
 background.
+
+The protocol selector is stored per imported profile. Existing profiles remain
+on `Legacy` until changed; the selector is locked while a connection is active.
 
 Runtime files are stored in `~/Library/Application Support/MouseVPN/`:
 

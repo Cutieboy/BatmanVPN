@@ -1,9 +1,11 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    thread,
     time::{Duration, Instant},
 };
 
+use mousevpn_client_wire::ClientWire;
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_crypto::ClientHandshake;
 use mousevpn_data_plane::TunnelDataPlane;
@@ -19,6 +21,7 @@ const DATAGRAM_BUFFER_LEN: usize = 65_535;
 pub(crate) fn connect(
     config: &ValidatedClientConfig,
     local_address: Option<IpAddr>,
+    wire: &ClientWire,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters), AppleClientError> {
     let local = match (config.server, local_address) {
         (SocketAddr::V4(_), Some(IpAddr::V4(address))) => SocketAddr::from((address, 0)),
@@ -34,13 +37,14 @@ pub(crate) fn connect(
     let mut transport = UdpTransport::bind(local, config.server)
         .map_err(AppleClientError::from)
         .map_err(|error| error.context("UDP connection failed"))?;
-    let (plane, parameters) = negotiate(&mut transport, config)?;
+    let (plane, parameters) = negotiate(&mut transport, config, wire)?;
     Ok((transport, plane, parameters))
 }
 
 fn negotiate(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
+    wire: &ClientWire,
 ) -> Result<(TunnelDataPlane, SessionParameters), AppleClientError> {
     let session_id = random_session_id()?;
     let mut handshake = ClientHandshake::new(
@@ -62,9 +66,12 @@ fn negotiate(
 
     let started = Instant::now();
     let deadline = started + HANDSHAKE_TIMEOUT;
-    send_request(transport, &request)?;
+    send_prelude(transport, wire)?;
+    let mut encoded_request = Vec::new();
+    send_request(transport, wire, &request, &mut encoded_request)?;
     let mut next_retransmit = started + HANDSHAKE_RETRANSMIT;
     let mut buffer = vec![0_u8; DATAGRAM_BUFFER_LEN];
+    let mut decoded = Vec::with_capacity(DATAGRAM_BUFFER_LEN);
 
     loop {
         let now = Instant::now();
@@ -72,7 +79,7 @@ fn negotiate(
             return Err(AppleClientError::new("handshake timed out"));
         }
         if now >= next_retransmit {
-            send_request(transport, &request)?;
+            send_request(transport, wire, &request, &mut encoded_request)?;
             next_retransmit = now + HANDSHAKE_RETRANSMIT;
         }
 
@@ -83,7 +90,10 @@ fn negotiate(
             Err(error) if is_retryable(&error) => continue,
             Err(error) => return Err(error.into()),
         };
-        let Ok(response) = Datagram::decode(&buffer[..length]) else {
+        let Ok(true) = wire.decode(&buffer[..length], &mut decoded) else {
+            continue;
+        };
+        let Ok(response) = Datagram::decode(&decoded) else {
             continue;
         };
         if response.header.kind != PacketKind::HandshakeResponse
@@ -100,12 +110,31 @@ fn negotiate(
     }
 }
 
-fn send_request(transport: &mut UdpTransport, request: &[u8]) -> Result<(), AppleClientError> {
-    match transport.send(request) {
+fn send_request(
+    transport: &mut UdpTransport,
+    wire: &ClientWire,
+    request: &[u8],
+    encoded: &mut Vec<u8>,
+) -> Result<(), AppleClientError> {
+    wire.encode(request, encoded)?;
+    match transport.send(encoded) {
         Ok(()) => Ok(()),
         Err(error) if is_retryable(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn send_prelude(transport: &mut UdpTransport, wire: &ClientWire) -> Result<(), AppleClientError> {
+    let mut cover = Vec::new();
+    for _ in 0..wire.cover_count()? {
+        wire.encode_cover(&mut cover)?;
+        transport.send(&cover)?;
+        let jitter = wire.handshake_jitter_ms()?;
+        if jitter != 0 {
+            thread::sleep(Duration::from_millis(jitter));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn is_retryable(error: &io::Error) -> bool {

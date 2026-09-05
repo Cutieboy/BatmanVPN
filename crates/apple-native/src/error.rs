@@ -39,6 +39,12 @@ impl From<mousevpn_config::ConfigError> for AppleClientError {
     }
 }
 
+impl From<mousevpn_client_wire::ClientWireError> for AppleClientError {
+    fn from(error: mousevpn_client_wire::ClientWireError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl From<mousevpn_crypto::CryptoError> for AppleClientError {
     fn from(error: mousevpn_crypto::CryptoError) -> Self {
         Self::new(error.to_string())

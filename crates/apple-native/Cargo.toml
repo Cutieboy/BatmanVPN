@@ -12,6 +12,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 getrandom = "0.3"
 mousevpn-config = { path = "../config" }
+mousevpn-client-wire = { path = "../client-wire" }
 mousevpn-crypto = { path = "../crypto" }
 mousevpn-data-plane = { path = "../data-plane" }
 mousevpn-protocol = { path = "../protocol" }

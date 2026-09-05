@@ -1,7 +1,7 @@
 # MouseMorph v2
 
-Status: experimental protocol draft implemented by the Linux, Android and
-Windows clients.
+Status: experimental protocol draft implemented by the Linux, Android, Windows
+and macOS clients.
 
 MouseMorph is an authenticated outer envelope for MouseVPN UDP datagrams. Its
 goal is to remove stable, deployment-independent markers from the wire without
@@ -220,7 +220,7 @@ must not be mistaken for roaming. Later capability changes such as `VALIDATED`
 toggling on the same `Network` update diagnostics and Android's underlying
 network hint, but only a different `Network` identity replaces the UDP socket.
 
-All three GUIs persist the selected value in each stored profile. Profiles that
+All four GUIs persist the selected value in each stored profile. Profiles that
 predate MouseMorph deserialize without the field and remain `legacy`; changing
 the mode is disabled while that profile is connecting or connected.
 

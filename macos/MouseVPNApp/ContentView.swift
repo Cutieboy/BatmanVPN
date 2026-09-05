@@ -148,6 +148,18 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                     }
+
+                    Picker("Протокол", selection: protocolBinding(for: profile)) {
+                        ForEach(MouseVPNProtocol.allCases) { mouseVPNProtocol in
+                            Text(mouseVPNProtocol.title).tag(mouseVPNProtocol)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(vpn.isConnected || vpn.isConnecting)
+
+                    Text(profile.mouseVPNProtocol.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Button {
@@ -214,11 +226,31 @@ struct ContentView: View {
         guard let selected = profiles.selectedProfile else { return }
         do {
             let password = try profiles.password(for: selected)
-            let profile = VPNProfile(token: selected.token, password: password)
+            let profile = VPNProfile(
+                token: selected.token,
+                password: password,
+                mouseVPNProtocol: selected.mouseVPNProtocol
+            )
             Task { _ = await vpn.installAndConnect(profile) }
         } catch {
             localError = error.localizedDescription
         }
+    }
+
+    private func protocolBinding(for profile: StoredVPNProfile) -> Binding<MouseVPNProtocol> {
+        Binding(
+            get: {
+                profiles.profiles.first(where: { $0.id == profile.id })?
+                    .mouseVPNProtocol ?? .legacy
+            },
+            set: { mouseVPNProtocol in
+                do {
+                    try profiles.setProtocol(mouseVPNProtocol, for: profile.id)
+                } catch {
+                    localError = error.localizedDescription
+                }
+            }
+        )
     }
 }
 
