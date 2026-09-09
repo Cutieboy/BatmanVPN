@@ -79,6 +79,16 @@ any Docker host, run:
 ./linux-gui/build-ubuntu22.sh
 ```
 
+If the host VPN prevents Docker bridge networking from reaching package
+repositories, the build can use the host network without changing VPN rules:
+
+```sh
+MOUSEVPN_BUILD_NETWORK=host MOUSEVPN_RUN_NETWORK=host ./linux-gui/build-ubuntu22.sh
+```
+
+The container's Cargo build defaults to four jobs; override `CARGO_BUILD_JOBS`
+to adjust memory use. Artifact names follow the version in `tauri.conf.json`.
+
 The artifacts are written to `linux-gui/dist`. The build deliberately leaves
 Wayland client libraries out of the AppImage: they must match the host's EGL
 graphics driver. Bundling the Ubuntu copies can make WebKit abort with

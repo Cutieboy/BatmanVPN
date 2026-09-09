@@ -7,6 +7,23 @@ Minimal Android client built around `VpnService` and the shared Rust protocol.
 Requirements are pinned in the project: JDK 17, Android API 36, Android Gradle
 Plugin 8.10.1, Gradle 8.11.1 and NDK 27.0.12077973.
 
+Android Studio and an emulator are not required. With JDK 17 and Android
+command-line tools on `PATH`, install only the build components and Rust targets:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+sdkmanager --sdk_root="$ANDROID_HOME" \
+  "platforms;android-36" "build-tools;35.0.0" "ndk;27.0.12077973" "platform-tools"
+rustup toolchain install 1.97.1 --profile minimal
+rustup target add --toolchain 1.97.1 aarch64-linux-android x86_64-linux-android
+cargo +1.97.1 install cargo-ndk --version 4.1.2 --locked
+```
+
+The September 2026 build uses command-line tools 19.0 and the Gradle wrapper;
+no separate Gradle installation is needed. The build defaults to
+`$HOME/.cargo/bin/cargo`; set `CARGO` if Rust is installed elsewhere.
+
 ```sh
 export ANDROID_HOME="$HOME/Android/Sdk"
 ./gradlew assembleDebug
@@ -19,7 +36,7 @@ and `x86_64`. The debug APK is written to
 For an installable internal release build:
 
 ```sh
-./gradlew assembleRelease lintRelease
+./gradlew assembleRelease testReleaseUnitTest lintRelease
 ```
 
 The APK is written to `app/build/outputs/apk/release/app-release.apk`. Internal

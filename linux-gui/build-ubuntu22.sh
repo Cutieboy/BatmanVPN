@@ -5,13 +5,17 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/.." && pwd)"
 image_name="mousevpn-tauri-ubuntu22"
 target_volume="mousevpn-ubuntu22-target"
+build_network="${MOUSEVPN_BUILD_NETWORK:-default}"
+run_network="${MOUSEVPN_RUN_NETWORK:-bridge}"
 
-docker build -t "$image_name" -f "$script_dir/Dockerfile.ubuntu22" "$repo_dir"
+docker build --network "$build_network" -t "$image_name" -f "$script_dir/Dockerfile.ubuntu22" "$repo_dir"
 docker volume create "$target_volume" >/dev/null
 
 docker run --rm \
+  --network "$run_network" \
   -e APPIMAGE_EXTRACT_AND_RUN=1 \
   -e CARGO_TARGET_DIR=/build/target \
+  -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
   -v "$repo_dir:/workspace" \
   -v "$target_volume:/build/target" \
   "$image_name" bash -lc '
@@ -24,8 +28,10 @@ docker run --rm \
     cargo build --release --bin mousevpn-helper
     cargo tauri build --bundles deb,appimage
 
+    version="$(sed -n '\''s/^[[:space:]]*"version": "\([^"]*\)",/\1/p'\'' tauri.conf.json)"
+    test -n "$version"
     appdir=/build/target/release/bundle/appimage/MouseVPN.AppDir
-    output=/build/target/release/bundle/appimage/MouseVPN_0.1.9_amd64.AppImage
+    output="/build/target/release/bundle/appimage/MouseVPN_${version}_amd64.AppImage"
     tool=/build/target/.tools/appimagetool-modern-x86_64.AppImage
 
     # libEGL is supplied by the host graphics driver. Bundling Ubuntu libwayland
@@ -51,11 +57,11 @@ docker run --rm \
     ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$tool" "$appdir" "$output"
 
     install -m 0755 "$output" \
-      /workspace/linux-gui/dist/MouseVPN_0.1.9_ubuntu22_amd64.AppImage
+      "/workspace/linux-gui/dist/MouseVPN_${version}_ubuntu22_amd64.AppImage"
     install -m 0644 \
-      /build/target/release/bundle/deb/MouseVPN_0.1.9_amd64.deb \
-      /workspace/linux-gui/dist/MouseVPN_0.1.9_ubuntu22_amd64.deb
+      "/build/target/release/bundle/deb/MouseVPN_${version}_amd64.deb" \
+      "/workspace/linux-gui/dist/MouseVPN_${version}_ubuntu22_amd64.deb"
     chown "$(stat -c %u /workspace):$(stat -c %g /workspace)" \
-      /workspace/linux-gui/dist/MouseVPN_0.1.9_ubuntu22_amd64.AppImage \
-      /workspace/linux-gui/dist/MouseVPN_0.1.9_ubuntu22_amd64.deb
+      "/workspace/linux-gui/dist/MouseVPN_${version}_ubuntu22_amd64.AppImage" \
+      "/workspace/linux-gui/dist/MouseVPN_${version}_ubuntu22_amd64.deb"
   '

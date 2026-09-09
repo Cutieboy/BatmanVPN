@@ -1,0 +1,30 @@
+pkgname=mousevpn
+pkgver=0.1.10
+pkgrel=1
+pkgdesc='MouseVPN desktop client for Linux'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Zumka1991/MouseVPN'
+license=('Apache-2.0 OR MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'glibc' 'gcc-libs' 'openssl'
+         'iproute2' 'nftables' 'systemd' 'polkit')
+makedepends=('rust' 'pkgconf')
+options=('!lto' '!debug')
+source=("mousevpn-${pkgver}.tar.gz" 'mousevpn.desktop')
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+    cd "$srcdir/mousevpn-$pkgver"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked --package mousevpn-linux-gui --bin mousevpn-linux-gui
+}
+
+package() {
+    install -Dm755 "$srcdir/target/release/mousevpn-linux-gui" \
+        "$pkgdir/usr/bin/mousevpn-linux-gui"
+    install -Dm644 "$srcdir/mousevpn.desktop" \
+        "$pkgdir/usr/share/applications/mousevpn.desktop"
+    install -Dm644 "$srcdir/mousevpn-$pkgver/linux-gui/src-tauri/icons/icon.png" \
+        "$pkgdir/usr/share/icons/hicolor/512x512/apps/mousevpn.png"
+    install -Dm644 "$srcdir/mousevpn-$pkgver/linux-gui/README.md" \
+        "$pkgdir/usr/share/doc/mousevpn/README.md"
+}

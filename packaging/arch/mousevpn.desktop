@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=MouseVPN
+GenericName=VPN client
+GenericName[ru]=VPN-клиент
+Comment=Connect to MouseVPN
+Comment[ru]=Подключение к MouseVPN
+Exec=mousevpn-linux-gui
+TryExec=mousevpn-linux-gui
+Icon=mousevpn
+Terminal=false
+Categories=Network;Security;
+StartupWMClass=MouseVPN
+Keywords=VPN;tunnel;privacy;

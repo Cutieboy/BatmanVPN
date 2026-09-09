@@ -226,6 +226,10 @@ the mode is disabled while that profile is connecting or connected.
 
 ## Implementation boundary
 
+The compatible September 2026 implementation update reduces envelope CPU cost
+and expands the shared authenticated receive window without changing this wire
+format. See [measurements and compatibility checks](PROTOCOL_PERFORMANCE_2026-09-10.md).
+
 The reusable `mousevpn-morph` crate owns:
 
 - profiles and padding policy;

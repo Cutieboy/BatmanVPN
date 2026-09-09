@@ -1,3 +1,5 @@
+// Frozen pre-optimization codec from ffb264a49dd9643ec44432c617b612aedfd0cf96.
+// Kept independent to exercise old/new wire interoperability in both directions.
 #![doc = "Authenticated polymorphic UDP envelope for `MouseVPN`."]
 
 use std::{error::Error, fmt, time::SystemTime};
@@ -22,9 +24,6 @@ pub const MAX_DATAGRAM_LEN: usize = 1_472;
 pub const SAFE_TUN_MTU: u16 = 1_280;
 
 const MAX_RANDOM_PADDING: usize = 31;
-// Nonce, padding-length choice and padding contents use disjoint CSPRNG bytes.
-// One OS request per frame avoids up to three requests on the packet path.
-const FRAME_RANDOM_LEN: usize = NONCE_LEN + 2 + MAX_RANDOM_PADDING;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -86,6 +85,17 @@ impl Profile {
             3 => Ok(Self::Paranoid),
             _ => Err(MorphError::InvalidProfile(value)),
         }
+    }
+
+    fn target_len(minimum: usize) -> Result<usize, MorphError> {
+        if minimum > MAX_DATAGRAM_LEN {
+            return Err(MorphError::FrameTooLarge {
+                actual: minimum,
+                maximum: MAX_DATAGRAM_LEN,
+            });
+        }
+        let extra = random_inclusive(0, MAX_RANDOM_PADDING)?;
+        Ok(minimum.saturating_add(extra).min(MAX_DATAGRAM_LEN))
     }
 }
 
@@ -231,26 +241,17 @@ fn encode_frame(
         maximum: u16::MAX as usize,
     })?;
     let minimum = MIN_FRAME_LEN + inner.len();
-    if minimum > MAX_DATAGRAM_LEN {
-        return Err(MorphError::FrameTooLarge {
-            actual: minimum,
-            maximum: MAX_DATAGRAM_LEN,
-        });
-    }
+    let target = Profile::target_len(minimum)?;
+    let padding_len = target - minimum;
     let epoch = current_epoch(profile)?;
     let route = routing_tag_at(key, profile, direction, epoch);
-    let mut random = [0_u8; FRAME_RANDOM_LEN];
-    getrandom::fill(&mut random).map_err(|error| MorphError::Random(error.to_string()))?;
-    let nonce = &random[..NONCE_LEN];
-    let choice = u16::from_be_bytes([random[NONCE_LEN], random[NONCE_LEN + 1]]);
-    let padding_len =
-        (usize::from(choice) % (MAX_RANDOM_PADDING + 1)).min(MAX_DATAGRAM_LEN - minimum);
-    let target = minimum + padding_len;
+    let mut nonce = [0_u8; NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|error| MorphError::Random(error.to_string()))?;
 
     output.clear();
     output.reserve(target);
     output.extend_from_slice(&route);
-    output.extend_from_slice(nonce);
+    output.extend_from_slice(&nonce);
     output.extend_from_slice(&[
         FORMAT_VERSION,
         kind as u8,
@@ -260,13 +261,18 @@ fn encode_frame(
         inner_len.to_be_bytes()[1],
     ]);
     output.extend_from_slice(inner);
-    output.extend_from_slice(&random[NONCE_LEN + 2..NONCE_LEN + 2 + padding_len]);
+    let padding_start = output.len();
+    output.resize(padding_start + padding_len, 0);
+    if padding_len != 0 {
+        getrandom::fill(&mut output[padding_start..])
+            .map_err(|error| MorphError::Random(error.to_string()))?;
+    }
 
     let cipher = ChaCha20Poly1305::new_from_slice(&key.0).map_err(|_| MorphError::CipherInit)?;
     let aad = associated_data(route, direction);
     let authentication = cipher
         .encrypt_in_place_detached(
-            Nonce::from_slice(nonce),
+            Nonce::from_slice(&nonce),
             &aad,
             &mut output[CLEAR_PREFIX_LEN..],
         )
@@ -299,7 +305,10 @@ fn decode_frame(
         .try_into()
         .map_err(|_| MorphError::InvalidFrame)?;
     let epoch = current_epoch(expected_profile)?;
-    if !matches_routing_tag(key, expected_profile, direction, epoch, route) {
+    if !accepted_epochs(epoch)
+        .into_iter()
+        .any(|candidate| routing_tag_at(key, expected_profile, direction, candidate) == route)
+    {
         return Err(MorphError::UnknownRoutingTag);
     }
     let nonce: [u8; NONCE_LEN] = input[ROUTING_TAG_LEN..CLEAR_PREFIX_LEN]
@@ -341,20 +350,6 @@ fn decode_frame(
         }
         _ => Err(MorphError::InvalidFrame),
     }
-}
-
-fn matches_routing_tag(
-    key: &MorphKey,
-    profile: Profile,
-    direction: Direction,
-    epoch: u64,
-    route: [u8; ROUTING_TAG_LEN],
-) -> bool {
-    // Most peers are in the same epoch. Keep exactly the old acceptance window,
-    // but avoid computing the previous epoch's HMAC for every ordinary packet.
-    [epoch, epoch.saturating_sub(1), epoch.saturating_add(1)]
-        .into_iter()
-        .any(|candidate| routing_tag_at(key, profile, direction, candidate) == route)
 }
 
 #[must_use]
@@ -463,130 +458,3 @@ impl fmt::Display for MorphError {
 }
 
 impl Error for MorphError {}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        accepted_epochs, routing_tag_at, DecodedFrame, Direction, MorphCodec, MorphKey, Profile,
-        MAX_DATAGRAM_LEN,
-    };
-
-    fn codec(profile: Profile) -> MorphCodec {
-        MorphCodec::new(MorphKey::from_bytes([7_u8; 32]), profile)
-    }
-
-    #[test]
-    fn every_profile_round_trips_payloads() {
-        for profile in [Profile::Quiet, Profile::Balanced, Profile::Paranoid] {
-            let codec = codec(profile);
-            let mut encoded = Vec::new();
-            codec
-                .encode_payload(b"legacy datagram", Direction::ClientToServer, &mut encoded)
-                .expect("encode");
-            assert!(encoded.len() <= MAX_DATAGRAM_LEN);
-            assert_ne!(&encoded[..], b"legacy datagram");
-            let mut decoded = Vec::new();
-            assert_eq!(
-                codec
-                    .decode(&encoded, Direction::ClientToServer, &mut decoded)
-                    .expect("decode"),
-                DecodedFrame::Payload { profile }
-            );
-            assert_eq!(decoded, b"legacy datagram");
-        }
-    }
-
-    #[test]
-    fn cover_frames_are_authenticated_and_empty() {
-        let codec = codec(Profile::Paranoid);
-        let mut encoded = Vec::new();
-        codec
-            .encode_cover(Direction::ClientToServer, &mut encoded)
-            .expect("encode cover");
-        let mut decoded = Vec::new();
-        assert_eq!(
-            codec
-                .decode(&encoded, Direction::ClientToServer, &mut decoded)
-                .expect("decode cover"),
-            DecodedFrame::Cover {
-                profile: Profile::Paranoid
-            }
-        );
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn tampering_and_wrong_direction_are_rejected() {
-        let codec = codec(Profile::Balanced);
-        let mut encoded = Vec::new();
-        codec
-            .encode_payload(b"secret", Direction::ClientToServer, &mut encoded)
-            .expect("encode");
-        let last = encoded.len() - 1;
-        encoded[last] ^= 1;
-        assert!(codec
-            .decode(&encoded, Direction::ClientToServer, &mut Vec::new())
-            .is_err());
-
-        let mut valid = Vec::new();
-        codec
-            .encode_payload(b"secret", Direction::ClientToServer, &mut valid)
-            .expect("encode");
-        assert!(codec
-            .decode(&valid, Direction::ServerToClient, &mut Vec::new())
-            .is_err());
-    }
-
-    #[test]
-    fn routing_tags_change_by_epoch_and_direction() {
-        let key = MorphKey::from_bytes([11_u8; 32]);
-        assert_ne!(
-            routing_tag_at(&key, Profile::Quiet, Direction::ClientToServer, 10),
-            routing_tag_at(&key, Profile::Quiet, Direction::ClientToServer, 11)
-        );
-        assert_ne!(
-            routing_tag_at(&key, Profile::Quiet, Direction::ClientToServer, 10),
-            routing_tag_at(&key, Profile::Quiet, Direction::ServerToClient, 10)
-        );
-        assert_ne!(
-            routing_tag_at(&key, Profile::Quiet, Direction::ClientToServer, 10),
-            routing_tag_at(&key, Profile::Paranoid, Direction::ClientToServer, 10)
-        );
-        assert_eq!(accepted_epochs(10), [9, 10, 11]);
-    }
-
-    #[test]
-    fn route_fast_path_preserves_clock_skew_and_direction_checks() {
-        let key = MorphKey::from_bytes([11; 32]);
-        for profile in [Profile::Quiet, Profile::Balanced, Profile::Paranoid] {
-            for direction in [Direction::ClientToServer, Direction::ServerToClient] {
-                for epoch in [0, 1, 100, u64::MAX - 1, u64::MAX] {
-                    for candidate in [
-                        epoch.saturating_sub(2),
-                        epoch.saturating_sub(1),
-                        epoch,
-                        epoch.saturating_add(1),
-                        epoch.saturating_add(2),
-                    ] {
-                        let tag = routing_tag_at(&key, profile, direction, candidate);
-                        assert_eq!(
-                            super::matches_routing_tag(&key, profile, direction, epoch, tag),
-                            accepted_epochs(epoch).contains(&candidate),
-                        );
-                        let other_direction = match direction {
-                            Direction::ClientToServer => Direction::ServerToClient,
-                            Direction::ServerToClient => Direction::ClientToServer,
-                        };
-                        assert!(!super::matches_routing_tag(
-                            &key,
-                            profile,
-                            other_direction,
-                            epoch,
-                            tag,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-}

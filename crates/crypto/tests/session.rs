@@ -114,3 +114,32 @@ fn rejects_packets_older_than_window() {
         Err(CryptoError::Replay(ReplayError::TooOld))
     ));
 }
+
+#[test]
+fn burst_reordering_survives_and_forged_jumps_do_not_erase_replay_history() {
+    let (client, server) = establish();
+    let (send, _) = client.split();
+    let (_, mut receive) = server.split();
+    let mut earlier = vec![0; 128];
+    let length = send.encrypt_into(1, b"delayed", &mut earlier).unwrap();
+    earlier.truncate(length);
+    let mut later = vec![0; 128];
+    let length = send.encrypt_into(4_096, b"burst", &mut later).unwrap();
+    later.truncate(length);
+    let mut plaintext = vec![0; 128];
+    receive.decrypt_into(4_096, &later, &mut plaintext).unwrap();
+    // Changing an unauthenticated sequence must not clear any replay bits.
+    assert!(receive
+        .decrypt_into(1_000_000, &later, &mut plaintext)
+        .is_err());
+    let len = receive.decrypt_into(1, &earlier, &mut plaintext).unwrap();
+    assert_eq!(&plaintext[..len], b"delayed");
+    assert!(matches!(
+        receive.decrypt_into(4_096, &later, &mut plaintext),
+        Err(CryptoError::Replay(ReplayError::Duplicate)),
+    ));
+    assert!(matches!(
+        receive.decrypt_into(1, &earlier, &mut plaintext),
+        Err(CryptoError::Replay(ReplayError::Duplicate)),
+    ));
+}
