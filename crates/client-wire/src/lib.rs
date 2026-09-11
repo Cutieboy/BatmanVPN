@@ -1,10 +1,11 @@
-#![doc = "Shared client-side legacy/MouseMorph wire adapter."]
+#![doc = "Shared client-side Legacy, `MouseMorph` and Speedy wire adapter."]
 
 use std::{error::Error, fmt};
 
 use mousevpn_config::ValidatedClientConfig;
-use mousevpn_crypto::{derive_morph_key, CryptoError};
+use mousevpn_crypto::{derive_morph_key, derive_speedy_key, CryptoError};
 use mousevpn_morph::{DecodedFrame, Direction, MorphCodec, MorphError, MorphKey, Profile};
+use mousevpn_speedy::{Direction as SpeedyDirection, SpeedyCodec, SpeedyError, SpeedyKey};
 
 pub const MAX_WIRE_DATAGRAM_LEN: usize = mousevpn_morph::MAX_DATAGRAM_LEN;
 
@@ -12,6 +13,7 @@ pub const MAX_WIRE_DATAGRAM_LEN: usize = mousevpn_morph::MAX_DATAGRAM_LEN;
 pub enum ClientWire {
     Legacy,
     Morph(MorphCodec),
+    Speedy(SpeedyCodec),
 }
 
 impl ClientWire {
@@ -21,6 +23,15 @@ impl ClientWire {
     ///
     /// Returns an error when the static X25519 shared secret is invalid.
     pub fn from_config(config: &ValidatedClientConfig) -> Result<Self, ClientWireError> {
+        if config.protocol == mousevpn_config::ClientProtocol::Speedy {
+            let key = derive_speedy_key(
+                &config.client_private_key,
+                &config.server_public_key,
+                &config.server_public_key,
+                &config.client_private_key.public_key(),
+            )?;
+            return Ok(Self::Speedy(SpeedyCodec::new(SpeedyKey::from_bytes(key))));
+        }
         let Some(profile) = config.protocol.morph_profile() else {
             return Ok(Self::Legacy);
         };
@@ -40,7 +51,7 @@ impl ClientWire {
     #[must_use]
     pub const fn profile(&self) -> Option<Profile> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy | Self::Speedy(_) => None,
             Self::Morph(codec) => Some(codec.profile()),
         }
     }
@@ -52,7 +63,7 @@ impl ClientWire {
     /// Returns an error when the operating-system random generator fails.
     pub fn cover_count(&self) -> Result<usize, ClientWireError> {
         match self {
-            Self::Legacy => Ok(0),
+            Self::Legacy | Self::Speedy(_) => Ok(0),
             Self::Morph(codec) => Ok(codec.profile().cover_count()?),
         }
     }
@@ -64,7 +75,7 @@ impl ClientWire {
     /// Returns an error when the operating-system random generator fails.
     pub fn handshake_jitter_ms(&self) -> Result<u64, ClientWireError> {
         match self {
-            Self::Legacy => Ok(0),
+            Self::Legacy | Self::Speedy(_) => Ok(0),
             Self::Morph(codec) => Ok(codec.profile().handshake_jitter_ms()?),
         }
     }
@@ -73,9 +84,13 @@ impl ClientWire {
     ///
     /// # Errors
     ///
-    /// Returns an error when `MouseMorph` cannot encode the frame.
+    /// Returns an error when the selected masking format cannot encode the frame.
     pub fn encode(&self, inner: &[u8], output: &mut Vec<u8>) -> Result<(), ClientWireError> {
         match self {
+            Self::Speedy(codec) => {
+                codec.encode(inner, SpeedyDirection::ClientToServer, output)?;
+                Ok(())
+            }
             Self::Legacy => {
                 output.clear();
                 output.extend_from_slice(inner);
@@ -92,9 +107,13 @@ impl ClientWire {
     ///
     /// # Errors
     ///
-    /// Returns an error when a `MouseMorph` frame is malformed or unauthenticated.
+    /// Returns an error when a masked frame is malformed or unauthenticated.
     pub fn decode(&self, outer: &[u8], output: &mut Vec<u8>) -> Result<bool, ClientWireError> {
         match self {
+            Self::Speedy(codec) => {
+                codec.decode(outer, SpeedyDirection::ServerToClient, output)?;
+                Ok(true)
+            }
             Self::Legacy => {
                 output.clear();
                 output.extend_from_slice(outer);
@@ -114,7 +133,7 @@ impl ClientWire {
     /// Returns an error when `MouseMorph` cannot encode the frame.
     pub fn encode_cover(&self, output: &mut Vec<u8>) -> Result<(), ClientWireError> {
         match self {
-            Self::Legacy => {
+            Self::Legacy | Self::Speedy(_) => {
                 output.clear();
                 Ok(())
             }
@@ -130,13 +149,15 @@ impl ClientWire {
 pub enum ClientWireError {
     Crypto(CryptoError),
     Morph(MorphError),
+    Speedy(SpeedyError),
 }
 
 impl fmt::Display for ClientWireError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Crypto(error) => write!(formatter, "MouseMorph key derivation failed: {error}"),
+            Self::Crypto(error) => write!(formatter, "wire key derivation failed: {error}"),
             Self::Morph(error) => write!(formatter, "MouseMorph frame failed: {error}"),
+            Self::Speedy(error) => write!(formatter, "Speedy frame failed: {error}"),
         }
     }
 }
@@ -146,6 +167,7 @@ impl Error for ClientWireError {
         match self {
             Self::Crypto(error) => Some(error),
             Self::Morph(error) => Some(error),
+            Self::Speedy(error) => Some(error),
         }
     }
 }
@@ -159,6 +181,12 @@ impl From<CryptoError> for ClientWireError {
 impl From<MorphError> for ClientWireError {
     fn from(error: MorphError) -> Self {
         Self::Morph(error)
+    }
+}
+
+impl From<SpeedyError> for ClientWireError {
+    fn from(error: SpeedyError) -> Self {
+        Self::Speedy(error)
     }
 }
 

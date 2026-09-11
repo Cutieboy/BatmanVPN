@@ -296,6 +296,7 @@ fn run_tunnel(
 const fn protocol_name(protocol: ClientProtocol) -> &'static str {
     match protocol {
         ClientProtocol::Legacy => "legacy",
+        ClientProtocol::Speedy => "speedy",
         ClientProtocol::MorphQuiet => "morph_quiet",
         ClientProtocol::MorphBalanced => "morph_balanced",
         ClientProtocol::MorphParanoid => "morph_paranoid",

@@ -148,8 +148,14 @@ fn same_server_path(left: &Route, right: &Route) -> bool {
     left.destination() == right.destination()
         && left.prefix() == right.prefix()
         && left.gateway() == right.gateway()
-        && left.if_index() == right.if_index()
-        && left.if_name() == right.if_name()
+        // Kernel snapshots can include both the interface index and its name,
+        // while server_route() builds an index-only route. Compare the index
+        // when available on both sides instead of requiring equal metadata.
+        && match (left.if_index(), right.if_index()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => left.if_name() == right.if_name(),
+            _ => left.if_name().is_some() && left.if_name() == right.if_name(),
+        }
         && left.metric() == right.metric()
 }
 
@@ -246,5 +252,24 @@ mod tests {
 
         assert!(same_server_path(&installed, &same));
         assert!(!same_server_path(&installed, &changed_gateway));
+    }
+
+    #[test]
+    fn listed_interface_name_does_not_make_the_same_route_look_absent() {
+        let server = Ipv4Addr::new(203, 0, 113, 7);
+        let default = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+            .with_if_index(2)
+            .with_if_name("eth0".to_owned());
+        let replacement = server_route(server, &[default]).unwrap();
+        let listed = replacement.clone().with_if_name("eth0".to_owned());
+        assert!(same_server_path(&listed, &replacement));
+        assert!(same_server_path(&replacement, &listed));
+        assert!(!same_server_path(&listed.clone().with_if_index(3), &listed));
+        let unresolved = Route::new(IpAddr::V4(server), 32)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+            .with_metric(4_242);
+        assert!(!same_server_path(&unresolved, &replacement));
+        assert!(!same_server_path(&listed.with_metric(100), &replacement));
     }
 }

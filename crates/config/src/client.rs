@@ -25,13 +25,14 @@ pub enum ClientProtocol {
     MorphQuiet,
     MorphBalanced,
     MorphParanoid,
+    Speedy,
 }
 
 impl ClientProtocol {
     #[must_use]
     pub const fn morph_profile(self) -> Option<Profile> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy | Self::Speedy => None,
             Self::MorphQuiet => Some(Profile::Quiet),
             Self::MorphBalanced => Some(Profile::Balanced),
             Self::MorphParanoid => Some(Profile::Paranoid),
@@ -59,7 +60,10 @@ impl ClientConfig {
         Ok(ValidatedClientConfig {
             server: self.server,
             client_private_key: decode_secret_key(&self.client_private_key)?,
-            context: ProtocolContext::for_server(&server_public_key),
+            context: match self.protocol {
+                ClientProtocol::Speedy => ProtocolContext::for_speedy_server(&server_public_key),
+                _ => ProtocolContext::for_server(&server_public_key),
+            },
             server_public_key,
             tun_name: self.tun_name,
             protocol: self.protocol,
@@ -85,6 +89,29 @@ mod tests {
         ))
         .expect("config");
         assert_eq!(config.protocol, ClientProtocol::Legacy);
+    }
+
+    #[test]
+    fn speedy_is_explicit_and_has_its_own_noise_context() {
+        let config: ClientConfig = toml::from_str(&format!(
+            "server = '127.0.0.1:51820'\nserver_public_key = '{SERVER_KEY}'\nclient_private_key = '{CLIENT_KEY}'\nprotocol = 'speedy'\n"
+        )).unwrap();
+        let validated = config.validate().unwrap();
+        assert_eq!(validated.protocol, ClientProtocol::Speedy);
+        assert_eq!(
+            validated.context,
+            mousevpn_crypto::ProtocolContext::for_speedy_server(&validated.server_public_key)
+        );
+        assert_ne!(
+            validated.context,
+            mousevpn_crypto::ProtocolContext::for_server(&validated.server_public_key)
+        );
+        assert_eq!(
+            toml::Value::try_from(ClientProtocol::Speedy)
+                .unwrap()
+                .as_str(),
+            Some("speedy")
+        );
     }
 
     #[test]

@@ -17,16 +17,22 @@ use mousevpn_admin_api::{
 use mousevpn_config::{
     decode_public_key, encode_public_key, ValidatedServerConfig, DEFAULT_TUN_MTU, MAX_SAFE_TUN_MTU,
 };
-use mousevpn_crypto::{derive_morph_key, PublicKey, ServerHandshake};
+use mousevpn_crypto::{
+    derive_morph_key, derive_speedy_key, ProtocolContext, PublicKey, ServerHandshake,
+};
 use mousevpn_data_plane::{
     looks_like_protocol_datagram, Decoded, Ipv4Packet, PacketDevice, TunnelDataPlane,
     TunnelReceiver, TunnelSender, TUNNEL_OVERHEAD,
 };
 use mousevpn_linux_platform::{LinuxTun, LinuxTunConfig, DEFAULT_TX_QUEUE_LEN};
 use mousevpn_morph::{
-    accepted_epochs, current_epoch, routing_tag_at, DecodedFrame, Direction, MorphCodec,
-    MorphError, MorphKey, Profile, SAFE_TUN_MTU,
+    accepted_epochs, current_epoch, routing_tag_at, DecodedFrame, Direction, MorphCodec, MorphKey,
+    Profile, SAFE_TUN_MTU,
 };
+use mousevpn_speedy::{Direction as SpeedyDirection, SpeedyCodec, SpeedyKey};
+
+#[cfg(test)]
+mod speedy_tests;
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::socket::{
@@ -142,6 +148,10 @@ struct KeepaliveBuffers {
 #[derive(Clone, Debug)]
 enum WireMode {
     Legacy,
+    Speedy {
+        client_public_key: PublicKey,
+        codec: SpeedyCodec,
+    },
     Morph {
         client_public_key: PublicKey,
         codec: MorphCodec,
@@ -149,16 +159,19 @@ enum WireMode {
 }
 
 impl WireMode {
-    fn encode_server(&self, inner: &[u8], output: &mut Vec<u8>) -> Result<(), MorphError> {
+    fn encode_server(&self, inner: &[u8], output: &mut Vec<u8>) -> Result<(), ()> {
         match self {
             Self::Legacy => {
                 output.clear();
                 output.extend_from_slice(inner);
                 Ok(())
             }
-            Self::Morph { codec, .. } => {
-                codec.encode_payload(inner, Direction::ServerToClient, output)
-            }
+            Self::Morph { codec, .. } => codec
+                .encode_payload(inner, Direction::ServerToClient, output)
+                .map_err(|_| ()),
+            Self::Speedy { codec, .. } => codec
+                .encode(inner, SpeedyDirection::ServerToClient, output)
+                .map_err(|_| ()),
         }
     }
 
@@ -167,6 +180,9 @@ impl WireMode {
             Self::Legacy => true,
             Self::Morph {
                 client_public_key, ..
+            }
+            | Self::Speedy {
+                client_public_key, ..
             } => client_public_key == public_key,
         }
     }
@@ -174,6 +190,16 @@ impl WireMode {
     fn matches(&self, incoming: &Self) -> bool {
         match (self, incoming) {
             (Self::Legacy, Self::Legacy) => true,
+            (
+                Self::Speedy {
+                    client_public_key: expected,
+                    ..
+                },
+                Self::Speedy {
+                    client_public_key: actual,
+                    ..
+                },
+            ) => expected == actual,
             (
                 Self::Morph {
                     client_public_key: expected,
@@ -191,6 +217,7 @@ impl WireMode {
     fn session_mtu(&self, configured: u16) -> u16 {
         match self {
             Self::Legacy => configured,
+            Self::Speedy { .. } => configured.min(mousevpn_speedy::SAFE_TUN_MTU),
             Self::Morph { .. } => configured.min(SAFE_TUN_MTU),
         }
     }
@@ -209,6 +236,8 @@ struct MorphRouter {
     // The static shared key does not change when routing tags rotate. Avoid
     // repeating X25519 for every device in the receive loop once per second.
     keys: HashMap<PublicKey, MorphKey>,
+    speedy_codecs: HashMap<PublicKey, SpeedyCodec>,
+    speedy_routes: HashMap<[u8; 8], (PublicKey, SpeedyCodec)>,
     routes: HashMap<[u8; 8], MorphRoute>,
     ambiguous: HashSet<[u8; 8]>,
 }
@@ -242,6 +271,9 @@ impl MorphRouter {
             .collect();
         self.keys
             .retain(|public_key, _| devices.contains(public_key));
+        self.speedy_codecs
+            .retain(|public_key, _| devices.contains(public_key));
+        self.speedy_routes.clear();
         self.routes.clear();
         self.ambiguous.clear();
         for public_key in devices {
@@ -274,6 +306,10 @@ impl MorphRouter {
                     if self.ambiguous.contains(&tag) {
                         continue;
                     }
+                    if self.speedy_routes.remove(&tag).is_some() {
+                        self.ambiguous.insert(tag);
+                        continue;
+                    }
                     match self.routes.entry(tag) {
                         Entry::Vacant(entry) => {
                             entry.insert(route.clone());
@@ -285,8 +321,43 @@ impl MorphRouter {
                     }
                 }
             }
+            self.add_speedy_routes(public_key, config)?;
         }
         self.epoch = Some(epoch);
+        Ok(())
+    }
+
+    fn add_speedy_routes(
+        &mut self,
+        public_key: PublicKey,
+        config: &ValidatedServerConfig,
+    ) -> Result<(), ()> {
+        let codec = match self.speedy_codecs.entry(public_key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let key = derive_speedy_key(
+                    &config.server_private_key,
+                    &public_key,
+                    &config.server_public_key,
+                    &public_key,
+                )
+                .map_err(|_| ())?;
+                entry.insert(SpeedyCodec::new(SpeedyKey::from_bytes(key)))
+            }
+        };
+        for epoch in
+            mousevpn_speedy::accepted_epochs(mousevpn_speedy::current_epoch().map_err(|_| ())?)
+        {
+            let tag = codec.routing_tag_at(SpeedyDirection::ClientToServer, epoch);
+            if self.ambiguous.contains(&tag) {
+                continue;
+            }
+            if self.routes.remove(&tag).is_some() || self.speedy_routes.remove(&tag).is_some() {
+                self.ambiguous.insert(tag);
+                continue;
+            }
+            self.speedy_routes.insert(tag, (public_key, codec.clone()));
+        }
         Ok(())
     }
 }
@@ -424,6 +495,23 @@ fn decode_wire_into(
     output: &mut Vec<u8>,
 ) -> Option<WireMode> {
     let Some(route) = router.resolve(input, config, authorized) else {
+        if let Some(tag) = input
+            .get(..8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        {
+            if router.ambiguous.contains(&tag) {
+                return None;
+            }
+            if let Some((public_key, codec)) = router.speedy_routes.get(&tag) {
+                codec
+                    .decode(input, SpeedyDirection::ClientToServer, output)
+                    .ok()?;
+                return Some(WireMode::Speedy {
+                    client_public_key: *public_key,
+                    codec: codec.clone(),
+                });
+            }
+        }
         output.clear();
         output.extend_from_slice(input);
         return Some(WireMode::Legacy);
@@ -595,10 +683,13 @@ fn handle_handshake(
     wire: &WireMode,
     cache: &mut HashMap<PublicKey, CachedHandshake>,
 ) {
-    let Ok(mut handshake) = ServerHandshake::new(
-        &services.config.server_private_key,
-        &services.config.context,
-    ) else {
+    let context = if matches!(wire, WireMode::Speedy { .. }) {
+        ProtocolContext::for_speedy_server(&services.config.server_public_key)
+    } else {
+        services.config.context
+    };
+    let Ok(mut handshake) = ServerHandshake::new(&services.config.server_private_key, &context)
+    else {
         return;
     };
     if handshake.read_initial(datagram.payload).is_err() {

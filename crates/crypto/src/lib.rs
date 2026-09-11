@@ -10,7 +10,7 @@ mod session;
 pub use context::ProtocolContext;
 pub use error::CryptoError;
 pub use handshake::{ClientHandshake, ServerHandshake};
-pub use keys::{derive_morph_key, KeyPair, PublicKey, SecretKey, KEY_LEN};
+pub use keys::{derive_morph_key, derive_speedy_key, KeyPair, PublicKey, SecretKey, KEY_LEN};
 pub use replay::{ReplayError, REPLAY_WINDOW_SIZE};
 pub use session::{ReceiveHalf, SecureSession, SendHalf, AUTH_TAG_LEN};
 

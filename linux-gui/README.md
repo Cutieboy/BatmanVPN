@@ -4,6 +4,11 @@ Desktop client built with Tauri 2 and the existing MouseVPN Rust runtime.
 
 ## Current MVP
 
+- supports the optional **Speedy** protocol with minimal header masking,
+  no padding or handshake cover traffic, and separate reliability history;
+  requires a server built with [Speedy support](../docs/SPEEDY.md). Existing
+  profiles keep their selected protocol, with Legacy as the default;
+
 - imports encrypted `MV1.…` profiles with their password;
 - stores one private TOML file per profile under
   `$XDG_CONFIG_HOME/mousevpn/profiles` (or `~/.config/mousevpn/profiles`) with

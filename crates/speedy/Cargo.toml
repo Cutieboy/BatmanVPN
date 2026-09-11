@@ -1,15 +1,23 @@
 [package]
-name = "mousevpn-client-wire"
+name = "mousevpn-speedy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-mousevpn-config = { path = "../config" }
+blake3 = "1.8"
+hkdf = "0.12"
+hmac = "0.12"
+mousevpn-protocol = { path = "../protocol" }
+sha2 = "0.10"
+subtle = "2.6"
+zeroize = "1.8"
+
+[dev-dependencies]
 mousevpn-crypto = { path = "../crypto" }
+mousevpn-data-plane = { path = "../data-plane" }
 mousevpn-morph = { path = "../morph" }
-mousevpn-speedy = { path = "../speedy" }
 
 [lints]
 workspace = true

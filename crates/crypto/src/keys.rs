@@ -122,11 +122,46 @@ pub fn derive_morph_key(
     server_public_key: &PublicKey,
     client_public_key: &PublicKey,
 ) -> Result<[u8; KEY_LEN], CryptoError> {
+    derive_wire_key(
+        local_secret_key,
+        peer_public_key,
+        server_public_key,
+        client_public_key,
+        MORPH_KEY_LABEL,
+    )
+}
+
+/// Derives a Speedy v1 key, separate from `MouseMorph` and Noise session keys.
+///
+/// # Errors
+/// Returns an error for a low-order peer key or an invalid HKDF expansion.
+pub fn derive_speedy_key(
+    local_secret_key: &SecretKey,
+    peer_public_key: &PublicKey,
+    server_public_key: &PublicKey,
+    client_public_key: &PublicKey,
+) -> Result<[u8; KEY_LEN], CryptoError> {
+    derive_wire_key(
+        local_secret_key,
+        peer_public_key,
+        server_public_key,
+        client_public_key,
+        b"MouseVPN Speedy v1 key",
+    )
+}
+
+fn derive_wire_key(
+    local_secret_key: &SecretKey,
+    peer_public_key: &PublicKey,
+    server_public_key: &PublicKey,
+    client_public_key: &PublicKey,
+    label: &[u8],
+) -> Result<[u8; KEY_LEN], CryptoError> {
     let mut shared = x25519_dalek::x25519(*local_secret_key.0, *peer_public_key.as_bytes());
     if shared == [0_u8; KEY_LEN] {
         return Err(CryptoError::InvalidSharedSecret);
     }
-    let hkdf = Hkdf::<Sha256>::new(Some(MORPH_KEY_LABEL), &shared);
+    let hkdf = Hkdf::<Sha256>::new(Some(label), &shared);
     let mut info = [0_u8; KEY_LEN * 2];
     info[..KEY_LEN].copy_from_slice(server_public_key.as_bytes());
     info[KEY_LEN..].copy_from_slice(client_public_key.as_bytes());
@@ -141,6 +176,46 @@ pub fn derive_morph_key(
 #[cfg(test)]
 mod tests {
     use super::{derive_morph_key, KeyPair};
+
+    #[test]
+    fn speedy_keys_agree_are_domain_separated_and_reject_low_order_peers() {
+        let server = KeyPair::generate().unwrap();
+        let client = KeyPair::generate().unwrap();
+        let key = super::derive_speedy_key(
+            &client.secret,
+            &server.public,
+            &server.public,
+            &client.public,
+        )
+        .unwrap();
+        assert_eq!(
+            key,
+            super::derive_speedy_key(
+                &server.secret,
+                &client.public,
+                &server.public,
+                &client.public
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            derive_morph_key(
+                &client.secret,
+                &server.public,
+                &server.public,
+                &client.public
+            )
+            .unwrap()
+        );
+        assert!(super::derive_speedy_key(
+            &client.secret,
+            &super::PublicKey::from_bytes([0; 32]),
+            &server.public,
+            &client.public
+        )
+        .is_err());
+    }
 
     #[test]
     fn both_roles_derive_the_same_morph_key() {

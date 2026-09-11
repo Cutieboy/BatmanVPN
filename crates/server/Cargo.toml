@@ -12,12 +12,15 @@ mousevpn-crypto = { path = "../crypto" }
 mousevpn-data-plane = { path = "../data-plane" }
 mousevpn-linux-platform = { path = "../linux-platform" }
 mousevpn-morph = { path = "../morph" }
+mousevpn-speedy = { path = "../speedy" }
 mousevpn-protocol = { path = "../protocol" }
 mousevpn-transport = { path = "../transport" }
 nix = { version = "0.30", features = ["net", "poll", "socket", "uio"] }
 socket2 = "0.6"
 
 [dev-dependencies]
+mousevpn-client-wire = { path = "../client-wire" }
+mousevpn-linux-client = { path = "../linux-client" }
 mousevpn-transport = { path = "../transport" }
 tempfile = "3.26"
 

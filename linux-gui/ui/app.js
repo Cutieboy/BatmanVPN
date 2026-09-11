@@ -82,6 +82,7 @@ if (isWindows) {
     .then((available) => elements.appExclusions.classList.toggle("hidden", !available))
     .catch(() => elements.appExclusions.classList.add("hidden"));
 } else {
+  elements.protocolMode.add(new Option("Speedy — минимальная маскировка", "speedy"), 1);
   elements.reliabilityDiagnostics.classList.remove("hidden");
 }
 
@@ -152,6 +153,7 @@ function renderProtocol() {
   const protocol = profile?.protocol ?? "legacy";
   const descriptions = {
     legacy: "Обычный MouseVPN для старых клиентов",
+    speedy: "Минимальная маскировка без дополнений и задержек. Нужен сервер с поддержкой Speedy.",
     morph_quiet: "Меняющийся тег и лёгкое случайное дополнение",
     morph_balanced: "Пятисекундная ротация и 1–2 маскирующих пакета",
     morph_paranoid: "Секундная ротация и 3–5 маскирующих пакетов",

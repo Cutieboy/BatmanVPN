@@ -202,7 +202,9 @@ fn log_connected(mode: Mode, wire: &ClientWire) {
     match mode {
         Mode::FullTunnel => {
             eprintln!("MOUSEVPN_STATE=connected");
-            if let Some(profile) = wire.profile() {
+            if matches!(wire, ClientWire::Speedy(_)) {
+                eprintln!("MOUSEVPN_PROTOCOL=speedy");
+            } else if let Some(profile) = wire.profile() {
                 eprintln!("MOUSEVPN_PROTOCOL=morph_{}", profile.name());
             } else {
                 eprintln!("MOUSEVPN_PROTOCOL=legacy");

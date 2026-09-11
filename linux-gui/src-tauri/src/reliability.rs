@@ -367,8 +367,9 @@ impl ModeSummary {
     }
 }
 
-const ALL_PROTOCOLS: [ClientProtocol; 4] = [
+const ALL_PROTOCOLS: [ClientProtocol; 5] = [
     ClientProtocol::Legacy,
+    ClientProtocol::Speedy,
     ClientProtocol::MorphQuiet,
     ClientProtocol::MorphBalanced,
     ClientProtocol::MorphParanoid,
@@ -377,6 +378,7 @@ const ALL_PROTOCOLS: [ClientProtocol; 4] = [
 const fn protocol_key(protocol: ClientProtocol) -> &'static str {
     match protocol {
         ClientProtocol::Legacy => "legacy",
+        ClientProtocol::Speedy => "speedy",
         ClientProtocol::MorphQuiet => "morph_quiet",
         ClientProtocol::MorphBalanced => "morph_balanced",
         ClientProtocol::MorphParanoid => "morph_paranoid",
@@ -386,6 +388,7 @@ const fn protocol_key(protocol: ClientProtocol) -> &'static str {
 const fn protocol_label(protocol: ClientProtocol) -> &'static str {
     match protocol {
         ClientProtocol::Legacy => "Legacy",
+        ClientProtocol::Speedy => "Speedy",
         ClientProtocol::MorphQuiet => "Morph Quiet",
         ClientProtocol::MorphBalanced => "Morph Balanced",
         ClientProtocol::MorphParanoid => "Morph Paranoid",
@@ -480,7 +483,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let mode = &monitor.summary("profile").modes[2];
+        let summary = monitor.summary("profile");
+        let mode = summary
+            .modes
+            .iter()
+            .find(|mode| mode.protocol == "morph_balanced")
+            .unwrap();
         assert_eq!(mode.sessions, 1);
         assert_eq!(mode.observed_seconds, 305);
         assert_eq!(mode.keepalives_sent, 30);

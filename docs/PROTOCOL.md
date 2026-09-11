@@ -7,6 +7,10 @@ The optional Linux-first authenticated masking envelope is specified in
 [MOUSEMORPH_V2.md](MOUSEMORPH_V2.md); it carries these complete datagrams as
 encrypted inner payloads.
 
+[Speedy v1](SPEEDY.md) is an optional Linux-first format with minimal header
+masking, a separate Noise context and no second payload encryption. Legacy
+framing and the default protocol remain unchanged.
+
 ## Cryptographic protocol
 
 The protected session uses:
