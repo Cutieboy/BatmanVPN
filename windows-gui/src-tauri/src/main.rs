@@ -237,7 +237,19 @@ fn set_autostart(_enabled: bool) -> Result<bool, String> {
 
 #[cfg(any(windows, test))]
 fn autostart_command(executable: &Path) -> String {
-    format!("\"{}\" --minimized", executable.display())
+    format!("\\\"{}\\\" --minimized --autoconnect", executable.display())
+}
+
+fn autoconnect_first_profile(state: &AppState) {
+    let Ok(profiles) = profiles::list() else {
+        return;
+    };
+    let Some(profile) = profiles.first() else {
+        return;
+    };
+    if let Err(error) = connect_profile_inner(profile.id().to_owned(), state) {
+        set_tray_error(state, error);
+    }
 }
 
 #[tauri::command]
@@ -538,7 +550,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn run_gui(minimized: bool) {
+fn run_gui(minimized: bool, autoconnect: bool) {
     let builder = tauri::Builder::default();
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(
@@ -557,6 +569,9 @@ fn run_gui(minimized: bool) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+            if autoconnect {
+                autoconnect_first_profile(app.state::<AppState>().inner());
             }
             Ok(())
         })
@@ -649,8 +664,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        [_, minimized] if minimized == "--minimized" => run_gui(true),
-        _ => run_gui(false),
+        [_, minimized, autoconnect]
+            if minimized == "--minimized" && autoconnect == "--autoconnect" =>
+            run_gui(true, true),
+        [_, minimized] if minimized == "--minimized" => run_gui(true, false),
+        _ => run_gui(false, false),
     }
 }
 
@@ -682,7 +700,7 @@ mod helper_status_tests {
             autostart_command(std::path::Path::new(
                 r"C:\Program Files\MouseVPN\MouseVPN.exe"
             )),
-            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized"#
+            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized --autoconnect"#
         );
     }
 
