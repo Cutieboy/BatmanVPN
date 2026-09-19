@@ -140,7 +140,7 @@ impl GeoRouter {
     pub(crate) fn is_direct_domain(&self, domain: &str) -> bool {
         let domain = normalize_domain(domain);
         self.domains.iter().any(|candidate| {
-            domain == candidate || domain.ends_with(&format!(".{candidate}"))
+            domain == *candidate || domain.ends_with(&format!(".{candidate}"))
         })
     }
 }
