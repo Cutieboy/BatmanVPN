@@ -237,7 +237,7 @@ fn set_autostart(_enabled: bool) -> Result<bool, String> {
 
 #[cfg(any(windows, test))]
 fn autostart_command(executable: &Path) -> String {
-    format!("\\\"{}\\\" --minimized --autoconnect", executable.display())
+    format!("\"{}\" --minimized --autoconnect", executable.display())
 }
 
 fn autoconnect_first_profile(state: &AppState) {
