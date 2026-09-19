@@ -35,6 +35,8 @@ mod runtime;
 mod split_tunnel;
 #[cfg(windows)]
 mod windivert;
+#[cfg(windows)]
+mod geo;
 
 pub use error::ClientError;
 
