@@ -151,7 +151,7 @@ fn parse_domain(line: &str) -> Option<String> {
         return None;
     }
     let domain = line.strip_prefix("domain:").unwrap_or(line).trim();
-    if domain.is_empty() || domain.contains(char::is_whitespace) {
+    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
         return None;
     }
     Some(normalize_domain(domain))
