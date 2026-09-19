@@ -2,6 +2,7 @@
 
 pub(crate) mod divert;
 pub(crate) mod flow;
+pub(crate) mod geo;
 pub(crate) mod packet;
 
 use std::{
