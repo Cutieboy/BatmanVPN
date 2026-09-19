@@ -388,11 +388,28 @@ impl Library {
         let handle = unsafe { (self.open)(filter.as_ptr(), layer, priority, flags) };
         if handle == INVALID_HANDLE_VALUE {
             const ERROR_INVALID_PARAMETER: i32 = 87;
+            const ERROR_SERVICE_DISABLED: i32 = 1058;
             let error = std::io::Error::last_os_error();
             // The most common cause of this code is a filter the driver will
             // not accept, and the compiler can say exactly why.
             if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
                 self.check_filter(filter.to_str().unwrap_or_default(), layer)?;
+            }
+            // WinDivert normally installs its demand-start driver when the
+            // first handle is opened. A previous process can, however, leave
+            // the service registered with a disabled start type (ERROR 1058).
+            // The DLL's private installer is not exported, so repair the
+            // service registration using the same SCM contract and retry once.
+            if error.raw_os_error() == Some(ERROR_SERVICE_DISABLED)
+                && repair_driver_service().is_ok()
+            {
+                let retry = unsafe { (self.open)(filter.as_ptr(), layer, priority, flags) };
+                if retry != INVALID_HANDLE_VALUE {
+                    return Ok(Handle {
+                        library: Arc::clone(self),
+                        handle: retry as usize,
+                    });
+                }
             }
             return Err(open_error(&error));
         }
@@ -763,6 +780,161 @@ fn missing_library(directory: &Path) -> ClientError {
         "WinDivert.dll is missing from {}; reinstall MouseVPN to restore it",
         directory.display()
     ))
+}
+
+/// Repairs the demand-start WinDivert service when another program or an
+/// interrupted uninstall left it registered as disabled.
+///
+/// WinDivert normally performs this work internally, but its installer is a
+/// private DLL function. Repeating the same SCM operation here lets MouseVPN
+/// recover from the specific `ERROR_SERVICE_DISABLED` state without asking
+/// the user to reinstall the application or launch the GUI elevated again.
+fn repair_driver_service() -> Result<(), ClientError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError},
+        System::Services::{
+            ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW,
+            OpenServiceW, StartServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS,
+            SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER,
+            SERVICE_NO_CHANGE,
+        },
+    };
+
+    let dll = library_path()?;
+    let driver = dll.with_file_name("WinDivert64.sys");
+    if !driver.is_file() {
+        return Err(ClientError::Platform(format!(
+            "WinDivert64.sys is missing from {}; reinstall MouseVPN to restore it",
+            driver.parent().unwrap_or_else(|| std::path::Path::new(".")).display()
+        )));
+    }
+
+    let service_name: Vec<u16> =
+        "WinDivert".encode_utf16().chain(std::iter::once(0)).collect();
+    let driver_path: Vec<u16> =
+        driver.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // SAFETY: null database and machine names select the local SCM.
+    let manager = unsafe {
+        OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            SC_MANAGER_ALL_ACCESS,
+        )
+    };
+    if manager.is_null() {
+        return Err(ClientError::Platform(format!(
+            "failed to open the Windows Service Control Manager: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // SAFETY: service name is NUL-terminated and manager is valid.
+    let mut service = unsafe {
+        OpenServiceW(manager, service_name.as_ptr(), SERVICE_ALL_ACCESS)
+    };
+
+    if service.is_null() {
+        let error = unsafe { GetLastError() };
+        if error != windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST {
+            unsafe { CloseServiceHandle(manager) };
+            return Err(ClientError::Platform(format!(
+                "failed to open the WinDivert service: Windows error {error}"
+            )));
+        }
+
+        let display_name = service_name.clone();
+        // SAFETY: all pointers remain valid for the duration of the call.
+        service = unsafe {
+            CreateServiceW(
+                manager,
+                service_name.as_ptr(),
+                display_name.as_ptr(),
+                SERVICE_ALL_ACCESS,
+                SERVICE_KERNEL_DRIVER,
+                SERVICE_DEMAND_START,
+                SERVICE_ERROR_NORMAL,
+                driver_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if service.is_null() {
+            let error = unsafe { GetLastError() };
+            if error != windows_sys::Win32::Foundation::ERROR_SERVICE_EXISTS {
+                unsafe { CloseServiceHandle(manager) };
+                return Err(ClientError::Platform(format!(
+                    "failed to register the WinDivert driver service: Windows error {error}"
+                )));
+            }
+            // Another WinDivertOpen won the race.
+            service = unsafe {
+                OpenServiceW(manager, service_name.as_ptr(), SERVICE_ALL_ACCESS)
+            };
+        }
+    } else {
+        // Normalize an existing registration back to WinDivert's documented
+        // demand-start mode instead of deleting a service another process may
+        // still hold.
+        // SAFETY: service handle is valid and optional parameters are null.
+        let changed = unsafe {
+            ChangeServiceConfigW(
+                service,
+                SERVICE_NO_CHANGE,
+                SERVICE_DEMAND_START,
+                SERVICE_NO_CHANGE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if changed == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+            return Err(ClientError::Platform(format!(
+                "failed to restore WinDivert service start mode: {error}"
+            )));
+        }
+    }
+
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Err(ClientError::Platform(
+            "WinDivert service handle is unavailable after repair".to_owned(),
+        ));
+    }
+
+    // SAFETY: driver service takes no arguments.
+    let started = unsafe { StartServiceW(service, 0, std::ptr::null()) };
+    if started == 0 {
+        let error = unsafe { GetLastError() };
+        if error != windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING {
+            unsafe {
+                CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+            return Err(ClientError::Platform(format!(
+                "failed to start the WinDivert driver after repair: Windows error {error}"
+            )));
+        }
+    }
+
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(())
 }
 
 /// Turns the documented `WinDivertOpen` failures into actionable messages.
