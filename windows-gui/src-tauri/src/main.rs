@@ -204,8 +204,6 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
             "ONLOGON",
             "/RL",
             "HIGHEST",
-            "/DELAY",
-            "0000:10",
             "/TR",
             &task_command,
             "/F",
