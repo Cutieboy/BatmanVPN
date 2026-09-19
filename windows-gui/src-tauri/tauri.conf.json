@@ -1,5 +1,5 @@
 {
-  "productName": "MouseVPN",
+  "productName": "BatmanVPN",
   "version": "0.1.17",
   "identifier": "dev.mousevpn.windows",
   "build": {
@@ -9,7 +9,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "MouseVPN for Windows",
+        "title": "BatmanVPN for Windows",
         "width": 1120,
         "height": 720,
         "minWidth": 900,
@@ -25,10 +25,10 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
-    "icon": ["icons/icon.ico"],
+    "icon": ["icons/bat_icon.png"],
     "category": "Utility",
-    "shortDescription": "Fast private MouseVPN client",
-    "longDescription": "MouseVPN desktop client for Windows",
+    "shortDescription": "Fast private BatmanVPN client",
+    "longDescription": "BatmanVPN desktop client for Windows",
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
