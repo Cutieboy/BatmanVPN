@@ -492,7 +492,7 @@ impl Classifier {
     }
 
     fn matches_excluded_ancestor(&self, process_id: u32, child_created: u64) -> bool {
-        let Ok(snapshot) = ProcessSnapshot::new() else {
+        let Some(snapshot) = ProcessSnapshot::new() else {
             return false;
         };
         let mut current = process_id;
