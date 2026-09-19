@@ -27,6 +27,8 @@ on:
       - "crates/data-plane/**"
       - "crates/protocol/**"
       - "crates/transport/**"
+      - "windows-gui/**"
+      - "linux-gui/ui/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -44,4 +46,9 @@ jobs:
 
       - name: Test Windows client
         run: cargo test -p mousevpn-windows-client --locked
-\n      - name: Check Windows GUI\n        run: cargo check -p mousevpn-windows-gui --locked\n\n      - name: Test Windows GUI\n        run: cargo test -p mousevpn-windows-gui --locked\n
+
+      - name: Check Windows GUI
+        run: cargo check -p mousevpn-windows-gui --locked
+
+      - name: Test Windows GUI
+        run: cargo test -p mousevpn-windows-gui --locked
