@@ -48,7 +48,7 @@ impl Ipv4Trie {
     fn insert(&mut self, address: u32, prefix: u8) {
         let mut node = 0;
         for bit in 0..prefix {
-            let branch = usize::from(((address >> (31 - bit)) & 1) != 0);
+            let branch = if ((address >> (31 - bit)) & 1) != 0 { 1 } else { 0 };
             node = match self.nodes[node].child[branch] {
                 Some(child) => child,
                 None => {
@@ -71,7 +71,7 @@ impl Ipv4Trie {
             return true;
         }
         for bit in 0..32 {
-            let branch = usize::from(((address >> (31 - bit)) & 1) != 0);
+            let branch = if ((address >> (31 - bit)) & 1) != 0 { 1 } else { 0 };
             let Some(child) = self.nodes[node].child[branch] else {
                 return false;
             };
