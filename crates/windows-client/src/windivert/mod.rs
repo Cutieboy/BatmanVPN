@@ -792,7 +792,7 @@ fn missing_library(directory: &Path) -> ClientError {
 fn repair_driver_service() -> Result<(), ClientError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError},
+        Foundation::GetLastError,
         System::Services::{
             ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW,
             OpenServiceW, StartServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS,
