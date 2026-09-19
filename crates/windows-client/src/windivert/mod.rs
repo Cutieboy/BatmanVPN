@@ -805,8 +805,9 @@ fn repair_driver_service() -> Result<(), ClientError> {
         Foundation::{GetLastError, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST},
         System::Services::{
             ChangeServiceConfigW, CloseServiceHandle, OpenSCManagerW, OpenServiceW,
-            StartServiceW, SC_MANAGER_CONNECT, SERVICE_CHANGE_CONFIG, SERVICE_DEMAND_START,
-            SERVICE_NO_CHANGE, SERVICE_START,
+            QueryServiceStatus, StartServiceW, SC_MANAGER_CONNECT, SERVICE_CHANGE_CONFIG,
+            SERVICE_DEMAND_START, SERVICE_NO_CHANGE, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+            SERVICE_START,
         },
     };
 
@@ -893,6 +894,39 @@ fn repair_driver_service() -> Result<(), ClientError> {
                 "failed to start the WinDivert driver after repair: Windows error {error}"
             )));
         }
+    }
+
+    // StartServiceW can return before the service reaches RUNNING. Avoid racing
+    // the WinDivertOpen retry with the Service Control Manager's state change.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut status = unsafe { std::mem::zeroed() };
+        // SAFETY: service is a valid handle with SERVICE_QUERY_STATUS.
+        let queried = unsafe { QueryServiceStatus(service, &raw mut status) };
+        if queried == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+            return Err(ClientError::Platform(format!(
+                "failed to query the WinDivert service after repair: {error}"
+            )));
+        }
+        if status.dwCurrentState == SERVICE_RUNNING {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let state = status.dwCurrentState;
+            unsafe {
+                CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+            return Err(ClientError::Platform(format!(
+                "WinDivert service did not reach RUNNING state after repair (state {state})"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     unsafe {
