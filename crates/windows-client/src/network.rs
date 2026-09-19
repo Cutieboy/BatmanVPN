@@ -303,8 +303,7 @@ fn apply_parameters(
     tunnel: NET_LUID_LH,
     parameters: SessionParameters,
 ) -> Result<(), ClientError> {
-    netcfg::set_tunnel_address(tunnel, parameters.client_address, parameters.prefix_len)?;
-    netcfg::set_tunnel_dns(ADAPTER_NAME, parameters.dns)
+    netcfg::set_tunnel_address(tunnel, parameters.client_address, parameters.prefix_len)
 }
 
 /// Restores any route the tunnel owns that roaming or another VPN removed.
@@ -484,7 +483,6 @@ fn cleanup(firewall_rules: bool) -> Result<(), ClientError> {
     // to block the next connection until Windows finished the removal.
     if let Ok(tunnel) = netcfg::interface_luid(ADAPTER_NAME) {
         if netcfg::has_ipv4_binding(tunnel) {
-            collect(&mut failures, netcfg::reset_tunnel_dns(ADAPTER_NAME));
             collect(&mut failures, netcfg::reset_tunnel_metric(tunnel));
             collect(&mut failures, netcfg::clear_addresses(tunnel));
         }
@@ -743,8 +741,8 @@ mod tests {
     fn install_only_configures_the_kill_switch() {
         let script = install_script(SERVER, &AppRoutingPolicy::default());
         assert!(script.contains("MouseVPN-KS-v4-"));
-        // Addresses, DNS, the interface metric and routes are applied through
-        // iphlpapi now, so none of them may reappear in the script.
+        // Addresses, the interface metric and routes are applied through
+        // iphlpapi now; MouseVPN deliberately never configures Windows DNS.
         assert!(!script.contains("New-NetIPAddress"));
         assert!(!script.contains("New-NetRoute"));
         assert!(!script.contains("Set-DnsClientServerAddress"));
