@@ -720,18 +720,18 @@ mod tests {
     }
 
     #[test]
-    fn tunnels_name_resolution_whatever_the_policy_says() {
-        // Windows resolves through a shared service, so the query carries no
-        // trace of which application wanted the name. An unclassified flow to
-        // the session's resolver still has to take the tunnel: the resolver
-        // exists nowhere else.
+    fn leaves_dns_on_the_configured_windows_resolver() {
+        // MouseVPN never changes Windows DNS configuration, so DNS stays on
+        // the resolver Windows selected rather than being rewritten into the
+        // tunnel.
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        let original = packet.clone();
         assert_eq!(
             prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
-            Outcome::Tunnel
+            Outcome::PassThrough
         );
-        assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
+        assert_eq!(packet, original);
     }
 
     #[test]
