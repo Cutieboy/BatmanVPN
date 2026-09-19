@@ -568,6 +568,9 @@ fn run_gui(minimized: bool, autoconnect: bool) {
                     let _ = window.hide();
                 }
             }
+            if autostart_enabled().unwrap_or(false) {
+                let _ = set_autostart(true);
+            }
             if autoconnect {
                 autoconnect_first_profile(app.state::<AppState>().inner());
             }
