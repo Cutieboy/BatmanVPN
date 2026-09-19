@@ -756,7 +756,7 @@ mod tests {
         packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         packet[40..42].copy_from_slice(&54_518_u16.to_be_bytes());
-        packet[42..44].copy_from_slice(&53_u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&443_u16.to_be_bytes());
 
         let table = FlowTable::default();
         table.insert_for_test(
