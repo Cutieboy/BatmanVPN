@@ -7,7 +7,7 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::{
@@ -25,48 +25,90 @@ const DNS_BUFFER: usize = 4096;
 const DNS_TTL_FALLBACK: u32 = 60;
 
 #[derive(Clone, Copy)]
-struct CidrV4 {
-    network: u32,
-    mask: u32,
+struct TrieNode {
+    child: [Option<usize>; 2],
+    terminal: bool,
 }
 
-impl CidrV4 {
-    fn contains(self, address: Ipv4Addr) -> bool {
-        (u32::from(address) & self.mask) == self.network
+#[derive(Clone)]
+struct Ipv4Trie {
+    nodes: Vec<TrieNode>,
+}
+
+impl Ipv4Trie {
+    fn new() -> Self {
+        Self {
+            nodes: vec![TrieNode {
+                child: [None, None],
+                terminal: false,
+            }],
+        }
     }
 
-    fn parse(line: &str) -> Option<Self> {
-        let (address, prefix) = line.split_once('/')?;
-        let address = address.parse::<Ipv4Addr>().ok()?;
-        let prefix = prefix.parse::<u8>().ok()?;
-        if prefix > 32 {
-            return None;
+    fn insert(&mut self, address: u32, prefix: u8) {
+        let mut node = 0;
+        for bit in 0..prefix {
+            let branch = usize::from(((address >> (31 - bit)) & 1) != 0);
+            node = match self.nodes[node].child[branch] {
+                Some(child) => child,
+                None => {
+                    let child = self.nodes.len();
+                    self.nodes.push(TrieNode {
+                        child: [None, None],
+                        terminal: false,
+                    });
+                    self.nodes[node].child[branch] = Some(child);
+                    child
+                }
+            };
         }
-        let mask = if prefix == 0 {
-            0
-        } else {
-            u32::MAX << (32 - u32::from(prefix))
-        };
-        Some(Self {
-            network: u32::from(address) & mask,
-            mask,
-        })
+        self.nodes[node].terminal = true;
     }
+
+    fn contains(&self, address: u32) -> bool {
+        let mut node = 0;
+        if self.nodes[node].terminal {
+            return true;
+        }
+        for bit in 0..32 {
+            let branch = usize::from(((address >> (31 - bit)) & 1) != 0);
+            let Some(child) = self.nodes[node].child[branch] else {
+                return false;
+            };
+            node = child;
+            if self.nodes[node].terminal {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Default for Ipv4Trie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn parse_cidr(line: &str) -> Option<(u32, u8)> {
+    let (address, prefix) = line.split_once('/')?;
+    let address = address.parse::<Ipv4Addr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    (prefix <= 32).then_some((u32::from(address), prefix))
 }
 
 #[derive(Clone)]
 pub(crate) struct GeoRouter {
-    cidrs: Arc<Vec<CidrV4>>,
+    cidrs: Arc<Ipv4Trie>,
     domains: Arc<Vec<String>>,
 }
 
 impl GeoRouter {
     pub(crate) fn embedded() -> Result<Self, ClientError> {
-        let mut cidrs = DIRECT_IPS
-            .lines()
-            .filter_map(|line| CidrV4::parse(line.trim()))
-            .collect::<Vec<_>>();
-        cidrs.sort_unstable_by_key(|cidr| (cidr.network, cidr.mask));
+        let mut cidrs = Ipv4Trie::new();
+        for (address, prefix) in DIRECT_IPS.lines().filter_map(|line| parse_cidr(line.trim())) {
+            cidrs.insert(address, prefix);
+        }
 
         let mut domains = CATEGORY_RU
             .lines()
@@ -76,7 +118,7 @@ impl GeoRouter {
         domains.sort_unstable();
         domains.dedup();
 
-        if cidrs.is_empty() || domains.is_empty() {
+        if domains.is_empty() {
             return Err(ClientError::Platform(
                 "embedded RoscomVPN geo-direct data is empty".to_owned(),
             ));
@@ -90,7 +132,7 @@ impl GeoRouter {
 
     pub(crate) fn is_direct_ip(&self, address: IpAddr) -> bool {
         match address {
-            IpAddr::V4(address) => self.cidrs.iter().any(|cidr| cidr.contains(address)),
+            IpAddr::V4(address) => self.cidrs.contains(u32::from(address)),
             IpAddr::V6(_) => false,
         }
     }
