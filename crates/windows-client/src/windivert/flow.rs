@@ -60,6 +60,8 @@ pub(crate) enum Disposition {
 #[derive(Default)]
 pub(crate) struct FlowTable {
     entries: RwLock<HashMap<FlowKey, Disposition>>,
+    /// IPs learned from direct-domain DNS answers for the lifetime of their DNS TTL.
+    geo_direct_ips: RwLock<HashMap<IpAddr, std::time::Instant>>,
 }
 
 impl FlowTable {
@@ -68,6 +70,21 @@ impl FlowTable {
             .read()
             .ok()
             .and_then(|entries| entries.get(key).copied())
+    }
+
+    pub(crate) fn route_direct_ip(&self, address: IpAddr, ttl: std::time::Duration) {
+        if let Ok(mut ips) = self.geo_direct_ips.write() {
+            ips.insert(address, std::time::Instant::now() + ttl);
+        }
+    }
+
+    pub(crate) fn is_geo_direct_ip(&self, address: IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let Ok(mut ips) = self.geo_direct_ips.write() else {
+            return false;
+        };
+        ips.retain(|_, expires| *expires > now);
+        ips.contains_key(&address)
     }
 
     fn insert(&self, key: FlowKey, disposition: Disposition) {
@@ -107,6 +124,9 @@ impl FlowTable {
     pub(crate) fn clear(&self) {
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
+        }
+        if let Ok(mut ips) = self.geo_direct_ips.write() {
+            ips.clear();
         }
     }
 
