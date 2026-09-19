@@ -405,6 +405,9 @@ impl Library {
                     Ok(()) => {
                         let retry = unsafe { (self.open)(filter.as_ptr(), layer, priority, flags) };
                         if retry != INVALID_HANDLE_VALUE {
+                            eprintln!(
+                                "MOUSEVPN_DIVERT_RECOVERY=WinDivert service repaired and handle reopened"
+                            );
                             return Ok(Handle {
                                 library: Arc::clone(self),
                                 handle: retry as usize,
