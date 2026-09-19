@@ -835,7 +835,7 @@ fn repair_driver_service() -> Result<(), ClientError> {
         OpenServiceW(
             manager,
             service_name.as_ptr(),
-            SERVICE_CHANGE_CONFIG | SERVICE_START,
+            SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS,
         )
     };
     if service.is_null() {
