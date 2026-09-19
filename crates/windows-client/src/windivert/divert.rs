@@ -12,6 +12,7 @@ use std::{
 
 use super::{
     flow::{Disposition, FlowKey, FlowTable},
+    geo::GeoRouter,
     packet::{Packet, PROTOCOL_TCP, PROTOCOL_UDP},
     Address, Handle, Library, BATCH_MAX, LAYER_NETWORK, MTU_MAX,
 };
@@ -188,8 +189,9 @@ pub(crate) enum Outcome {
 pub(crate) struct Translation {
     pub(crate) physical: IpAddr,
     pub(crate) tunnel: IpAddr,
-    /// The resolver the session provides. Traffic to it always takes the
-    /// tunnel, whichever process sent it.
+    /// The resolver value is retained for wire compatibility with the
+    /// translation object, but Windows DNS is deliberately never changed and
+    /// DNS packets are always left on the physical link.
     pub(crate) resolver: IpAddr,
     /// The largest TCP segment the tunnel can carry, clamped into the
     /// handshake of every routed connection.
@@ -276,6 +278,7 @@ pub(crate) fn prepare_outbound(
     bytes: &mut [u8],
     table: &FlowTable,
     translation: Translation,
+    geo: Option<&GeoRouter>,
 ) -> Outcome {
     let Some(mut packet) = Packet::parse(bytes) else {
         return Outcome::PassThrough;
@@ -293,14 +296,24 @@ pub(crate) fn prepare_outbound(
         remote: packet.destination(),
         remote_port: destination_port,
     };
-    // Name resolution is the one thing that cannot follow the per-application
-    // policy. Windows resolves through a shared service, so a query carries no
-    // trace of which application wanted the name, and the session's resolver
-    // only exists at the far end of the tunnel: sent any other way the query
-    // would be routed at an address that does not answer. Every application
-    // therefore resolves through the tunnel, including excluded ones.
-    let resolving = packet.destination() == translation.resolver && destination_port == DNS_PORT;
-    if !resolving && table.lookup(&key) != Some(Disposition::Tunnel) {
+    // MouseVPN deliberately never changes Windows DNS configuration. DNS must
+    // therefore continue to use whatever resolver Windows already has, rather
+    // than being redirected to SessionParameters::dns.
+    if destination_port == DNS_PORT {
+        return Outcome::PassThrough;
+    }
+
+    // Geo-direct is decided from the destination IP before the connection is
+    // rewritten. DNS-derived entries are learned by the sniff-only watcher,
+    // which means a domain that resolves to a foreign CDN can still bypass the
+    // VPN without guessing from a later TLS SNI packet.
+    if let Some(geo) = geo {
+        if geo.is_direct_ip(packet.destination()) || table.is_geo_direct_ip(packet.destination()) {
+            return Outcome::PassThrough;
+        }
+    }
+
+    if table.lookup(&key) != Some(Disposition::Tunnel) {
         return Outcome::PassThrough;
     }
     // The application bound to the physical address, but the server only
@@ -349,6 +362,7 @@ pub(crate) struct Diverter {
     handle: Arc<Handle>,
     table: Arc<FlowTable>,
     translation: Arc<RwLock<Translation>>,
+    geo: Option<GeoRouter>,
 }
 
 impl Diverter {
@@ -363,6 +377,7 @@ impl Diverter {
         table: Arc<FlowTable>,
         translation: Arc<RwLock<Translation>>,
         server: SocketAddr,
+        geo: Option<GeoRouter>,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
         // and nothing here depends on winning against another filter.
@@ -374,6 +389,7 @@ impl Diverter {
             handle,
             table,
             translation,
+            geo,
         })
     }
 
@@ -446,7 +462,7 @@ impl Diverter {
                 let end = offset.saturating_add(length).min(bytes);
                 let packet = &mut buffer[start..end];
                 offset = end;
-                match prepare_outbound(packet, &self.table, translation) {
+                match prepare_outbound(packet, &self.table, translation, self.geo.as_ref()) {
                     Outcome::PassThrough => {
                         stats.passed = stats.passed.saturating_add(1);
                         // Captured but unmodified, so the checksums the stack
@@ -600,7 +616,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let table = table_with(Disposition::Tunnel);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), None),
             Outcome::Tunnel
         );
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
@@ -615,7 +631,7 @@ mod tests {
         let original = packet.clone();
         let table = table_with(Disposition::Direct);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), None),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
