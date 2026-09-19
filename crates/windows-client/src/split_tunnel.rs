@@ -15,8 +15,6 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::Datagram;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
-use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-
 use crate::{
     diagnostics::{Diagnostics, SendCounters},
     handshake::connect,
@@ -67,7 +65,6 @@ pub fn run_split_tunnel(
 
     // Shared rather than copied: a reconnect can change the tunnel address,
     // the MTU, and, if the machine moved networks, the physical address too.
-    let route = netcfg::default_ipv4_route(None)?;
     let translation = Arc::new(RwLock::new(Translation::new(
         IpAddr::V4(network::physical_addresses()?.ipv4),
         IpAddr::V4(parameters.client_address),
