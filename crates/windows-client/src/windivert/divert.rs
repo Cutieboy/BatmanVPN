@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
         // The destination and ports must survive untouched.
         assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
-        assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x00, 0x35]);
+        assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x01, 0xbb]);
     }
 
     #[test]
@@ -765,7 +765,7 @@ mod tests {
                 local: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 local_port: 54_518,
                 remote: IpAddr::V6(Ipv6Addr::LOCALHOST),
-                remote_port: 53,
+                remote_port: 443,
             },
             Disposition::Tunnel,
         );
