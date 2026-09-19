@@ -560,7 +560,7 @@ mod tests {
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
         packet[20..22].copy_from_slice(&54_518_u16.to_be_bytes());
-        packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         packet
     }
 
@@ -572,7 +572,7 @@ mod tests {
                 local: PHYSICAL,
                 local_port: 54_518,
                 remote: REMOTE,
-                remote_port: 53,
+                remote_port: 443,
             },
             disposition,
         );
