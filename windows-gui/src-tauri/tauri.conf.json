@@ -29,7 +29,8 @@
       "msi"
     ],
     "icon": [
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.ico"
     ],
     "category": "Utility",
     "shortDescription": "Fast private BatmanVPN client",
