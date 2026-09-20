@@ -89,7 +89,14 @@ impl FlowTable {
 
     fn insert(&self, key: FlowKey, disposition: Disposition) {
         if let Ok(mut entries) = self.entries.write() {
-            entries.insert(key, disposition);
+            // The same 5-tuple can be reported more than once by WinDivert's
+            // socket and flow layers, and those events can carry different
+            // process attribution. Once an attributed decision exists, a later
+            // event must not silently replace it with a different policy result.
+            //
+            // In particular, an already-routed connection must not flip back
+            // to Direct merely because another observer reports the tuple.
+            entries.entry(key).or_insert(disposition);
         }
     }
 
