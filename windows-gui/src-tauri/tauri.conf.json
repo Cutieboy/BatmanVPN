@@ -38,6 +38,9 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
         "silent": true
+      },
+      "nsis": {
+        "installerHooks": "migrate-mousevpn-installer.nsh"
       }
     }
   }
