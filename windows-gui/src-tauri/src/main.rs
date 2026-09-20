@@ -204,6 +204,15 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
     if enabled {
         let executable = std::env::current_exe().map_err(display_error)?;
         let task_command = autostart_command(&executable);
+
+        let mut legacy_delete = Command::new("schtasks.exe");
+        legacy_delete.creation_flags(CREATE_NO_WINDOW);
+        let _ = legacy_delete
+            .args(["/Delete", "/TN", LEGACY_AUTOSTART_TASK_NAME, "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
         command.args([
             "/Create",
             "/TN",
