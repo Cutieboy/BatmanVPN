@@ -10,8 +10,8 @@
     "windows": [
       {
         "title": "BatmanVPN for Windows",
-        "width": 960,
-        "height": 640,
+        "width": 920,
+        "height": 620,
         "minWidth": 900,
         "minHeight": 600,
         "center": true,
@@ -29,7 +29,7 @@
       "msi"
     ],
     "icon": [
-      "icons/icon.png"
+      "icons/icon.svg"
     ],
     "category": "Utility",
     "shortDescription": "Fast private BatmanVPN client",
