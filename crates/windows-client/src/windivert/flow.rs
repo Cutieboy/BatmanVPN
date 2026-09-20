@@ -788,6 +788,14 @@ mod tests {
     }
 
     #[test]
+    fn a_later_attributed_event_never_overwrites_the_first_decision() {
+        let table = FlowTable::default();
+        table.insert(key(), Disposition::Tunnel);
+        table.insert(key(), Disposition::Direct);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
+    }
+
+    #[test]
     fn an_unattributed_event_still_seeds_an_unknown_flow() {
         let table = FlowTable::default();
         table.insert_unattributed(key(), Disposition::Tunnel);
