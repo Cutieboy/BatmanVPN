@@ -14,3 +14,11 @@
     ${EndIf}
   ${EndIf}
 !macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; The old MouseVPN uninstall entry can survive an in-place install because
+  ; BatmanVPN and MouseVPN use the same installation directory. Remove only
+  ; the stale registry entry; the actual files and BatmanVPN uninstall entry
+  ; are already owned by the new installation.
+  DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MouseVPN"
+!macroend
