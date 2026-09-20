@@ -311,33 +311,6 @@ pub(crate) fn prepare_outbound(
         geo.is_direct_ip(packet.destination()) || table.is_geo_direct_ip(packet.destination())
     });
 
-    // Temporary targeted routing diagnostics for the ChatGPT/Cloudflare
-    // destinations seen during split-tunnel troubleshooting. Keep this scoped
-    // to the observed addresses so normal packet processing is not flooded.
-    let route_diag = match packet.destination() {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            (octets[0] == 8
-                && ((octets[1] == 6 && octets[2] == 112)
-                    || (octets[1] == 47 && octets[2] == 69)))
-                || address == std::net::Ipv4Addr::new(104, 18, 32, 47)
-                || address == std::net::Ipv4Addr::new(172, 64, 155, 209)
-        }
-        IpAddr::V6(_) => false,
-    };
-
-    if route_diag {
-        let disposition = table.lookup(&key);
-        eprintln!(
-            "MOUSEVPN_ROUTE_DIAG=dst={} proto={} dport={} geo_direct={} flow_disposition={:?}",
-            packet.destination(),
-            packet.protocol(),
-            destination_port,
-            geo_direct,
-            disposition
-        );
-    }
-
     if geo_direct {
         return Outcome::PassThrough;
     }
