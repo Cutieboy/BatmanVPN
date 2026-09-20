@@ -27,7 +27,9 @@ mod tray;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
-const AUTOSTART_TASK_NAME: &str = "MouseVPN";
+const AUTOSTART_TASK_NAME: &str = "BatmanVPN";
+#[cfg(windows)]
+const LEGACY_AUTOSTART_TASK_NAME: &str = "MouseVPN";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,15 +172,21 @@ fn set_installed_app_selection(
 #[tauri::command]
 #[cfg(windows)]
 fn autostart_enabled() -> Result<bool, String> {
-    let mut command = Command::new("schtasks.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .args(["/Query", "/TN", AUTOSTART_TASK_NAME])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(display_error)
+    for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
+        let mut command = Command::new("schtasks.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let exists = command
+            .args(["/Query", "/TN", task_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(display_error)?
+            .success();
+        if exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -212,7 +220,16 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
         if !autostart_enabled()? {
             return Ok(false);
         }
-        command.args(["/Delete", "/TN", AUTOSTART_TASK_NAME, "/F"]);
+        for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
+            let mut delete = Command::new("schtasks.exe");
+            delete.creation_flags(CREATE_NO_WINDOW);
+            let _ = delete
+                .args(["/Delete", "/TN", task_name, "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        return Ok(false);
     }
     let output = command.output().map_err(display_error)?;
     if !output.status.success() {
@@ -375,7 +392,7 @@ pub(crate) fn tray_toggle(state: &AppState) -> Result<(), String> {
         _ => profiles::list()?
             .first()
             .map(|profile| profile.id().to_owned())
-            .ok_or_else(|| "Сначала добавьте профиль в окне MouseVPN".to_owned())?,
+            .ok_or_else(|| "Сначала добавьте профиль в окне BatmanVPN".to_owned())?,
     };
     connect_profile_inner(id, state).map(|_| ())
 }
