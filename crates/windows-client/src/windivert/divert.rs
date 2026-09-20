@@ -307,10 +307,38 @@ pub(crate) fn prepare_outbound(
     // rewritten. DNS-derived entries are learned by the sniff-only watcher,
     // which means a domain that resolves to a foreign CDN can still bypass the
     // VPN without guessing from a later TLS SNI packet.
-    if let Some(geo) = geo {
-        if geo.is_direct_ip(packet.destination()) || table.is_geo_direct_ip(packet.destination()) {
-            return Outcome::PassThrough;
-        }
+    let geo_direct = geo.is_some_and(|geo| {
+        geo.is_direct_ip(packet.destination()) || table.is_geo_direct_ip(packet.destination())
+    });
+
+    // Temporary targeted routing diagnostics for the ChatGPT/Cloudflare
+    // destinations seen during split-tunnel troubleshooting. Keep this scoped
+    // to the observed addresses so normal packet processing is not flooded.
+    if matches!(
+        packet.destination(),
+        IpAddr::V4(address)
+            if address.octets()[0] == 8
+                && ((address.octets()[1] == 6 && address.octets()[2] == 112)
+                    || (address.octets()[1] == 47 && address.octets()[2] == 69))
+    ) || matches!(
+        packet.destination(),
+        IpAddr::V4(address)
+            if address == IpAddr::V4(std::net::Ipv4Addr::new(104, 18, 32, 47))
+                || address == IpAddr::V4(std::net::Ipv4Addr::new(172, 64, 155, 209))
+    ) {
+        let disposition = table.lookup(&key);
+        eprintln!(
+            "MOUSEVPN_ROUTE_DIAG=dst={} proto={} dport={} geo_direct={} flow_disposition={:?}",
+            packet.destination(),
+            packet.protocol(),
+            destination_port,
+            geo_direct,
+            disposition
+        );
+    }
+
+    if geo_direct {
+        return Outcome::PassThrough;
     }
 
     if table.lookup(&key) != Some(Disposition::Tunnel) {
