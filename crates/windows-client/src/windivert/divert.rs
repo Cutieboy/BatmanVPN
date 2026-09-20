@@ -267,6 +267,24 @@ fn filter(server: SocketAddr) -> String {
     )
 }
 
+/// Returns whether an address belongs to a private/local network that must
+/// remain on the physical interface instead of entering VPN transformation.
+fn is_local_network(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, ..] = address.octets();
+            (a == 10)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 169 && b == 254)
+        }
+        IpAddr::V6(address) => {
+            let first = address.octets()[0];
+            (first & 0xfe) == 0xfc || (first & 0xc0) == 0x80
+        }
+    }
+}
+
 /// Rewrites a captured outbound packet when it belongs in the tunnel.
 ///
 /// Returns [`Outcome::PassThrough`] for anything not positively identified as
@@ -300,6 +318,18 @@ pub(crate) fn prepare_outbound(
     // therefore continue to use whatever resolver Windows already has, rather
     // than being redirected to SessionParameters::dns.
     if destination_port == DNS_PORT {
+        return Outcome::PassThrough;
+    }
+
+    // Directly connected/private networks must never be fed into the VPN
+    // transformation path. In per-application mode the process classifier
+    // intentionally treats unlisted traffic as Tunnel when the user selected
+    // "Exclude", which is correct for Internet traffic but wrong for a LAN
+    // destination. A LAN peer such as an SMB server can therefore complete
+    // the TCP handshake and then lose subsequent packets after WinDivert
+    // rewrites them. Keep RFC1918, IPv4 link-local, IPv6 ULA and IPv6 link-local
+    // traffic byte-for-byte on the physical link.
+    if is_local_network(packet.destination()) {
         return Outcome::PassThrough;
     }
 
@@ -536,7 +566,9 @@ impl Diverter {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter, prepare_inbound, prepare_outbound, Address, Outcome, Translation};
+    use super::{
+        filter, is_local_network, prepare_inbound, prepare_outbound, Address, Outcome, Translation,
+    };
     use crate::windivert::{
         flow::{Disposition, FlowKey, FlowTable},
         packet::PROTOCOL_UDP,
@@ -625,6 +657,51 @@ mod tests {
         // The destination and ports must survive untouched.
         assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
         assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x01, 0xbb]);
+    }
+
+    #[test]
+    fn bypasses_private_lan_even_when_the_flow_is_classified_for_tunnel() {
+        // SMB and other local services must stay on the physical interface
+        // even in denylist mode, where an otherwise-unlisted process is
+        // normally classified as Tunnel.
+        for destination in [
+            Ipv4Addr::new(192, 168, 1, 159),
+            Ipv4Addr::new(10, 10, 10, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+        ] {
+            assert!(is_local_network(IpAddr::V4(destination)));
+            let physical = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 136));
+            let mut packet = udp_packet(physical, IpAddr::V4(destination));
+            let original = packet.clone();
+            let table = FlowTable::default();
+            table.insert_for_test(
+                FlowKey {
+                    protocol: PROTOCOL_UDP,
+                    local: physical,
+                    local_port: 54_518,
+                    remote: IpAddr::V4(destination),
+                    remote_port: 443,
+                },
+                Disposition::Tunnel,
+            );
+            assert_eq!(
+                prepare_outbound(&mut packet, &table, addresses(), None),
+                Outcome::PassThrough,
+                "destination {destination}"
+            );
+            assert_eq!(packet, original);
+        }
+    }
+
+    #[test]
+    fn keeps_public_traffic_tunnelled_when_the_flow_is_classified() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = table_with(Disposition::Tunnel);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
     }
 
     #[test]
