@@ -12,10 +12,16 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, HANDLE},
-    System::Threading::{
-        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+    Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        Threading::{
+            GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
 };
 
@@ -54,6 +60,8 @@ pub(crate) enum Disposition {
 #[derive(Default)]
 pub(crate) struct FlowTable {
     entries: RwLock<HashMap<FlowKey, Disposition>>,
+    /// IPs learned from direct-domain DNS answers for the lifetime of their DNS TTL.
+    geo_direct_ips: RwLock<HashMap<IpAddr, std::time::Instant>>,
 }
 
 impl FlowTable {
@@ -64,9 +72,31 @@ impl FlowTable {
             .and_then(|entries| entries.get(key).copied())
     }
 
+    pub(crate) fn route_direct_ip(&self, address: IpAddr, ttl: std::time::Duration) {
+        if let Ok(mut ips) = self.geo_direct_ips.write() {
+            ips.insert(address, std::time::Instant::now() + ttl);
+        }
+    }
+
+    pub(crate) fn is_geo_direct_ip(&self, address: IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let Ok(mut ips) = self.geo_direct_ips.write() else {
+            return false;
+        };
+        ips.retain(|_, expires| *expires > now);
+        ips.contains_key(&address)
+    }
+
     fn insert(&self, key: FlowKey, disposition: Disposition) {
         if let Ok(mut entries) = self.entries.write() {
-            entries.insert(key, disposition);
+            // The same 5-tuple can be reported more than once by WinDivert's
+            // socket and flow layers, and those events can carry different
+            // process attribution. Once an attributed decision exists, a later
+            // event must not silently replace it with a different policy result.
+            //
+            // In particular, an already-routed connection must not flip back
+            // to Direct merely because another observer reports the tuple.
+            entries.entry(key).or_insert(disposition);
         }
     }
 
@@ -101,6 +131,9 @@ impl FlowTable {
     pub(crate) fn clear(&self) {
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
+        }
+        if let Ok(mut ips) = self.geo_direct_ips.write() {
+            ips.clear();
         }
     }
 
@@ -457,10 +490,21 @@ impl Classifier {
                 return (*listed, true);
             }
         }
+
         let Some(path) = process.image_path() else {
             return (false, false);
         };
-        let listed = self.matches(&path);
+        // An excluded desktop application can delegate its network work to a
+        // helper process. Windhawk is a concrete example: its UI can launch a
+        // VSCodium/Node extension host which owns the actual HTTPS socket.
+        // Treat a descendant of an excluded application as excluded too, so
+        // the user's bypass follows the application rather than one executable
+        // image. The parent PID alone is not enough because Windows can reuse
+        // PIDs; require each parent to have been created no later than its
+        // child before accepting the ancestry.
+        let listed = self.matches(&path)
+            || self.matches_excluded_ancestor(process_id, created);
+
         if let Ok(mut cache) = self.cache.lock() {
             // Dropping everything is cruder than evicting the coldest entry
             // and costs one re-query for the processes still running. Both are
@@ -474,6 +518,41 @@ impl Classifier {
         (listed, true)
     }
 
+    fn matches_excluded_ancestor(&self, process_id: u32, child_created: u64) -> bool {
+        let Some(snapshot) = ProcessSnapshot::new() else {
+            return false;
+        };
+        let mut current = process_id;
+        let mut child_time = child_created;
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(parent_id) = snapshot.parent_of(current) {
+            if parent_id == 0 || parent_id == current || !visited.insert(parent_id) {
+                return false;
+            }
+            let Some(parent) = Process::open(parent_id) else {
+                return false;
+            };
+            let Some(parent_created) = parent.created() else {
+                return false;
+            };
+            // A reused parent PID cannot be an ancestor when the replacement
+            // process started after the child.
+            if parent_created > child_time {
+                return false;
+            }
+            if parent
+                .image_path()
+                .is_some_and(|path| self.matches(&path))
+            {
+                return true;
+            }
+            current = parent_id;
+            child_time = parent_created;
+        }
+        false
+    }
+
     fn matches(&self, path: &Path) -> bool {
         self.apps
             .iter()
@@ -485,6 +564,54 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     left.as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+/// A point-in-time map of process IDs to their parent process IDs.
+///
+/// Tool Help exposes the parent PID in the same snapshot as the process list.
+/// Taking one snapshot per uncached classification keeps ancestry checks off the
+/// packet path while avoiding a separate process enumeration for every parent.
+struct ProcessSnapshot {
+    parents: std::collections::HashMap<u32, u32>,
+}
+
+impl ProcessSnapshot {
+    fn new() -> Option<Self> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut parents = std::collections::HashMap::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            cntUsage: 0,
+            th32ProcessID: 0,
+            th32DefaultHeapID: 0,
+            th32ModuleID: 0,
+            cntThreads: 0,
+            th32ParentProcessID: 0,
+            pcPriClassBase: 0,
+            dwFlags: 0,
+            szExeFile: [0; 260],
+        };
+        let first = unsafe { Process32FirstW(snapshot, &raw mut entry) };
+        if first == 0 {
+            unsafe { CloseHandle(snapshot) };
+            return None;
+        }
+        loop {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
+                break;
+            }
+        }
+        unsafe { CloseHandle(snapshot) };
+        Some(Self { parents })
+    }
+
+    fn parent_of(&self, process_id: u32) -> Option<u32> {
+        self.parents.get(&process_id).copied()
+    }
 }
 
 /// An open process handle, closed exactly once when it goes out of scope.
@@ -657,6 +784,14 @@ mod tests {
         let table = FlowTable::default();
         table.insert(key(), Disposition::Tunnel);
         table.insert_unattributed(key(), Disposition::Direct);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
+    }
+
+    #[test]
+    fn a_later_attributed_event_never_overwrites_the_first_decision() {
+        let table = FlowTable::default();
+        table.insert(key(), Disposition::Tunnel);
+        table.insert(key(), Disposition::Direct);
         assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
     }
 

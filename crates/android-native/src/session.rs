@@ -25,7 +25,8 @@ use nix::{
 
 use crate::socket_protector::SocketProtector;
 
-const POLL: Duration = Duration::from_millis(250);
+const NORMAL_POLL: Duration = Duration::from_secs(1);
+const DOZE_POLL: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
 /// Silence after which the session is treated as dead.
 ///
@@ -75,6 +76,8 @@ pub(crate) struct SpawnedSession {
     pub(crate) reconnect_requested: Arc<AtomicBool>,
     pub(crate) parameters_changed: Arc<AtomicBool>,
     pub(crate) wake: Arc<EventFd>,
+    pub(crate) dozing: Arc<AtomicBool>,
+    pub(crate) shutdown_transport: UdpTransport,
     pub(crate) metrics: Arc<SessionMetrics>,
     pub(crate) worker: thread::JoinHandle<()>,
 }
@@ -89,6 +92,7 @@ struct RunContext {
     reconnect_requested: Arc<AtomicBool>,
     parameters_changed: Arc<AtomicBool>,
     wake: Arc<EventFd>,
+    dozing: Arc<AtomicBool>,
     metrics: Arc<SessionMetrics>,
 }
 
@@ -116,6 +120,7 @@ struct OutgoingContext<'a> {
     session_stopping: &'a AtomicBool,
     wake: &'a EventFd,
     metrics: &'a SessionMetrics,
+    dozing: &'a AtomicBool,
 }
 
 pub(crate) fn spawn(
@@ -136,6 +141,8 @@ pub(crate) fn spawn(
     let reconnecting = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let parameters_changed = Arc::new(AtomicBool::new(false));
+    let dozing = Arc::new(AtomicBool::new(false));
+    let shutdown_transport = transport.try_clone()?;
     let wake = Arc::new(
         EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
             .context("failed to create session wake event")?,
@@ -151,6 +158,7 @@ pub(crate) fn spawn(
         reconnect_requested: Arc::clone(&reconnect_requested),
         parameters_changed: Arc::clone(&parameters_changed),
         wake: Arc::clone(&wake),
+        dozing: Arc::clone(&dozing),
         metrics: Arc::clone(&metrics),
     };
     let worker = thread::Builder::new()
@@ -166,6 +174,8 @@ pub(crate) fn spawn(
         reconnect_requested,
         parameters_changed,
         wake,
+        dozing,
+        shutdown_transport,
         metrics,
         worker,
     })
@@ -177,7 +187,7 @@ fn run(
     plane: TunnelDataPlane,
     context: &RunContext,
 ) -> Result<()> {
-    transport.set_read_timeout(Some(POLL))?;
+    transport.set_read_timeout(Some(if context.dozing.load(Ordering::Acquire) { DOZE_POLL } else { NORMAL_POLL }))?;
     let sending_tun = tun.try_clone()?;
     // The two directions share no mutable state; only reconnect swaps the
     // sender, so the send path is uncontended and the receive path is lock-free.
@@ -194,6 +204,7 @@ fn run(
     let outgoing_reconnect_requested = Arc::clone(&context.reconnect_requested);
     let outgoing_wake = Arc::clone(&context.wake);
     let session_stopping = Arc::clone(&context.stopping);
+    let outgoing_dozing = Arc::clone(&context.dozing);
     let packet_capacity = usize::from(context.parameters.mtu) + 128;
     let outgoing_metrics = Arc::clone(&context.metrics);
     let outgoing_wire = context.wire.clone();
@@ -209,6 +220,7 @@ fn run(
                 session_stopping: &session_stopping,
                 wake: &outgoing_wake,
                 metrics: &outgoing_metrics,
+                dozing: &outgoing_dozing,
             },
             packet_capacity,
         );
@@ -258,7 +270,13 @@ impl IncomingLoop<'_> {
         let mut keepalive = Vec::with_capacity(128);
         let mut wire_keepalive = Vec::with_capacity(MAX_WIRE_DATAGRAM_LEN);
         let mut udp_batch = UdpBatch::default();
+        let mut applied_dozing = self.context.dozing.load(Ordering::Acquire);
         while !self.context.stopping.load(Ordering::Relaxed) {
+            let dozing = self.context.dozing.load(Ordering::Acquire);
+            if dozing != applied_dozing {
+                self.transport.set_read_timeout(Some(if dozing { DOZE_POLL } else { NORMAL_POLL }))?;
+                applied_dozing = dozing;
+            }
             match self
                 .transport
                 .receive_batch_with(&mut packets, &mut lengths, &mut udp_batch)
@@ -284,11 +302,11 @@ impl IncomingLoop<'_> {
                 }
                 Err(error) => return Err(error.into()),
             }
-            if self.last_sent.elapsed() >= KEEPALIVE {
+            if !dozing && self.last_sent.elapsed() >= KEEPALIVE {
                 self.send_keepalive(&mut keepalive, &mut wire_keepalive)?;
             }
             self.update_reconnect_state();
-            if self.reconnect_needed && Instant::now() >= self.next_reconnect {
+            if !dozing && self.reconnect_needed && Instant::now() >= self.next_reconnect {
                 self.try_reconnect()?;
             }
         }
@@ -388,6 +406,9 @@ impl IncomingLoop<'_> {
     }
 
     fn update_reconnect_state(&mut self) {
+        if self.context.dozing.load(Ordering::Acquire) {
+            return;
+        }
         let now = Instant::now();
         if self
             .context
@@ -467,7 +488,7 @@ impl IncomingLoop<'_> {
         transport: UdpTransport,
         plane: TunnelDataPlane,
     ) -> Result<()> {
-        transport.set_read_timeout(Some(POLL))?;
+        transport.set_read_timeout(Some(if self.context.dozing.load(Ordering::Acquire) { DOZE_POLL } else { NORMAL_POLL }))?;
         let (sender, receiver) = plane.split();
         self.receiver = receiver;
         *self
@@ -511,6 +532,7 @@ fn send_outgoing(
             &tun,
             context.wake,
             !context.reconnecting.load(Ordering::Acquire),
+            if context.dozing.load(Ordering::Acquire) { DOZE_POLL } else { NORMAL_POLL },
         )?;
         if !tun_ready {
             continue;
@@ -609,7 +631,7 @@ fn record_outgoing_result(
     Ok(())
 }
 
-fn wait_for_tun(tun: &File, wake: &EventFd, include_tun: bool) -> Result<bool> {
+fn wait_for_tun(tun: &File, wake: &EventFd, include_tun: bool, timeout: Duration) -> Result<bool> {
     let tun_events = if include_tun {
         PollFlags::POLLIN
     } else {
@@ -619,7 +641,8 @@ fn wait_for_tun(tun: &File, wake: &EventFd, include_tun: bool) -> Result<bool> {
         PollFd::new(tun.as_fd(), tun_events),
         PollFd::new(wake.as_fd(), PollFlags::POLLIN),
     ];
-    poll(&mut descriptors, 250_u16).context("failed to poll TUN")?;
+    let timeout_ms = timeout.as_millis().min(u16::MAX as u128) as u16;
+    poll(&mut descriptors, timeout_ms).context("failed to poll TUN")?;
     let wake_ready = descriptors[1]
         .revents()
         .is_some_and(|events| events.contains(PollFlags::POLLIN));

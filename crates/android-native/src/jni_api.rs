@@ -12,7 +12,7 @@ use mousevpn_config::{ClientConfig, ClientProtocol};
 use crate::{
     handshake::{bind_socket, negotiate},
     registry::{
-        insert_pending, insert_running, metrics, network_changed, status, stop, take_pending,
+        insert_pending, insert_running, metrics, network_changed, set_dozing, status, stop,
         PendingSession,
     },
     session,
@@ -100,6 +100,7 @@ fn parse_protocol(value: &str) -> Result<ClientProtocol> {
         "morph_quiet" => Ok(ClientProtocol::MorphQuiet),
         "morph_balanced" => Ok(ClientProtocol::MorphBalanced),
         "morph_paranoid" => Ok(ClientProtocol::MorphParanoid),
+        "speedy" => Ok(ClientProtocol::Speedy),
         _ => Err(anyhow!("unsupported MouseVPN protocol mode: {value}")),
     }
 }
@@ -144,6 +145,16 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_networkChanged(
     handle: jlong,
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| network_changed(handle)));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_setDozing(
+    _env: JNIEnv,
+    _object: JObject,
+    handle: jlong,
+    dozing: jboolean,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| set_dozing(handle, dozing == JNI_TRUE)));
 }
 
 #[no_mangle]

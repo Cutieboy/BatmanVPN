@@ -27,7 +27,9 @@ mod tray;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
-const AUTOSTART_TASK_NAME: &str = "MouseVPN";
+const AUTOSTART_TASK_NAME: &str = "BatmanVPN";
+#[cfg(windows)]
+const LEGACY_AUTOSTART_TASK_NAME: &str = "MouseVPN";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,15 +172,21 @@ fn set_installed_app_selection(
 #[tauri::command]
 #[cfg(windows)]
 fn autostart_enabled() -> Result<bool, String> {
-    let mut command = Command::new("schtasks.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .args(["/Query", "/TN", AUTOSTART_TASK_NAME])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(display_error)
+    for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
+        let mut command = Command::new("schtasks.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let exists = command
+            .args(["/Query", "/TN", task_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(display_error)?
+            .success();
+        if exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -196,6 +204,15 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
     if enabled {
         let executable = std::env::current_exe().map_err(display_error)?;
         let task_command = autostart_command(&executable);
+
+        let mut legacy_delete = Command::new("schtasks.exe");
+        legacy_delete.creation_flags(CREATE_NO_WINDOW);
+        let _ = legacy_delete
+            .args(["/Delete", "/TN", LEGACY_AUTOSTART_TASK_NAME, "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
         command.args([
             "/Create",
             "/TN",
@@ -204,8 +221,6 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
             "ONLOGON",
             "/RL",
             "HIGHEST",
-            "/DELAY",
-            "0000:10",
             "/TR",
             &task_command,
             "/F",
@@ -214,7 +229,16 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
         if !autostart_enabled()? {
             return Ok(false);
         }
-        command.args(["/Delete", "/TN", AUTOSTART_TASK_NAME, "/F"]);
+        for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
+            let mut delete = Command::new("schtasks.exe");
+            delete.creation_flags(CREATE_NO_WINDOW);
+            let _ = delete
+                .args(["/Delete", "/TN", task_name, "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        return Ok(false);
     }
     let output = command.output().map_err(display_error)?;
     if !output.status.success() {
@@ -237,7 +261,19 @@ fn set_autostart(_enabled: bool) -> Result<bool, String> {
 
 #[cfg(any(windows, test))]
 fn autostart_command(executable: &Path) -> String {
-    format!("\"{}\" --minimized", executable.display())
+    format!("\"{}\" --minimized --autoconnect", executable.display())
+}
+
+fn autoconnect_first_profile(state: &AppState) {
+    let Ok(profiles) = profiles::list() else {
+        return;
+    };
+    let Some(profile) = profiles.first() else {
+        return;
+    };
+    if let Err(error) = connect_profile_inner(profile.id().to_owned(), state) {
+        set_tray_error(state, error);
+    }
 }
 
 #[tauri::command]
@@ -365,7 +401,7 @@ pub(crate) fn tray_toggle(state: &AppState) -> Result<(), String> {
         _ => profiles::list()?
             .first()
             .map(|profile| profile.id().to_owned())
-            .ok_or_else(|| "Сначала добавьте профиль в окне MouseVPN".to_owned())?,
+            .ok_or_else(|| "Сначала добавьте профиль в окне BatmanVPN".to_owned())?,
     };
     connect_profile_inner(id, state).map(|_| ())
 }
@@ -538,7 +574,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn run_gui(minimized: bool) {
+fn run_gui(minimized: bool, autoconnect: bool) {
     let builder = tauri::Builder::default();
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(
@@ -557,6 +593,12 @@ fn run_gui(minimized: bool) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+            if autostart_enabled().unwrap_or(false) {
+                let _ = set_autostart(true);
+            }
+            if autoconnect {
+                autoconnect_first_profile(app.state::<AppState>().inner());
             }
             Ok(())
         })
@@ -649,8 +691,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        [_, minimized] if minimized == "--minimized" => run_gui(true),
-        _ => run_gui(false),
+        [_, minimized, autoconnect]
+            if minimized == "--minimized" && autoconnect == "--autoconnect" =>
+            run_gui(true, true),
+        [_, minimized] if minimized == "--minimized" => run_gui(true, false),
+        _ => run_gui(false, false),
     }
 }
 
@@ -682,7 +727,7 @@ mod helper_status_tests {
             autostart_command(std::path::Path::new(
                 r"C:\Program Files\MouseVPN\MouseVPN.exe"
             )),
-            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized"#
+            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized --autoconnect"#
         );
     }
 

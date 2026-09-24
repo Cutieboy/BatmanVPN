@@ -1,9 +1,25 @@
 package dev.mousevpn.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TunnelMtuPolicyTest {
+    @Test
+    fun protocolModesMarkMorphEnvelopeCorrectly() {
+        assertTrue(VpnProtocol.MORPH_BALANCED.usesMorph)
+        assertFalse(VpnProtocol.SPEEDY.usesMorph)
+    }
+
+    @Test
+    fun protocolModesMarkMorphEnvelopeCorrectly() {
+        assertTrue(VpnProtocol.MORPH_BALANCED.usesMorph)
+        assertFalse(VpnProtocol.SPEEDY.usesMorph)
+    }
+
     @Test
     fun normalLinksKeepTheNegotiatedMtu() {
         assertEquals(1420, calculateTunnelMtu(1420, 1500, false))

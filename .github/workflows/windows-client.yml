@@ -1,0 +1,54 @@
+name: Windows client
+
+on:
+  push:
+    paths:
+      - "crates/windows-client/**"
+      - "crates/client-core/**"
+      - "crates/client-wire/**"
+      - "crates/config/**"
+      - "crates/crypto/**"
+      - "crates/data-plane/**"
+      - "crates/protocol/**"
+      - "crates/transport/**"
+      - "windows-gui/**"
+      - "linux-gui/ui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/windows-client.yml"
+  pull_request:
+    paths:
+      - "crates/windows-client/**"
+      - "crates/client-core/**"
+      - "crates/client-wire/**"
+      - "crates/config/**"
+      - "crates/crypto/**"
+      - "crates/data-plane/**"
+      - "crates/protocol/**"
+      - "crates/transport/**"
+      - "windows-gui/**"
+      - "linux-gui/ui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/windows-client.yml"
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Windows client
+        run: cargo check -p mousevpn-windows-client --locked
+
+      - name: Test Windows client
+        run: cargo test -p mousevpn-windows-client --locked
+
+      - name: Check Windows GUI
+        run: cargo check -p mousevpn-windows-gui --locked
+
+      - name: Test Windows GUI
+        run: cargo test -p mousevpn-windows-gui --locked

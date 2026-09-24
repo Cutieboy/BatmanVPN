@@ -1,6 +1,6 @@
 {
-  "productName": "MouseVPN",
-  "version": "0.1.17",
+  "productName": "BatmanVPN",
+  "version": "0.1.18",
   "identifier": "dev.mousevpn.windows",
   "build": {
     "frontendDist": "../../linux-gui/ui"
@@ -9,11 +9,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "MouseVPN for Windows",
-        "width": 1120,
-        "height": 720,
+        "title": "BatmanVPN for Windows",
+        "width": 920,
+        "height": 620,
         "minWidth": 900,
-        "minHeight": 620,
+        "minHeight": 600,
         "center": true,
         "resizable": true
       }
@@ -24,15 +24,24 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
-    "icon": ["icons/icon.ico"],
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "category": "Utility",
-    "shortDescription": "Fast private MouseVPN client",
-    "longDescription": "MouseVPN desktop client for Windows",
+    "shortDescription": "Fast private BatmanVPN client",
+    "longDescription": "BatmanVPN desktop client for Windows",
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
         "silent": true
+      },
+      "nsis": {
+        "installerHooks": "migrate-mousevpn-installer.nsh"
       }
     }
   }

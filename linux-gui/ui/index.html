@@ -3,17 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MouseVPN</title>
+    <title>BatmanVPN</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
         <header class="brand">
-          <img src="logo.png" alt="" />
+          <svg class="brand-mark" viewBox="0 0 128 128" aria-hidden="true">
+  <rect width="128" height="128" rx="28" fill="#080808"/>
+  <path fill="#FFD400" d="M10 48 25 30 42 42 64 20l22 22 17-12 15 18-10 25-18-10-10 20-16-13-16 13-10-20-18 10z"/>
+  <path fill="#080808" d="M18 51 31 42l14 9 19-17 19 17 14-9 13 9-10 8-17 2-19 10-19-10-17-2z"/>
+  <path fill="#FFD400" d="m58 48 6-10 6 10v22l-6 13-6-13z"/>
+  <path fill="#FFD400" d="m58 39 3-9 3 9 3-9 3 9z"/>
+</svg>
           <div>
-            <h1>MouseVPN</h1>
-            <span>Linux Client</span>
+            <h1>Batman<span class="brand-accent">VPN</span></h1>
+            <span>Windows Client</span>
           </div>
         </header>
 
@@ -44,8 +50,8 @@
           <input id="autostartEnabled" type="checkbox" />
           <span class="autostart-switch" aria-hidden="true"></span>
           <span class="button-copy">
-            <strong>Запускать вместе с Windows</strong>
-            <small>Свёрнуто в системный трей</small>
+            <strong>Запускать и подключать VPN</strong>
+            <small>При входе в Windows — сразу подключается к VPN</small>
           </span>
         </label>
 
@@ -90,7 +96,7 @@
           <div class="protocol-copy">
             <span class="eyebrow">ПРОТОКОЛ</span>
             <strong>Режим маскировки</strong>
-            <small id="protocolHint">Обычный MouseVPN для старых клиентов</small>
+            <small id="protocolHint">Обычный BatmanVPN для старых клиентов</small>
           </div>
           <label class="protocol-select-label" for="protocolMode">
             <select id="protocolMode" aria-label="Режим маскировки">
@@ -223,7 +229,7 @@
           </div>
           <button id="closeInstalledApps" type="button" class="close-button" aria-label="Закрыть">×</button>
         </div>
-        <p class="modal-description">Программы из меню «Пуск» и Microsoft Store. Для Store-приложений MouseVPN сам найдёт защищённую папку WindowsApps.</p>
+        <p class="modal-description">Программы из меню «Пуск» и Microsoft Store. Для Store-приложений BatmanVPN сам найдёт защищённую папку WindowsApps.</p>
         <div class="installed-apps-tools">
           <input id="installedAppsSearch" type="search" placeholder="Claude, ChatGPT, Telegram…" aria-label="Поиск установленных приложений" />
           <span id="installedAppsSelectionCount" class="selection-count">Выбрано: 0</span>

@@ -71,6 +71,16 @@ pub(crate) fn insert_running(handle: i64, session: SpawnedSession) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn set_dozing(handle: i64, dozing: bool) {
+    let Ok(map) = registry().lock() else {
+        return;
+    };
+    if let Some(Entry::Running(session)) = map.get(&handle) {
+        session.dozing.store(dozing, Ordering::Release);
+        crate::session::signal(&session.wake);
+    }
+}
+
 pub(crate) fn network_changed(handle: i64) {
     let Ok(map) = registry().lock() else {
         return;

@@ -35,7 +35,6 @@ const ERROR_SUCCESS: u32 = 0;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NOT_FOUND: u32 = 1168;
 const ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How long to let Windows attach IPv4 to a newly created tunnel interface.
 const INTERFACE_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -507,58 +506,13 @@ pub(crate) fn remove_owned_routes(
 /// # Errors
 ///
 /// Returns an error when netsh rejects the change.
-pub(crate) fn set_tunnel_dns(alias: &str, server: Ipv4Addr) -> Result<(), ClientError> {
-    run_netsh(
-        &[
-            "interface",
-            "ipv4",
-            "set",
-            "dnsservers",
-            &format!("name={alias}"),
-            "source=static",
-            &format!("address={server}"),
-            "register=none",
-            "validate=no",
-        ],
-        "set the MouseVPN DNS server",
-    )
-}
 
 /// Hands DNS on the tunnel interface back to DHCP.
 ///
 /// # Errors
 ///
 /// Returns an error when netsh rejects the change.
-pub(crate) fn reset_tunnel_dns(alias: &str) -> Result<(), ClientError> {
-    run_netsh(
-        &[
-            "interface",
-            "ipv4",
-            "set",
-            "dnsservers",
-            &format!("name={alias}"),
-            "source=dhcp",
-            "register=none",
-            "validate=no",
-        ],
-        "restore the DNS configuration",
-    )
-}
 
-fn run_netsh(arguments: &[&str], operation: &str) -> Result<(), ClientError> {
-    let mut command = Command::new("netsh.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    let output = command.args(arguments).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let details = if stderr.is_empty() { stdout } else { stderr };
-    Err(ClientError::Platform(format!(
-        "failed to {operation}: {details}"
-    )))
-}
 
 unsafe fn owned_route(row: &MIB_IPFORWARD_ROW2) -> OwnedRoute {
     OwnedRoute {

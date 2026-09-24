@@ -11,14 +11,14 @@ const TOGGLE: &str = "toggle";
 const QUIT: &str = "quit";
 
 pub(crate) fn install(app: &mut tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, SHOW, "Открыть MouseVPN", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, SHOW, "Открыть BatmanVPN", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, TOGGLE, "Подключить / отключить", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, QUIT, "Выйти", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &toggle, &separator, &quit])?;
 
     let mut tray = TrayIconBuilder::new()
-        .tooltip("MouseVPN")
+        .tooltip("BatmanVPN")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {

@@ -12,6 +12,7 @@ use std::{
 
 use super::{
     flow::{Disposition, FlowKey, FlowTable},
+    geo::GeoRouter,
     packet::{Packet, PROTOCOL_TCP, PROTOCOL_UDP},
     Address, Handle, Library, BATCH_MAX, LAYER_NETWORK, MTU_MAX,
 };
@@ -188,8 +189,9 @@ pub(crate) enum Outcome {
 pub(crate) struct Translation {
     pub(crate) physical: IpAddr,
     pub(crate) tunnel: IpAddr,
-    /// The resolver the session provides. Traffic to it always takes the
-    /// tunnel, whichever process sent it.
+    /// The resolver value is retained for wire compatibility with the
+    /// translation object, but Windows DNS is deliberately never changed and
+    /// DNS packets are always left on the physical link.
     pub(crate) resolver: IpAddr,
     /// The largest TCP segment the tunnel can carry, clamped into the
     /// handshake of every routed connection.
@@ -265,6 +267,24 @@ fn filter(server: SocketAddr) -> String {
     )
 }
 
+/// Returns whether an address belongs to a private/local network that must
+/// remain on the physical interface instead of entering VPN transformation.
+fn is_local_network(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, ..] = address.octets();
+            (a == 10)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 169 && b == 254)
+        }
+        IpAddr::V6(address) => {
+            let first = address.octets()[0];
+            (first & 0xfe) == 0xfc || (first & 0xc0) == 0x80
+        }
+    }
+}
+
 /// Rewrites a captured outbound packet when it belongs in the tunnel.
 ///
 /// Returns [`Outcome::PassThrough`] for anything not positively identified as
@@ -276,6 +296,7 @@ pub(crate) fn prepare_outbound(
     bytes: &mut [u8],
     table: &FlowTable,
     translation: Translation,
+    geo: Option<&GeoRouter>,
 ) -> Outcome {
     let Some(mut packet) = Packet::parse(bytes) else {
         return Outcome::PassThrough;
@@ -293,14 +314,38 @@ pub(crate) fn prepare_outbound(
         remote: packet.destination(),
         remote_port: destination_port,
     };
-    // Name resolution is the one thing that cannot follow the per-application
-    // policy. Windows resolves through a shared service, so a query carries no
-    // trace of which application wanted the name, and the session's resolver
-    // only exists at the far end of the tunnel: sent any other way the query
-    // would be routed at an address that does not answer. Every application
-    // therefore resolves through the tunnel, including excluded ones.
-    let resolving = packet.destination() == translation.resolver && destination_port == DNS_PORT;
-    if !resolving && table.lookup(&key) != Some(Disposition::Tunnel) {
+    // MouseVPN deliberately never changes Windows DNS configuration. DNS must
+    // therefore continue to use whatever resolver Windows already has, rather
+    // than being redirected to SessionParameters::dns.
+    if destination_port == DNS_PORT {
+        return Outcome::PassThrough;
+    }
+
+    // Directly connected/private networks must never be fed into the VPN
+    // transformation path. In per-application mode the process classifier
+    // intentionally treats unlisted traffic as Tunnel when the user selected
+    // "Exclude", which is correct for Internet traffic but wrong for a LAN
+    // destination. A LAN peer such as an SMB server can therefore complete
+    // the TCP handshake and then lose subsequent packets after WinDivert
+    // rewrites them. Keep RFC1918, IPv4 link-local, IPv6 ULA and IPv6 link-local
+    // traffic byte-for-byte on the physical link.
+    if is_local_network(packet.destination()) {
+        return Outcome::PassThrough;
+    }
+
+    // Geo-direct is decided from the destination IP before the connection is
+    // rewritten. DNS-derived entries are learned by the sniff-only watcher,
+    // which means a domain that resolves to a foreign CDN can still bypass the
+    // VPN without guessing from a later TLS SNI packet.
+    let geo_direct = geo.is_some_and(|geo| {
+        geo.is_direct_ip(packet.destination()) || table.is_geo_direct_ip(packet.destination())
+    });
+
+    if geo_direct {
+        return Outcome::PassThrough;
+    }
+
+    if table.lookup(&key) != Some(Disposition::Tunnel) {
         return Outcome::PassThrough;
     }
     // The application bound to the physical address, but the server only
@@ -349,6 +394,7 @@ pub(crate) struct Diverter {
     handle: Arc<Handle>,
     table: Arc<FlowTable>,
     translation: Arc<RwLock<Translation>>,
+    geo: Option<GeoRouter>,
 }
 
 impl Diverter {
@@ -363,6 +409,7 @@ impl Diverter {
         table: Arc<FlowTable>,
         translation: Arc<RwLock<Translation>>,
         server: SocketAddr,
+        geo: Option<GeoRouter>,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
         // and nothing here depends on winning against another filter.
@@ -374,6 +421,7 @@ impl Diverter {
             handle,
             table,
             translation,
+            geo,
         })
     }
 
@@ -446,7 +494,7 @@ impl Diverter {
                 let end = offset.saturating_add(length).min(bytes);
                 let packet = &mut buffer[start..end];
                 offset = end;
-                match prepare_outbound(packet, &self.table, translation) {
+                match prepare_outbound(packet, &self.table, translation, self.geo.as_ref()) {
                     Outcome::PassThrough => {
                         stats.passed = stats.passed.saturating_add(1);
                         // Captured but unmodified, so the checksums the stack
@@ -518,7 +566,9 @@ impl Diverter {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter, prepare_inbound, prepare_outbound, Address, Outcome, Translation};
+    use super::{
+        filter, is_local_network, prepare_inbound, prepare_outbound, Address, Outcome, Translation,
+    };
     use crate::windivert::{
         flow::{Disposition, FlowKey, FlowTable},
         packet::PROTOCOL_UDP,
@@ -544,7 +594,7 @@ mod tests {
         packet[12..16].copy_from_slice(&source.octets());
         packet[16..20].copy_from_slice(&destination.octets());
         packet[20..22].copy_from_slice(&54_518_u16.to_be_bytes());
-        packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         packet
     }
 
@@ -556,7 +606,7 @@ mod tests {
                 local: PHYSICAL,
                 local_port: 54_518,
                 remote: REMOTE,
-                remote_port: 53,
+                remote_port: 443,
             },
             disposition,
         );
@@ -600,13 +650,58 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let table = table_with(Disposition::Tunnel);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), None),
             Outcome::Tunnel
         );
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
         // The destination and ports must survive untouched.
         assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
-        assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x00, 0x35]);
+        assert_eq!(&packet[20..24], &[0xd4, 0xf6, 0x01, 0xbb]);
+    }
+
+    #[test]
+    fn bypasses_private_lan_even_when_the_flow_is_classified_for_tunnel() {
+        // SMB and other local services must stay on the physical interface
+        // even in denylist mode, where an otherwise-unlisted process is
+        // normally classified as Tunnel.
+        for destination in [
+            Ipv4Addr::new(192, 168, 1, 159),
+            Ipv4Addr::new(10, 10, 10, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+        ] {
+            assert!(is_local_network(IpAddr::V4(destination)));
+            let physical = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 136));
+            let mut packet = udp_packet(physical, IpAddr::V4(destination));
+            let original = packet.clone();
+            let table = FlowTable::default();
+            table.insert_for_test(
+                FlowKey {
+                    protocol: PROTOCOL_UDP,
+                    local: physical,
+                    local_port: 54_518,
+                    remote: IpAddr::V4(destination),
+                    remote_port: 443,
+                },
+                Disposition::Tunnel,
+            );
+            assert_eq!(
+                prepare_outbound(&mut packet, &table, addresses(), None),
+                Outcome::PassThrough,
+                "destination {destination}"
+            );
+            assert_eq!(packet, original);
+        }
+    }
+
+    #[test]
+    fn keeps_public_traffic_tunnelled_when_the_flow_is_classified() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = table_with(Disposition::Tunnel);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
     }
 
     #[test]
@@ -615,7 +710,7 @@ mod tests {
         let original = packet.clone();
         let table = table_with(Disposition::Direct);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), None),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
@@ -628,7 +723,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let original = packet.clone();
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
@@ -704,18 +799,18 @@ mod tests {
     }
 
     #[test]
-    fn tunnels_name_resolution_whatever_the_policy_says() {
-        // Windows resolves through a shared service, so the query carries no
-        // trace of which application wanted the name. An unclassified flow to
-        // the session's resolver still has to take the tunnel: the resolver
-        // exists nowhere else.
+    fn leaves_dns_on_the_configured_windows_resolver() {
+        // MouseVPN never changes Windows DNS configuration, so DNS stays on
+        // the resolver Windows selected rather than being rewritten into the
+        // tunnel.
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        let original = packet.clone();
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
-            Outcome::Tunnel
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
+            Outcome::PassThrough
         );
-        assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
+        assert_eq!(packet, original);
     }
 
     #[test]
@@ -725,7 +820,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
             Outcome::PassThrough
         );
     }
@@ -740,7 +835,7 @@ mod tests {
         packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         packet[40..42].copy_from_slice(&54_518_u16.to_be_bytes());
-        packet[42..44].copy_from_slice(&53_u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&443_u16.to_be_bytes());
 
         let table = FlowTable::default();
         table.insert_for_test(
@@ -749,12 +844,12 @@ mod tests {
                 local: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 local_port: 54_518,
                 remote: IpAddr::V6(Ipv6Addr::LOCALHOST),
-                remote_port: 53,
+                remote_port: 443,
             },
             Disposition::Tunnel,
         );
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), None),
             Outcome::Discard
         );
     }

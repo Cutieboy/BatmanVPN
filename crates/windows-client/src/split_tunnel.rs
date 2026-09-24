@@ -15,8 +15,6 @@ use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::Datagram;
 use mousevpn_transport::{DatagramTransport, UdpTransport};
-use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-
 use crate::{
     diagnostics::{Diagnostics, SendCounters},
     handshake::connect,
@@ -27,6 +25,7 @@ use crate::{
     windivert::{
         divert::{prepare_inbound, Diverter, Translation},
         flow::{FlowTable, FlowWatcher},
+        geo::{DnsWatcher, GeoRouter},
         Address, Library,
     },
     AppRoutingPolicy, ClientError,
@@ -66,27 +65,30 @@ pub fn run_split_tunnel(
 
     // Shared rather than copied: a reconnect can change the tunnel address,
     // the MTU, and, if the machine moved networks, the physical address too.
-    let route = netcfg::default_ipv4_route(None)?;
     let translation = Arc::new(RwLock::new(Translation::new(
         IpAddr::V4(network::physical_addresses()?.ipv4),
         IpAddr::V4(parameters.client_address),
         IpAddr::V4(parameters.dns),
         parameters.mtu,
     )));
-    // Installed before capture starts: a query sent to the old resolver in the
-    // gap would go out untunnelled.
-    let _dns = DnsGuard::install(route.interface_luid, parameters.dns)?;
 
     let library = Library::load()?;
+    // Geo-direct never changes DNS configuration. A sniff-only DNS watcher
+    // observes ordinary Windows DNS responses and turns direct-domain answers
+    // into short-lived IP decisions before the corresponding application
+    // connection is diverted.
+    let geo_router = GeoRouter::embedded()?;
     // The watcher must be running before the diverter captures anything:
     // packets of a flow it has not classified yet pass through untranslated.
     let watcher = FlowWatcher::start(&library, app_routing)?;
     let table = watcher.table();
+    let _dns_geo = DnsWatcher::start(&library, geo_router.clone(), Arc::clone(&table))?;
     let diverter = Arc::new(Diverter::open(
         &library,
         Arc::clone(&table),
         Arc::clone(&translation),
         config.server,
+        Some(geo_router),
     )?);
 
     let (sender, receiver) = plane.split();
@@ -470,33 +472,6 @@ impl ReceiveLoop<'_> {
 /// usually fine and sometimes fatal: a router that does not answer at all
 /// leaves every application unable to resolve a name, while a browser with its
 /// own encrypted resolver carries on and hides the fault.
-struct DnsGuard {
-    alias: String,
-}
-
-impl DnsGuard {
-    /// # Errors
-    ///
-    /// Returns an error when the interface cannot be named or netsh refuses.
-    fn install(interface: NET_LUID_LH, resolver: Ipv4Addr) -> Result<Self, ClientError> {
-        let alias = netcfg::interface_alias(interface)?;
-        netcfg::set_tunnel_dns(&alias, resolver)?;
-        eprintln!("MOUSEVPN_STATE=dns_configured");
-        Ok(Self { alias })
-    }
-}
-
-impl Drop for DnsGuard {
-    fn drop(&mut self) {
-        // Leaving a resolver behind that only existed inside the tunnel would
-        // break name resolution on a machine that is no longer connected, so a
-        // failure here is worth reporting loudly.
-        if let Err(error) = netcfg::reset_tunnel_dns(&self.alias) {
-            eprintln!("MOUSEVPN_RUNTIME_WARNING=failed to restore DNS on {}: {error}", self.alias);
-        }
-    }
-}
-
 /// Distinguishes a packet worth dropping from a failure worth reporting.
 enum SendFailure {
     Skip,
