@@ -1,6 +1,7 @@
 package dev.mousevpn.app
 
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -8,6 +9,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.Handler
 import android.os.Looper
@@ -30,11 +32,17 @@ class MouseVpnService : VpnService() {
     @Volatile private var handle = 0L
     @Volatile private var diagnosticSessionId = 0L
     @Volatile private var underlyingNetwork = "unknown"
+    @Volatile private var dozing = false
     private val underlyingNetworks = ConcurrentHashMap<Network, UnderlyingNetworkState>()
     private var selectedUnderlyingNetwork: Network? = null
     private var selectedUnderlyingState: UnderlyingNetworkState? = null
     private lateinit var diagnostics: DiagnosticStore
     private var lastCheckpointElapsedRealtime = 0L
+    private val dozeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            if (intent?.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) updateDozeState()
+        }
+    }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             if (updateUnderlyingNetwork(network)) signalNetworkChange()
@@ -59,6 +67,8 @@ class MouseVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         diagnostics = DiagnosticStore(this)
+        dozing = getSystemService(PowerManager::class.java).isDeviceIdleMode
+        registerReceiver(dozeReceiver, IntentFilter(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED), android.content.Context.RECEIVER_NOT_EXPORTED)
         val connectivity = getSystemService(ConnectivityManager::class.java)
         // Seed every physical route synchronously. `activeNetwork` may itself be
         // another VPN, and binding MouseVPN's transport socket to it is rejected
@@ -164,10 +174,10 @@ class MouseVpnService : VpnService() {
             val mtu = calculateTunnelMtu(
                 serverMtu,
                 underlyingMtu(),
-                profile.protocol != VpnProtocol.LEGACY,
+                profile.protocol.usesMorph,
             )
             val builder = Builder()
-                .setSession("MouseVPN")
+                .setSession("BatmanVPN")
                 .setMtu(mtu)
                 .addAddress(prepared.getString("address"), prepared.getInt("prefix"))
                 .addRoute("0.0.0.0", 0)
@@ -180,6 +190,7 @@ class MouseVpnService : VpnService() {
             val fd = descriptor.detachFd()
             descriptor = null
             check(NativeBridge.start(handle, fd)) { "Rust-ядро не запустило туннель" }
+            runCatching { NativeBridge.setDozing(handle, dozing) }
             connectedAt = SystemClock.elapsedRealtime()
             connectedSinceElapsedRealtime = connectedAt
             if (diagnosticSessionId != 0L) {
@@ -368,7 +379,7 @@ class MouseVpnService : VpnService() {
                 reconnectingShown = false
             }
             val now = SystemClock.elapsedRealtime()
-            if (now - lastCheckpointElapsedRealtime >= DIAGNOSTIC_CHECKPOINT_MS) {
+            if (!dozing && now - lastCheckpointElapsedRealtime >= DIAGNOSTIC_CHECKPOINT_MS) {
                 val sessionId = diagnosticSessionId
                 if (sessionId != 0L) {
                     runCatching {
@@ -382,7 +393,7 @@ class MouseVpnService : VpnService() {
                 lastCheckpointElapsedRealtime = now
             }
             try {
-                Thread.sleep(1_000)
+                Thread.sleep(if (dozing) DOZE_MONITOR_INTERVAL_MS else 1_000L)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return AttemptResult(AttemptOutcome.STOPPED, elapsedSince(connectedAt))
@@ -407,6 +418,18 @@ class MouseVpnService : VpnService() {
         broadcast("Отключено")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun updateDozeState() {
+        val idle = getSystemService(PowerManager::class.java).isDeviceIdleMode
+        if (idle == dozing) return
+        dozing = idle
+        val current = handle
+        if (current != 0L) runCatching { NativeBridge.setDozing(current, idle) }
+        if (!idle && current != 0L) {
+            networkRestartRequested.set(true)
+            Log.i(LOG_TAG, "Doze ended; rebuilding VPN to refresh tunnel liveness")
+        }
     }
 
     private fun broadcast(status: String) {
@@ -563,6 +586,7 @@ class MouseVpnService : VpnService() {
         handle = 0L
         connectedSinceElapsedRealtime = 0L
         networkHandler.removeCallbacks(signalNetworkChange)
+        runCatching { unregisterReceiver(dozeReceiver) }
         stopNativeAsync(current)
         runCatching {
             getSystemService(ConnectivityManager::class.java)
@@ -584,6 +608,7 @@ class MouseVpnService : VpnService() {
 
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
         private const val DIAGNOSTIC_CHECKPOINT_MS = 60_000L
+        private const val DOZE_MONITOR_INTERVAL_MS = 5_000L
         private const val RECONNECT_BACKOFF_RESET_MS = 60_000L
         private const val MAX_INITIAL_CONNECT_ATTEMPTS = 3
         private const val LOG_TAG = "MouseVpnService"
