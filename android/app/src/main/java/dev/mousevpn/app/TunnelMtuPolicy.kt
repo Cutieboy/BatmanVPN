@@ -8,6 +8,5 @@ internal fun calculateTunnelMtu(serverMtu: Int, underlyingMtu: Int?, morph: Bool
     // MouseMorph adds: route 8 + nonce 12 + inner header 6 + tag 16 + padding <= 31.
     val fits = underlyingMtu - overhead
     require(fits >= 576) { "MTU физической сети слишком мал для VPN" }
-    // This tunnel carries IPv4 only; the IPv6 minimum of 1280 is not its floor.
     return minOf(serverMtu, fits)
 }

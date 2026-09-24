@@ -4,11 +4,12 @@ import android.util.Base64
 import org.json.JSONObject
 import java.util.UUID
 
-enum class VpnProtocol(val nativeValue: String) {
-    LEGACY("legacy"),
-    MORPH_QUIET("morph_quiet"),
-    MORPH_BALANCED("morph_balanced"),
-    MORPH_PARANOID("morph_paranoid");
+enum class VpnProtocol(val nativeValue: String, val usesMorph: Boolean) {
+    LEGACY("legacy", false),
+    MORPH_QUIET("morph_quiet", true),
+    MORPH_BALANCED("morph_balanced", true),
+    MORPH_PARANOID("morph_paranoid", true),
+    SPEEDY("speedy", false);
 
     companion object {
         fun fromStored(value: String): VpnProtocol =
