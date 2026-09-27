@@ -105,7 +105,7 @@ fn parse_protocol(value: &str) -> Result<ClientProtocol> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_start(
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_startNative(
     mut env: JNIEnv,
     _object: JObject,
     handle: jlong,
