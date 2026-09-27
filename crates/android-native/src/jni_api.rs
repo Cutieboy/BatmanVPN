@@ -12,15 +12,15 @@ use mousevpn_config::{ClientConfig, ClientProtocol};
 use crate::{
     handshake::{bind_socket, negotiate},
     registry::{
-        insert_pending, insert_running, metrics, network_changed, status, stop, take_pending,
-        PendingSession,
+        insert_pending, insert_running, metrics, network_changed, set_dozing, status, stop,
+        take_pending, PendingSession,
     },
     session,
     socket_protector::SocketProtector,
 };
 
 #[no_mangle]
-pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepare(
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepareNative(
     mut env: JNIEnv,
     _object: JObject,
     service: JObject,
@@ -147,7 +147,17 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_networkChanged(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_stop(
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_setDozing(
+    _env: JNIEnv,
+    _object: JObject,
+    handle: jlong,
+    dozing: jboolean,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| set_dozing(handle, dozing != JNI_FALSE)));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_stopNative(
     _env: JNIEnv,
     _object: JObject,
     handle: jlong,
