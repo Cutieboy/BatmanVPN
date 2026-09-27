@@ -1,11 +1,68 @@
 package dev.mousevpn.app
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.PowerManager
+import org.json.JSONObject
+
 object NativeBridge {
     init {
         System.loadLibrary("mousevpn_android")
     }
 
-    external fun prepare(
+    private var dozeService: MouseVpnService? = null
+    private var dozeReceiver: BroadcastReceiver? = null
+    private var dozeHandle = 0L
+
+    fun prepare(
+        service: MouseVpnService,
+        endpoint: String,
+        serverPublicKey: String,
+        clientPrivateKey: String,
+        protocol: String,
+    ): String {
+        unregisterDozeReceiver()
+        val result = prepareNative(service, endpoint, serverPublicKey, clientPrivateKey, protocol)
+        val handle = JSONObject(result).getLong("handle")
+        dozeService = service
+        dozeHandle = handle
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) {
+                    setDozing(dozeHandle, isDeviceIdleMode(context))
+                }
+            }
+        }
+        dozeReceiver = receiver
+        val filter = IntentFilter(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            service.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            service.registerReceiver(receiver, filter)
+        }
+        setDozing(handle, isDeviceIdleMode(service))
+        return result
+    }
+
+    external fun start(handle: Long, tunFd: Int): Boolean
+    external fun networkChanged(handle: Long)
+
+    fun stop(handle: Long) {
+        try {
+            stopNative(handle)
+        } finally {
+            if (handle == dozeHandle) unregisterDozeReceiver()
+        }
+    }
+
+    external fun status(handle: Long): String
+    external fun metrics(handle: Long): String
+
+    private external fun prepareNative(
         service: MouseVpnService,
         endpoint: String,
         serverPublicKey: String,
@@ -13,9 +70,20 @@ object NativeBridge {
         protocol: String,
     ): String
 
-    external fun start(handle: Long, tunFd: Int): Boolean
-    external fun networkChanged(handle: Long)
-    external fun stop(handle: Long)
-    external fun status(handle: Long): String
-    external fun metrics(handle: Long): String
+    private external fun setDozing(handle: Long, dozing: Boolean)
+    private external fun stopNative(handle: Long)
+
+    private fun isDeviceIdleMode(context: Context): Boolean =
+        (context.getSystemService(Context.POWER_SERVICE) as PowerManager).isDeviceIdleMode
+
+    private fun unregisterDozeReceiver() {
+        val service = dozeService
+        val receiver = dozeReceiver
+        if (service != null && receiver != null) {
+            runCatching { service.unregisterReceiver(receiver) }
+        }
+        dozeService = null
+        dozeReceiver = null
+        dozeHandle = 0L
+    }
 }
