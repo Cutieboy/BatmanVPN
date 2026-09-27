@@ -85,6 +85,16 @@ pub(crate) fn network_changed(handle: i64) {
     }
 }
 
+pub(crate) fn set_dozing(handle: i64, dozing: bool) {
+    let Ok(map) = registry().lock() else {
+        return;
+    };
+    if let Some(Entry::Running(session)) = map.get(&handle) {
+        session.dozing.store(dozing, Ordering::Release);
+        crate::session::signal(&session.wake);
+    }
+}
+
 pub(crate) fn status(handle: i64) -> &'static str {
     let Ok(map) = registry().lock() else {
         return "error";
