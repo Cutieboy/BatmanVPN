@@ -44,11 +44,20 @@ object NativeBridge {
             @Suppress("DEPRECATION")
             service.registerReceiver(receiver, filter)
         }
-        setDozing(handle, isDeviceIdleMode(service))
         return result
     }
 
-    external fun start(handle: Long, tunFd: Int): Boolean
+    fun start(handle: Long, tunFd: Int): Boolean {
+        val started = startNative(handle, tunFd)
+        if (started) {
+            val service = dozeService
+            if (service != null && handle == dozeHandle) {
+                setDozing(handle, isDeviceIdleMode(service))
+            }
+        }
+        return started
+    }
+
     external fun networkChanged(handle: Long)
 
     fun stop(handle: Long) {
@@ -70,6 +79,7 @@ object NativeBridge {
         protocol: String,
     ): String
 
+    private external fun startNative(handle: Long, tunFd: Int): Boolean
     private external fun setDozing(handle: Long, dozing: Boolean)
     private external fun stopNative(handle: Long)
 
