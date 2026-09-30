@@ -1,4 +1,4 @@
-﻿#![doc = "Tracks which process owns each network flow, using the `WinDivert` flow layer."]
+#![doc = "Tracks which process owns each network flow, using the `WinDivert` flow layer."]
 
 use std::{
     collections::HashMap,
@@ -53,13 +53,28 @@ pub(crate) enum Disposition {
     Direct,
 }
 
+/// A routing decision and how it was reached.
+///
+/// The packet path can only guess — it has no process knowledge — while the
+/// watcher derives its answer from a real executable. The provenance lets an
+/// authoritative answer replace a guess without letting two authoritative
+/// answers (from the socket and flow layers) overwrite each other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Entry {
+    disposition: Disposition,
+    /// `true` when the decision was made by the packet path before the
+    /// watcher had classified the flow. Such a guess must not outlive the
+    /// watcher's authoritative answer.
+    provisional: bool,
+}
+
 /// The decisions taken so far, shared with the packet path.
 ///
 /// Reads vastly outnumber writes: every diverted packet consults the table,
 /// while entries only change when a flow is created or torn down.
 #[derive(Default)]
 pub(crate) struct FlowTable {
-    entries: RwLock<HashMap<FlowKey, Disposition>>,
+    entries: RwLock<HashMap<FlowKey, Entry>>,
     /// IPs learned from direct-domain DNS answers for the lifetime of their DNS TTL.
     geo_direct_ips: RwLock<HashMap<IpAddr, std::time::Instant>>,
 }
@@ -69,7 +84,7 @@ impl FlowTable {
         self.entries
             .read()
             .ok()
-            .and_then(|entries| entries.get(key).copied())
+            .and_then(|entries| entries.get(key).map(|entry| entry.disposition))
     }
 
     pub(crate) fn route_direct_ip(&self, address: IpAddr, ttl: std::time::Duration) {
@@ -87,16 +102,29 @@ impl FlowTable {
         ips.contains_key(&address)
     }
 
-    fn insert(&self, key: FlowKey, disposition: Disposition) {
+    /// Records an attributed decision from the FlowWatcher.
+    ///
+    /// An authoritative decision (derived from a real process) replaces any
+    /// provisional guess made by the packet path, but does not overwrite
+    /// another authoritative decision — the first attributed event wins,
+    /// preventing a later event from a different layer from flip-flopping
+    /// the routing of an already-established flow.
+    pub(crate) fn insert(&self, key: FlowKey, disposition: Disposition) {
         if let Ok(mut entries) = self.entries.write() {
-            // The same 5-tuple can be reported more than once by WinDivert's
-            // socket and flow layers, and those events can carry different
-            // process attribution. Once an attributed decision exists, a later
-            // event must not silently replace it with a different policy result.
-            //
-            // In particular, an already-routed connection must not flip back
-            // to Direct merely because another observer reports the tuple.
-            entries.entry(key).or_insert(disposition);
+            entries
+                .entry(key)
+                .and_modify(|existing| {
+                    // Override a provisional guess with the authoritative
+                    // answer; leave an authoritative answer alone.
+                    if existing.provisional {
+                        existing.disposition = disposition;
+                        existing.provisional = false;
+                    }
+                })
+                .or_insert(Entry {
+                    disposition,
+                    provisional: false,
+                });
         }
     }
 
@@ -110,10 +138,29 @@ impl FlowTable {
     /// quietly downgrade a routed application to the physical link.
     ///
     /// An answer derived from no process therefore never replaces one derived
-    /// from a real executable.
+    /// from a real executable, nor a provisional guess from the packet path.
     fn insert_unattributed(&self, key: FlowKey, disposition: Disposition) {
         if let Ok(mut entries) = self.entries.write() {
-            entries.entry(key).or_insert(disposition);
+            entries.entry(key).or_insert(Entry {
+                disposition,
+                provisional: false,
+            });
+        }
+    }
+
+    /// Records a provisional decision made by the packet path for an
+    /// unclassified flow.
+    ///
+    /// The packet path has no process knowledge, so its guess must not
+    /// outlast the watcher's authoritative answer. A later attributed
+    /// [`insert`] will replace this entry. An unattributed event or another
+    /// provisional insert will not.
+    pub(crate) fn insert_provisional(&self, key: FlowKey, disposition: Disposition) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.entry(key).or_insert(Entry {
+                disposition,
+                provisional: true,
+            });
         }
     }
 
@@ -810,6 +857,39 @@ mod tests {
         assert_eq!(table.lookup(&key()), Some(Disposition::Direct));
         table.remove(&key());
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn an_attributed_event_replaces_a_provisional_guess() {
+        // The packet path pins an unclassified SYN to the default (Tunnel).
+        // When the watcher later learns the process is excluded, its
+        // authoritative Direct answer must replace the guess — otherwise an
+        // excluded application would be permanently tunnelled.
+        let table = FlowTable::default();
+        table.insert_provisional(key(), Disposition::Tunnel);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
+        table.insert(key(), Disposition::Direct);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Direct));
+    }
+
+    #[test]
+    fn a_provisional_guess_does_not_override_an_attributed_decision() {
+        // The watcher classified the flow first (e.g. the socket connect event
+        // beat the SYN). A later provisional insert must not flip it.
+        let table = FlowTable::default();
+        table.insert(key(), Disposition::Direct);
+        table.insert_provisional(key(), Disposition::Tunnel);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Direct));
+    }
+
+    #[test]
+    fn an_unattributed_event_does_not_replace_a_provisional_guess() {
+        // The System process reporting a flow must not downgrade the packet
+        // path's provisional default. Only an attributed decision may.
+        let table = FlowTable::default();
+        table.insert_provisional(key(), Disposition::Tunnel);
+        table.insert_unattributed(key(), Disposition::Direct);
+        assert_eq!(table.lookup(&key()), Some(Disposition::Tunnel));
     }
 
     #[test]

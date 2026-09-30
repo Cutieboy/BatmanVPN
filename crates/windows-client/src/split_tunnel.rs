@@ -1,7 +1,7 @@
 #![doc = "Runs a per-application tunnel that needs no adapter and no routes."]
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, RwLock,
@@ -24,17 +24,116 @@ use crate::{
     platform::ensure_supported_runtime,
     windivert::{
         divert::{prepare_inbound, Diverter, Translation},
-        flow::{FlowTable, FlowWatcher},
+        flow::{Disposition, FlowTable, FlowWatcher},
         geo::{DnsWatcher, GeoRouter},
         Address, Library,
     },
-    AppRoutingPolicy, ClientError,
+    AppRoutingMode, AppRoutingPolicy, ClientError,
 };
 
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
 
-/// Tunnels only the applications the policy selects, leaving the rest of the
-/// machine on its physical link.
+/// Extracts a human-readable 5-tuple from a raw IP packet for diagnostics.
+///
+/// Returns `None` for anything without a parseable IPv4/IPv6 header and
+/// transport header. This is diagnostics-only: it never fails the send path.
+fn describe_packet(packet: &[u8]) -> Option<String> {
+    let version = packet.first().copied()? >> 4;
+    let (protocol, src, dst, header_len) = match version {
+        4 => {
+            let header_len = usize::from(packet.first().copied()? & 0x0f) * 4;
+            if header_len < 20 || packet.len() < header_len {
+                return None;
+            }
+            let protocol = *packet.get(9)?;
+            let src = Ipv4Addr::new(
+                *packet.get(12)?,
+                *packet.get(13)?,
+                *packet.get(14)?,
+                *packet.get(15)?,
+            );
+            let dst = Ipv4Addr::new(
+                *packet.get(16)?,
+                *packet.get(17)?,
+                *packet.get(18)?,
+                *packet.get(19)?,
+            );
+            (protocol, IpAddr::V4(src), IpAddr::V4(dst), header_len)
+        }
+        6 => {
+            let header_len = 40;
+            if packet.len() < header_len {
+                return None;
+            }
+            let protocol = *packet.get(6)?;
+            let mut src_bytes = [0_u8; 16];
+            src_bytes.copy_from_slice(packet.get(8..24)?);
+            let mut dst_bytes = [0_u8; 16];
+            dst_bytes.copy_from_slice(packet.get(24..40)?);
+            (
+                protocol,
+                IpAddr::V6(Ipv6Addr::from(src_bytes)),
+                IpAddr::V6(Ipv6Addr::from(dst_bytes)),
+                header_len,
+            )
+        }
+        _ => return None,
+    };
+    // Only TCP (6) and UDP (17) carry the ports we want to report.
+    let ports = if matches!(protocol, 6 | 17) {
+        let transport = packet.get(header_len..)?;
+        if transport.len() < 4 {
+            return None;
+        }
+        let sport = u16::from_be_bytes([transport[0], transport[1]]);
+        let dport = u16::from_be_bytes([transport[2], transport[3]]);
+        Some((sport, dport))
+    } else {
+        None
+    };
+    let proto_name = match protocol {
+        6 => "tcp",
+        17 => "udp",
+        _other => return None,
+    };
+    let tuple = match ports {
+        Some((sport, dport)) => format!("{src}:{sport}->{dst}:{dport}"),
+        None => format!("{src}->{dst}"),
+    };
+    Some(format!("{proto_name} {tuple} len={}", packet.len()))
+}
+
+/// Returns the TCP control flags (SYN, ACK, RST, FIN) for an IPv4/IPv6 TCP
+/// packet, or `None` for non-TCP or unparseable packets.
+fn tcp_flags(packet: &[u8]) -> Option<u8> {
+    let version = packet.first().copied()? >> 4;
+    let header_len = match version {
+        4 => {
+            let len = usize::from(packet.first().copied()? & 0x0f) * 4;
+            if len < 20 {
+                return None;
+            }
+            len
+        }
+        6 => {
+            // No extension headers parsed; assume 40-byte IPv6 base header.
+            40
+        }
+        _ => return None,
+    };
+    if packet.len() < header_len + 14 {
+        return None;
+    }
+    let protocol = match version {
+        4 => packet[9],
+        _ => packet[6],
+    };
+    if protocol != 6 {
+        return None;
+    }
+    // TCP flags are in byte 13 of the TCP header (offset header_len + 13).
+    Some(packet[header_len + 13])
+}
 ///
 /// Nothing here touches the routing table, creates an adapter, or installs
 /// firewall filters. Traffic reaches the tunnel because `WinDivert` lifts it out
@@ -65,11 +164,16 @@ pub fn run_split_tunnel(
 
     // Shared rather than copied: a reconnect can change the tunnel address,
     // the MTU, and, if the machine moved networks, the physical address too.
+    let default_disposition = match app_routing.mode {
+        AppRoutingMode::Exclude => Disposition::Tunnel,
+        AppRoutingMode::Include => Disposition::Direct,
+    };
     let translation = Arc::new(RwLock::new(Translation::new(
         IpAddr::V4(network::physical_addresses()?.ipv4),
         IpAddr::V4(parameters.client_address),
         IpAddr::V4(parameters.dns),
         parameters.mtu,
+        default_disposition,
     )));
 
     let library = Library::load()?;
@@ -121,6 +225,7 @@ pub fn run_split_tunnel(
         counters: &counters,
         outbound_transport: &transport_tx,
         inbound: Address::for_inbound(netcfg::default_ipv4_route(None)?.interface_index, 0),
+        default_disposition,
     }
     .run(stopping);
 
@@ -177,7 +282,24 @@ fn spawn_outbound(
                             })
                     });
                 match encoded {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        // Diagnostic: log outbound TCP SYN and RST only, so we
+                        // can trace the handshake/reset sequence without
+                        // flooding the log with every data packet.
+                        const SYN: u8 = 0x02;
+                        const RST: u8 = 0x04;
+                        let flags = tcp_flags(packet);
+                        let is_control = flags.is_some_and(|f| (f & SYN) != 0 || (f & RST) != 0);
+                        if is_control {
+                            let desc =
+                                describe_packet(packet).unwrap_or_else(|| "?".to_owned());
+                            eprintln!(
+                                "MOUSEVPN_OUTBOUND_OK=flags=0x{:02x} {}",
+                                flags.unwrap_or(0),
+                                desc,
+                            );
+                        }
+                    }
                     Err(Skip) => {
                         counters.failed();
                         // Clamping the segment size keeps TCP within the
@@ -217,10 +339,24 @@ fn spawn_outbound(
                         if is_peer_unavailable(&error) || is_transient_io(&error) =>
                     {
                         counters.failed();
+                        // Diagnostic: log every silent send drop with
+                        // WSA code, kind, and 5-tuple so we can correlate
+                        // with the intermittent HTTPS resets.
+                        let desc = describe_packet(packet).unwrap_or_else(|| "?".to_owned());
+                        eprintln!(
+                            "MOUSEVPN_SEND_DROP=kind={:?} os_code={:?} {}",
+                            error.kind(),
+                            error.raw_os_error(),
+                            desc,
+                        );
                     }
                     Err(error) => {
                         counters.failed();
-                        eprintln!("MOUSEVPN_SPLIT_WARNING={error}");
+                        let desc = describe_packet(packet).unwrap_or_else(|| "?".to_owned());
+                        eprintln!(
+                            "MOUSEVPN_SEND_ERROR={error} {}",
+                            desc,
+                        );
                     }
                 }
             })
@@ -243,6 +379,7 @@ struct ReceiveLoop<'a> {
     counters: &'a Arc<SendCounters>,
     outbound_transport: &'a mpsc::SyncSender<UdpTransport>,
     inbound: Address,
+    default_disposition: Disposition,
 }
 
 /// The scratch space one session reuses for every packet.
@@ -325,6 +462,19 @@ impl ReceiveLoop<'_> {
             .and_then(|_| Datagram::decode(&buffers.payload).ok());
         let Some(datagram) = framed else {
             diagnostics.rejected();
+            // Diagnostic: log rejected inbound datagrams so we can detect
+            // server responses dropped before injection.
+            let seq = self
+                .wire
+                .decode(&buffers.encrypted[..length], &mut buffers.payload)
+                .ok()
+                .filter(|decoded| *decoded)
+                .and_then(|_| Datagram::decode(&buffers.payload).ok())
+                .map(|d| d.header.sequence);
+            eprintln!(
+                "MOUSEVPN_INBOUND_REJECT=wire_len={length} seq={:?}",
+                seq.map(u64::from)
+            );
             return;
         };
         // Read before the datagram is consumed: the header numbers every
@@ -346,8 +496,15 @@ impl ReceiveLoop<'_> {
                 liveness.packet_received(now);
                 return;
             }
-            Err(_) => {
+            Err(error) => {
                 diagnostics.rejected();
+                // Diagnostic: capture the exact decode failure (e.g. an
+                // inbound packet exceeding the tunnel MTU) that would
+                // otherwise be silent.
+                eprintln!(
+                    "MOUSEVPN_INBOUND_DECODE_ERR=seq={} wire_len={length} error={error}",
+                    u64::from(sequence)
+                );
                 return;
             }
         };
@@ -362,8 +519,34 @@ impl ReceiveLoop<'_> {
         // deliver, and injecting it could hand an application traffic it never
         // asked for.
         if prepare_inbound(&mut buffers.injectable, translation) {
+            // Diagnostic: log only TCP control packets (SYN-ACK, RST, FIN)
+            // so we can trace the handshake/reset sequence without flooding
+            // the log with every data packet.
+            const SYN: u8 = 0x02;
+            const ACK: u8 = 0x10;
+            const FIN: u8 = 0x01;
+            const RST: u8 = 0x04;
+            let flags = tcp_flags(&buffers.injectable);
+            let is_control = flags.is_some_and(|f| {
+                (f & (SYN | ACK)) == (SYN | ACK) || (f & RST) != 0 || (f & FIN) != 0
+            });
+            if is_control {
+                let desc = describe_packet(&buffers.injectable).unwrap_or_else(|| "?".to_owned());
+                eprintln!(
+                    "MOUSEVPN_INBOUND_OK=seq={} wire_len={length} flags=0x{:02x} {}",
+                    u64::from(sequence),
+                    flags.unwrap_or(0),
+                    desc,
+                );
+            }
             self.diverter
                 .inject_inbound(&mut buffers.injectable, self.inbound);
+        } else {
+            eprintln!(
+                "MOUSEVPN_INBOUND_SKIP=seq={} len={}",
+                u64::from(sequence),
+                buffers.injectable.len(),
+            );
         }
     }
 
@@ -430,6 +613,7 @@ impl ReceiveLoop<'_> {
             IpAddr::V4(parameters.client_address),
             IpAddr::V4(parameters.dns),
             parameters.mtu,
+            self.default_disposition,
         );
         {
             let mut translation = self.translation.write().map_err(|_| {

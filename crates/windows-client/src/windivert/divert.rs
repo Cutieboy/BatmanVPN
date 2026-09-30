@@ -1,4 +1,4 @@
-﻿#![doc = "Moves selected applications' packets between the stack and the tunnel."]
+#![doc = "Moves selected applications' packets between the stack and the tunnel."]
 
 use std::{
     fmt::Write as _,
@@ -175,6 +175,10 @@ pub(crate) enum Outcome {
     /// The packet belongs to an application that stays on the physical link.
     /// It has not been touched and must be reinjected exactly as captured.
     PassThrough,
+    /// The packet stays on the physical link but was rewritten in place (its
+    /// TCP MSS option was clamped). It must be reinjected with recomputed
+    /// checksums, because the stack's checksums no longer match the bytes.
+    PassThroughModified,
     /// The packet belongs to a routed application but cannot be tunnelled.
     /// It must be discarded rather than handed back, because reinjecting it
     /// would send traffic the user asked to protect out in the clear.
@@ -196,6 +200,10 @@ pub(crate) struct Translation {
     /// The largest TCP segment the tunnel can carry, clamped into the
     /// handshake of every routed connection.
     pub(crate) max_segment_size: u16,
+    /// The routing disposition for flows that have not yet been classified
+    /// by the asynchronous FlowWatcher. In Exclude mode this is Tunnel
+    /// (everything not excluded is tunnelled); in Include mode it is Direct.
+    pub(crate) default_disposition: Disposition,
 }
 
 impl Translation {
@@ -209,6 +217,7 @@ impl Translation {
         tunnel: IpAddr,
         resolver: IpAddr,
         tunnel_mtu: u16,
+        default_disposition: Disposition,
     ) -> Self {
         // IPv4 and TCP headers, twenty bytes each, come off the top.
         const HEADERS: u16 = 40;
@@ -217,6 +226,7 @@ impl Translation {
             tunnel,
             resolver,
             max_segment_size: tunnel_mtu.saturating_sub(HEADERS),
+            default_disposition,
         }
     }
 }
@@ -292,6 +302,13 @@ fn is_local_network(address: IpAddr) -> bool {
 /// has not classified. Defaulting to "leave it alone" means an unknown packet
 /// keeps working over the physical link instead of vanishing into a tunnel
 /// that may not expect it.
+///
+/// TCP SYN packets that are not yet classified still have their MSS option
+/// clamped before being passed through. Without an adapter to advertise the
+/// tunnel's MTU, a flow whose first packet races the socket-watcher thread
+/// would otherwise negotiate a segment size for the physical link and produce
+/// data segments the tunnel cannot carry. Clamping early, before the
+/// classification decision, closes that window.
 pub(crate) fn prepare_outbound(
     bytes: &mut [u8],
     table: &FlowTable,
@@ -345,7 +362,50 @@ pub(crate) fn prepare_outbound(
         return Outcome::PassThrough;
     }
 
-    if table.lookup(&key) != Some(Disposition::Tunnel) {
+    // Clamp the TCP MSS on every SYN that reaches this point, before the flow
+    // table is consulted. The socket-watcher thread classifies flows
+    // asynchronously, and a SYN that arrives here before its connect event is
+    // processed would otherwise escape with the physical-link segment size.
+    // Once the data plane starts dropping oversized data segments, the
+    // connection stalls — a path-MTU black hole that no ICMP can correct.
+    //
+    // Clamping before the verdict is safe: a flow later classified as Direct
+    // simply talks to its peer with a smaller segment, which costs nothing.
+    let modified = packet.clamp_mss(translation.max_segment_size);
+
+    let disposition = match table.lookup(&key) {
+        Some(d) => d,
+        None => {
+            // The FlowWatcher classifies flows asynchronously. A SYN that
+            // arrives before the watcher has processed the socket-connect
+            // event would be passed through, while subsequent packets
+            // (classified moments later) would be tunnelled. That mixed
+            // path causes the server to see data from two different source
+            // addresses and reset the connection.
+            //
+            // Pin the flow to the default disposition now so every packet
+            // of this connection follows the same path. The pin is
+            // *provisional*: the watcher's authoritative decision, when it
+            // arrives, replaces this guess, so an excluded application is
+            // still routed Direct even if its SYN won the race.
+            //
+            // `clamp_mss` only acts on TCP SYN packets, so `modified`
+            // is a reliable indicator of a SYN.
+            if modified {
+                table.insert_provisional(key, translation.default_disposition);
+                translation.default_disposition
+            } else {
+                // Non-SYN packets of unclassified flows stay on the
+                // physical link; the flow will be classified soon.
+                return Outcome::PassThrough;
+            }
+        }
+    };
+
+    if disposition != Disposition::Tunnel {
+        if modified {
+            return Outcome::PassThroughModified;
+        }
         return Outcome::PassThrough;
     }
     // The application bound to the physical address, but the server only
@@ -359,6 +419,8 @@ pub(crate) fn prepare_outbound(
     if !packet.set_source(translation.tunnel) {
         return Outcome::Discard;
     }
+    // Clamp again in case the SYN was already clamped above: the function is
+    // idempotent and returns false when the value already fits.
     packet.clamp_mss(translation.max_segment_size);
     Outcome::Tunnel
 }
@@ -494,12 +556,27 @@ impl Diverter {
                 let end = offset.saturating_add(length).min(bytes);
                 let packet = &mut buffer[start..end];
                 offset = end;
-                match prepare_outbound(packet, &self.table, translation, self.geo.as_ref()) {
+                let outcome = prepare_outbound(packet, &self.table, translation, self.geo.as_ref());
+                match outcome {
                     Outcome::PassThrough => {
                         stats.passed = stats.passed.saturating_add(1);
                         // Captured but unmodified, so the checksums the stack
                         // computed are still correct and reinjection is a
                         // straight handback.
+                        if reinject.is_full(packet.len()) {
+                            reinject.flush(&self.handle);
+                        }
+                        reinject.push(packet, *address);
+                    }
+                    Outcome::PassThroughModified => {
+                        stats.passed = stats.passed.saturating_add(1);
+                        // The TCP MSS option was rewritten, which invalidates
+                        // the TCP checksum. Recompute before reinjection.
+                        let mut owned = *address;
+                        if let Err(error) = self.handle.calc_checksums(packet, &mut owned) {
+                            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+                            continue;
+                        }
                         if reinject.is_full(packet.len()) {
                             reinject.flush(&self.handle);
                         }
@@ -581,7 +658,7 @@ mod tests {
     const RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 77, 0, 1));
 
     fn addresses() -> Translation {
-        Translation::new(PHYSICAL, TUNNEL, RESOLVER, 1280)
+        Translation::new(PHYSICAL, TUNNEL, RESOLVER, 1280, Disposition::Tunnel)
     }
 
     fn udp_packet(source: IpAddr, destination: IpAddr) -> Vec<u8> {
@@ -793,7 +870,7 @@ mod tests {
         assert_eq!(addresses().max_segment_size, 1240);
         // A nonsensically small MTU must not wrap around into a huge limit.
         assert_eq!(
-            Translation::new(PHYSICAL, TUNNEL, RESOLVER, 8).max_segment_size,
+            Translation::new(PHYSICAL, TUNNEL, RESOLVER, 8, Disposition::Tunnel).max_segment_size,
             0
         );
     }
@@ -874,5 +951,123 @@ mod tests {
         let filter = filter(server);
         let udp_branch = filter.split("tcp or ").nth(1).expect("udp branch");
         assert!(udp_branch.contains("203.0.113.10"));
+    }
+
+    /// An IPv4 TCP SYN destined for the public internet, with an MSS of 1460.
+    fn outbound_syn(mss: u16) -> Vec<u8> {
+        let (IpAddr::V4(physical), IpAddr::V4(remote)) = (PHYSICAL, REMOTE) else {
+            unreachable!("tests use IPv4")
+        };
+        let mut packet = vec![0_u8; 20 + 28];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&physical.octets());
+        packet[16..20].copy_from_slice(&remote.octets());
+        packet[20..22].copy_from_slice(&51_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        // Seven 32-bit words of TCP header, SYN set.
+        packet[32] = 7 << 4;
+        packet[33] = 0x02;
+        // Window scale, then NOP padding, then the MSS option.
+        packet[40] = 3;
+        packet[41] = 3;
+        packet[42] = 7;
+        packet[43] = 1;
+        packet[44] = 2;
+        packet[45] = 4;
+        packet[46..48].copy_from_slice(&mss.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn tunnels_an_unclassified_syn_and_clamps_its_mss() {
+        // The socket watcher classifies flows asynchronously. A SYN that races
+        // its connect event used to be passed through, which let the ACK and
+        // ClientHello (classified moments later) go through the tunnel instead.
+        // That mixed path made the server see two source addresses and reset
+        // the connection. The SYN is now pinned to the default disposition
+        // (Tunnel in Exclude mode) and tunnelled, so the whole connection takes
+        // one path. The MSS is still clamped for the tunnel's MTU.
+        let mut packet = outbound_syn(1460);
+        let table = FlowTable::default();
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 1240);
+        // The flow is now provisionally pinned to the default (Tunnel).
+        assert_eq!(
+            table.lookup(&FlowKey {
+                protocol: 6,
+                local: PHYSICAL,
+                local_port: 51_000,
+                remote: REMOTE,
+                remote_port: 443,
+            }),
+            Some(Disposition::Tunnel)
+        );
+    }
+
+    #[test]
+    fn leaves_an_unclassified_non_syn_byte_for_byte_alone() {
+        // Only the handshake carries an MSS option to clamp. A mid-stream
+        // segment of an unclassified flow must pass through untouched.
+        let mut packet = outbound_syn(1460);
+        // Clear SYN: a normal data segment.
+        packet[33] = 0x10;
+        let original = packet.clone();
+        let table = FlowTable::default();
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::PassThrough
+        );
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn clamps_a_classified_syn_and_routes_it_to_the_tunnel() {
+        let mut packet = outbound_syn(1460);
+        let table = FlowTable::default();
+        table.insert_for_test(
+            FlowKey {
+                protocol: 6,
+                local: PHYSICAL,
+                local_port: 51_000,
+                remote: REMOTE,
+                remote_port: 443,
+            },
+            Disposition::Tunnel,
+        );
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 1240);
+        // The source must have been rewritten onto the tunnel address.
+        assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
+    }
+
+    #[test]
+    fn clamps_a_syn_of_an_excluded_flow_and_passes_it_back_modified() {
+        // An excluded application's SYN is clamped too. The smaller segment
+        // costs nothing on the physical link, and the clamp protects against
+        // the flow being reclassified to Tunnel later.
+        let mut packet = outbound_syn(1460);
+        let table = FlowTable::default();
+        table.insert_for_test(
+            FlowKey {
+                protocol: 6,
+                local: PHYSICAL,
+                local_port: 51_000,
+                remote: REMOTE,
+                remote_port: 443,
+            },
+            Disposition::Direct,
+        );
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::PassThroughModified
+        );
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 1240);
     }
 }
