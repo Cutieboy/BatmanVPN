@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const LAST_USED_PROFILE_FILE: &str = "last-profile";
+
 use mousevpn_config::{ClientConfig, ClientProtocol};
 use mousevpn_profile_cli::decrypt_profile;
 use serde::{Deserialize, Serialize};
@@ -137,6 +139,28 @@ pub(crate) fn remove(id: &str) -> Result<(), String> {
 
 pub(crate) fn profile_path(id: &str) -> Result<PathBuf, String> {
     Ok(profiles_dir()?.join(format!("{}.toml", normalized_id(id)?)))
+}
+
+pub(crate) fn last_used_id() -> Result<Option<String>, String> {
+    let path = profiles_dir()?.join(LAST_USED_PROFILE_FILE);
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let id = contents.trim();
+            if id.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(normalized_id(id)?))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(display_error(error)),
+    }
+}
+
+pub(crate) fn mark_last_used(id: &str) -> Result<(), String> {
+    let id = normalized_id(id)?;
+    let path = profiles_dir()?.join(LAST_USED_PROFILE_FILE);
+    write_atomic(&path, id.as_bytes())
 }
 
 pub(crate) fn normalized_id(id: &str) -> Result<String, String> {
