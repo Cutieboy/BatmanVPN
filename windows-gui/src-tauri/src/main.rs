@@ -264,14 +264,17 @@ fn autostart_command(executable: &Path) -> String {
     format!("\"{}\" --minimized --autoconnect", executable.display())
 }
 
-fn autoconnect_first_profile(state: &AppState) {
-    let Ok(profiles) = profiles::list() else {
+fn autoconnect_last_profile(state: &AppState) {
+    let Ok(id) = profiles::last_used_id() else {
         return;
     };
-    let Some(profile) = profiles.first() else {
+    let Some(id) = id else {
         return;
     };
-    if let Err(error) = connect_profile_inner(profile.id().to_owned(), state) {
+    if !profiles::profile_path(&id).map_or(false, |path| path.exists()) {
+        return;
+    }
+    if let Err(error) = connect_profile_inner(id, state) {
         set_tray_error(state, error);
     }
 }
@@ -319,7 +322,8 @@ pub(crate) fn connect_profile_inner(
         profile_id: Some(id.clone()),
     };
     *lock(&state.snapshot)? = snapshot.clone();
-    *lock(&state.last_profile_id)? = Some(id);
+    *lock(&state.last_profile_id)? = Some(id.clone());
+    let _ = profiles::mark_last_used(&id);
     let shared_snapshot = Arc::clone(&state.snapshot);
     let generation = Arc::clone(&state.generation);
     let reader_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -598,7 +602,7 @@ fn run_gui(minimized: bool, autoconnect: bool) {
                 let _ = set_autostart(true);
             }
             if autoconnect {
-                autoconnect_first_profile(app.state::<AppState>().inner());
+                autoconnect_last_profile(app.state::<AppState>().inner());
             }
             Ok(())
         })
