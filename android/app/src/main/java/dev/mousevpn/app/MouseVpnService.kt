@@ -156,6 +156,7 @@ class MouseVpnService : VpnService() {
                     profile.serverPublicKey,
                     profile.clientPrivateKey,
                     profile.protocol.nativeValue,
+                    generation,
                 ),
             )
             handle = prepared.getLong("handle")
