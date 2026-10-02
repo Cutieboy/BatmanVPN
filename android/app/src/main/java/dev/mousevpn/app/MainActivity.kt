@@ -8,7 +8,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.app.AlertDialog
-import android.content.res.Configuration
 import android.net.Uri
 import android.text.InputType
 import android.widget.EditText
