@@ -69,27 +69,37 @@
         <!-- Hero / connection scene -->
         <FrameLayout
             android:layout_width="match_parent"
-            android:layout_height="350dp"
+            android:layout_height="300dp"
             android:layout_marginTop="8dp"
             android:background="@drawable/bg_hero"
             android:clipToOutline="true">
 
             <ImageView
-                android:layout_width="220dp"
-                android:layout_height="220dp"
+                android:layout_width="160dp"
+                android:layout_height="160dp"
                 android:layout_gravity="top|center_horizontal"
-                android:layout_marginTop="16dp"
-                android:alpha="0.8"
+                android:layout_marginTop="10dp"
+                android:alpha="0.65"
                 android:contentDescription="@null"
                 android:src="@drawable/bg_hero_glow" />
 
             <ImageView
                 android:layout_width="match_parent"
-                android:layout_height="110dp"
+                android:layout_height="90dp"
                 android:layout_gravity="bottom"
                 android:contentDescription="@null"
                 android:scaleType="fitXY"
                 android:src="@drawable/ic_gotham_skyline" />
+
+            <ImageView
+                android:id="@+id/connectionSpotlight"
+                android:layout_width="205dp"
+                android:layout_height="205dp"
+                android:layout_gravity="top|center_horizontal"
+                android:layout_marginTop="9dp"
+                android:contentDescription="@null"
+                android:src="@drawable/bg_spotlight"
+                android:visibility="invisible" />
 
             <TextView
                 android:layout_width="70dp"
@@ -108,10 +118,10 @@
                 android:layout_width="190dp"
                 android:layout_height="190dp"
                 android:layout_gravity="top|center_horizontal"
-                android:layout_marginTop="30dp"
+                android:layout_marginTop="28dp"
                 android:background="@drawable/bg_power_off"
                 android:contentDescription="@string/connect_toggle"
-                android:padding="55dp"
+                android:padding="44dp"
                 android:scaleType="centerInside"
                 android:src="@drawable/ic_batman_emblem" />
 
@@ -120,7 +130,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_gravity="bottom"
-                android:layout_marginBottom="53dp"
+                android:layout_marginBottom="48dp"
                 android:gravity="center"
                 android:text="@string/status_off_title"
                 android:textColor="@color/text_primary"
@@ -132,7 +142,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_gravity="bottom"
-                android:layout_marginBottom="30dp"
+                android:layout_marginBottom="27dp"
                 android:gravity="center"
                 android:text="@string/status_off_hint"
                 android:textColor="@color/text_secondary"
@@ -230,46 +240,40 @@
                 android:textSize="27sp" />
         </LinearLayout>
 
-        <!-- Live metrics -->
+        <!-- Live connection metrics -->
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="72dp"
+            android:layout_height="96dp"
             android:layout_marginTop="8dp"
             android:background="@drawable/bg_card"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:paddingStart="16dp"
-            android:paddingEnd="16dp">
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp">
 
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
+                android:layout_weight="1.2"
                 android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="SERVER"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="9sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/statServerValue"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:text="—"
-                    android:textColor="@color/text_primary"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="IP" android:textColor="@color/text_secondary" android:textSize="8sp" android:textStyle="bold" />
+                <TextView android:id="@+id/statIpValue" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="4dp" android:ellipsize="end" android:maxLines="1" android:text="—" android:textColor="@color/text_primary" android:textSize="13sp" android:textStyle="bold" />
+                <TextView android:id="@+id/statCountryValue" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="2dp" android:ellipsize="end" android:maxLines="1" android:text="—" android:textColor="@color/text_secondary" android:textSize="10sp" />
             </LinearLayout>
 
-            <View
-                android:layout_width="1dp"
-                android:layout_height="38dp"
-                android:background="@color/divider" />
+            <View android:layout_width="1dp" android:layout_height="52dp" android:background="@color/divider" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="0.8"
+                android:gravity="center"
+                android:orientation="vertical">
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="PING" android:textColor="@color/text_secondary" android:textSize="8sp" android:textStyle="bold" />
+                <TextView android:id="@+id/statPingValue" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="4dp" android:text="—" android:textColor="@color/text_primary" android:textSize="16sp" android:textStyle="bold" />
+            </LinearLayout>
+
+            <View android:layout_width="1dp" android:layout_height="52dp" android:background="@color/divider" />
 
             <LinearLayout
                 android:layout_width="0dp"
@@ -277,24 +281,8 @@
                 android:layout_weight="1"
                 android:gravity="end"
                 android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="TIME"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="9sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/statTimeValue"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:text="—"
-                    android:textColor="@color/text_primary"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="SPEED" android:textColor="@color/text_secondary" android:textSize="8sp" android:textStyle="bold" />
+                <TextView android:id="@+id/statSpeedValue" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="4dp" android:text="—" android:textColor="@color/text_primary" android:textSize="16sp" android:textStyle="bold" />
             </LinearLayout>
         </LinearLayout>
 
