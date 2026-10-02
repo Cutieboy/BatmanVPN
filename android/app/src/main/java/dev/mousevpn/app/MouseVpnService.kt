@@ -30,7 +30,6 @@ class MouseVpnService : VpnService() {
     @Volatile private var handle = 0L
     @Volatile private var diagnosticSessionId = 0L
     @Volatile private var underlyingNetwork = "unknown"
-    @Volatile private var currentMetricsJson = "{}"
     private val underlyingNetworks = ConcurrentHashMap<Network, UnderlyingNetworkState>()
     private var selectedUnderlyingNetwork: Network? = null
     private var selectedUnderlyingState: UnderlyingNetworkState? = null
