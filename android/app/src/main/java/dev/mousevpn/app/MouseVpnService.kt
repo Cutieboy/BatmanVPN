@@ -256,6 +256,9 @@ class MouseVpnService : VpnService() {
             !Thread.currentThread().isInterrupted &&
             connectionGeneration.get() == generation
 
+    fun isConnectionCancelled(generation: Long): Boolean =
+        !isAttemptActive(generation)
+
     private fun ensureAttemptActive(generation: Long) {
         if (!isAttemptActive(generation)) throw InterruptedException()
     }
