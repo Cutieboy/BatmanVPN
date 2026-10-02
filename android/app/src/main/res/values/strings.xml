@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">MouseVPN</string>
+    <string name="app_name">BatmanVPN</string>
     <string name="profile_label">Профиль</string>
     <string name="select_server">Выберите сервер</string>
     <string name="select_server_hint">Активная конфигурация используется при следующем подключении</string>
