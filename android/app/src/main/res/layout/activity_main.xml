@@ -27,7 +27,7 @@
                 android:layout_height="50dp"
                 android:contentDescription="@null"
                 android:scaleType="fitCenter"
-                android:src="@drawable/mousevpn_logo_header" />
+                android:src="@drawable/ic_batman_emblem" />
 
             <TextView
                 android:layout_width="0dp"
