@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
     private lateinit var powerButton: ImageButton
+    private lateinit var heroGlow: View
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
     private lateinit var statIp: TextView
@@ -97,6 +98,7 @@ class MainActivity : Activity() {
         statusTitle = findViewById(R.id.statusTitle)
         statusText = findViewById(R.id.statusText)
         powerButton = findViewById(R.id.powerButton)
+        heroGlow = findViewById(R.id.heroGlow)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
         statIp = findViewById(R.id.statIpValue)
@@ -426,8 +428,9 @@ class MainActivity : Activity() {
             message.startsWith("Ошибка") || message == "Соединение потеряно" -> message
             else -> getString(R.string.status_off_hint)
         }
-        powerButton.setBackgroundResource(if (connected) R.drawable.bg_power_on else R.drawable.bg_power_off)
-        powerButton.setColorFilter(if (connected) Color.rgb(28, 23, 0) else Color.rgb(242, 195, 0))
+        powerButton.setBackgroundColor(Color.TRANSPARENT)
+        powerButton.setImageResource(if (connected) R.drawable.ic_batman_flying else R.drawable.ic_batman_sleeping)
+        heroGlow.visibility = if (connected) View.VISIBLE else View.INVISIBLE
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
