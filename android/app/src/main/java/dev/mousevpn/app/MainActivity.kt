@@ -44,6 +44,8 @@ class MainActivity : Activity() {
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
     private lateinit var connectionDetails: TextView
+    private lateinit var connectionSubdetails: TextView
+    private lateinit var heroLogo: android.widget.ImageView
     private lateinit var powerButton: TextView
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
@@ -76,6 +78,7 @@ class MainActivity : Activity() {
                 "—"
             }
             updateLiveMetrics(now)
+            updateConnectionDetails()
             handler.postDelayed(this, 1_000)
         }
     }
@@ -96,6 +99,8 @@ class MainActivity : Activity() {
         statusTitle = findViewById(R.id.statusTitle)
         statusText = findViewById(R.id.statusText)
         connectionDetails = findViewById(R.id.connectionDetails)
+        connectionSubdetails = findViewById(R.id.connectionSubdetails)
+        heroLogo = findViewById(R.id.heroLogo)
         powerButton = findViewById(R.id.powerButton)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
@@ -435,6 +440,10 @@ class MainActivity : Activity() {
                 else -> getColor(R.color.status_off)
             },
         )
+        powerButton.isActivated = connected
+        heroLogo.setImageResource(
+            if (connected) R.drawable.batman_logo_flying else R.drawable.batman_logo_sleeping
+        )
         updateConnectionDetails()
         if (!connected) {
             statTime.text = "—"
@@ -472,7 +481,12 @@ class MainActivity : Activity() {
         } else {
             "($count $noun в обход)"
         }
-        connectionDetails.text = "${profile.endpoint} $suffix"
+        connectionDetails.text = profile.endpoint
+        connectionSubdetails.text = if (connected) {
+            "$suffix  •  \${formatDuration((SystemClock.elapsedRealtime() - MouseVpnService.connectedSinceElapsedRealtime).coerceAtLeast(0L))}"
+        } else {
+            suffix
+        }
     }
 
     private fun updateLiveMetrics(now: Long) {
