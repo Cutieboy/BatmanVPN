@@ -29,10 +29,13 @@ import android.widget.ImageButton
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONObject
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
