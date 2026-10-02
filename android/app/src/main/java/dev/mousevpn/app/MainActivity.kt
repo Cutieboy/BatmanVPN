@@ -44,6 +44,10 @@ class MainActivity : Activity() {
     private lateinit var powerButton: ImageButton
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
+    private lateinit var statIp: TextView
+    private lateinit var statCountry: TextView
+    private lateinit var statPing: TextView
+    private lateinit var statSpeed: TextView
     private lateinit var protocolMode: Spinner
     private lateinit var protocolHint: TextView
     private lateinit var networkTestButton: Button
@@ -55,15 +59,20 @@ class MainActivity : Activity() {
     private var bindingProtocol = true
     @Volatile private var networkTestRunning = false
     private var pendingBackupBytes: ByteArray? = null
+    private var publicInfoLoadedForSession = false
+    private var lastMetricsBytes = 0L
+    private var lastMetricsAt = 0L
 
     private val clock = object : Runnable {
         override fun run() {
+            val now = SystemClock.elapsedRealtime()
             val since = MouseVpnService.connectedSinceElapsedRealtime
             statTime.text = if (connected && since > 0L) {
-                formatDuration(SystemClock.elapsedRealtime() - since)
+                formatDuration(now - since)
             } else {
                 "—"
             }
+            updateLiveMetrics(now)
             handler.postDelayed(this, 1_000)
         }
     }
@@ -86,6 +95,10 @@ class MainActivity : Activity() {
         powerButton = findViewById(R.id.powerButton)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
+        statIp = findViewById(R.id.statIpValue)
+        statCountry = findViewById(R.id.statCountryValue)
+        statPing = findViewById(R.id.statPingValue)
+        statSpeed = findViewById(R.id.statSpeedValue)
         protocolMode = findViewById(R.id.protocolMode)
         protocolHint = findViewById(R.id.protocolHint)
         networkTestButton = findViewById(R.id.networkTest)
@@ -410,10 +423,73 @@ class MainActivity : Activity() {
             else -> getString(R.string.status_off_hint)
         }
         powerButton.setBackgroundResource(if (connected) R.drawable.bg_power_on else R.drawable.bg_power_off)
-        if (!connected) statTime.text = "—"
+        if (!connected) {
+            statTime.text = "—"
+            statIp.text = "—"
+            statCountry.text = "—"
+            statPing.text = "—"
+            statSpeed.text = "—"
+            publicInfoLoadedForSession = false
+            lastMetricsBytes = 0L
+            lastMetricsAt = 0L
+        } else if (!publicInfoLoadedForSession) {
+            publicInfoLoadedForSession = true
+            fetchPublicNetworkInfo()
+        }
         updatePowerEnabled()
         updateProtocolUi()
         updateNetworkTestButton()
+    }
+
+    private fun updateLiveMetrics(now: Long) {
+        if (!connected) return
+        val metrics = runCatching { JSONObject(MouseVpnService.currentMetricsJson) }.getOrNull() ?: return
+        val received = metrics.optLong("bytesReceived")
+        val sent = metrics.optLong("bytesSent")
+        val total = received + sent
+        val previousAt = lastMetricsAt
+        val previousBytes = lastMetricsBytes
+        if (previousAt > 0L && now > previousAt) {
+            val bitsPerSecond = ((total - previousBytes).coerceAtLeast(0L) * 8_000L) /
+                (now - previousAt).coerceAtLeast(1L)
+            statSpeed.text = formatBitRate(bitsPerSecond)
+        }
+        lastMetricsBytes = total
+        lastMetricsAt = now
+        val rtt = metrics.optLong("lastKeepaliveRttMs")
+        statPing.text = if (rtt > 0L) "$rtt мс" else "—"
+    }
+
+    private fun fetchPublicNetworkInfo() {
+        networkTestExecutor.execute {
+            val result = runCatching {
+                val connection = URL("https://ipwho.is/").openConnection() as HttpURLConnection
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 5_000
+                connection.requestMethod = "GET"
+                connection.useCaches = false
+                try {
+                    if (connection.responseCode !in 200..299) error("HTTP " + connection.responseCode)
+                    JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                } finally {
+                    connection.disconnect()
+                }
+            }
+            val ip = result.getOrNull()?.optString("ip").orEmpty()
+            val country = result.getOrNull()?.optString("country").orEmpty()
+            runOnUiThread {
+                if (!connected) return@runOnUiThread
+                statIp.text = ip.ifBlank { "—" }
+                statCountry.text = country.ifBlank { "—" }
+            }
+        }
+    }
+
+    private fun formatBitRate(bitsPerSecond: Long): String = when {
+        bitsPerSecond >= 1_000_000_000L -> "%.1f Гбит/с".format(bitsPerSecond / 1_000_000_000.0)
+        bitsPerSecond >= 1_000_000L -> "%.1f Мбит/с".format(bitsPerSecond / 1_000_000.0)
+        bitsPerSecond >= 1_000L -> "%.0f Кбит/с".format(bitsPerSecond / 1_000.0)
+        else -> "$bitsPerSecond бит/с"
     }
 
     private fun updateProtocolUi() {
