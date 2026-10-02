@@ -1,14 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="background">#08111F</color>
-    <color name="surface">#111C2D</color>
-    <color name="surface_raised">#18263A</color>
-    <color name="surface_pressed">#22354E</color>
-    <color name="accent">#42D9D0</color>
-    <color name="accent_dim">#244D56</color>
-    <color name="on_accent">#052022</color>
-    <color name="text_primary">#F4F8FC</color>
-    <color name="text_secondary">#9CAFC2</color>
-    <color name="divider">#26374C</color>
-    <color name="error">#FF8A80</color>
+    <!-- Batman-inspired palette: deep black surfaces with a restrained signal yellow accent. -->
+    <color name="background">#050505</color>
+    <color name="surface">#111111</color>
+    <color name="surface_raised">#1A1A1A</color>
+    <color name="surface_pressed">#292929</color>
+    <color name="accent">#F2C300</color>
+    <color name="accent_dim">#6F5A00</color>
+    <color name="on_accent">#0A0A0A</color>
+    <color name="text_primary">#F5F5F5</color>
+    <color name="text_secondary">#A8A8A8</color>
+    <color name="divider">#2A2A2A</color>
+    <color name="error">#FF6B5F</color>
 </resources>
