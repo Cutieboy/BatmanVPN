@@ -4,12 +4,12 @@
             <gradient
                 android:type="radial"
                 android:centerX="50%"
-                android:centerY="42%"
-                android:gradientRadius="72%"
-                android:startColor="#FFE66A"
+                android:centerY="40%"
+                android:gradientRadius="58%"
+                android:startColor="#FFF4A3"
                 android:centerColor="#F2C300"
-                android:endColor="#6A5300" />
-            <stroke android:width="4dp" android:color="#FFF0A0"/>
+                android:endColor="#5A4500" />
+            <stroke android:width="3dp" android:color="#FFF1A0"/>
         </shape>
     </item>
     <item>
@@ -17,12 +17,12 @@
             <gradient
                 android:type="radial"
                 android:centerX="50%"
-                android:centerY="42%"
-                android:gradientRadius="72%"
-                android:startColor="#FFD928"
-                android:centerColor="#E5B800"
-                android:endColor="#3E3100" />
-            <stroke android:width="4dp" android:color="#FFD000"/>
+                android:centerY="38%"
+                android:gradientRadius="62%"
+                android:startColor="#FFE873"
+                android:centerColor="#F0C000"
+                android:endColor="#4A3900" />
+            <stroke android:width="3dp" android:color="#FFD72A"/>
         </shape>
     </item>
 </selector>
