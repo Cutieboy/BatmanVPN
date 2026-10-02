@@ -26,7 +26,7 @@ import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -45,7 +45,7 @@ class MainActivity : Activity() {
     private lateinit var endpoint: TextView
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
-    private lateinit var powerButton: ImageButton
+    private lateinit var powerButton: ImageView
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
     private lateinit var statIp: TextView
