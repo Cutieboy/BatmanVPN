@@ -58,23 +58,13 @@
                 android:src="@drawable/ic_settings" />
         </LinearLayout>
 
-        <!-- Hero / connection scene -->
+        <!-- Connection status -->
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="300dp"
             android:layout_marginTop="8dp"
             android:background="@drawable/bg_hero"
             android:clipToOutline="true">
-
-            <ImageView
-                android:id="@+id/heroGlow"
-                android:layout_width="190dp"
-                android:layout_height="190dp"
-                android:layout_gravity="top|center_horizontal"
-                android:layout_marginTop="4dp"
-                android:alpha="0.85"
-                android:contentDescription="@null"
-                android:src="@drawable/bg_hero_glow" />
 
             <ImageView
                 android:layout_width="match_parent"
@@ -84,45 +74,37 @@
                 android:scaleType="fitXY"
                 android:src="@drawable/ic_gotham_skyline" />
 
-            <ImageButton
-                android:id="@+id/powerButton"
-                android:layout_width="170dp"
-                android:layout_height="150dp"
-                android:layout_gravity="top|center_horizontal"
-                android:layout_marginTop="28dp"
-                android:background="@android:color/transparent"
-                android:contentDescription="@string/connect_toggle"
-                android:padding="0dp"
-                android:scaleType="fitCenter"
-                android:src="@drawable/ic_batman_sleeping" />
-
             <TextView
-                android:id="@+id/statusTitle"
-                android:layout_width="match_parent"
+                android:id="@+id/powerButton"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="bottom"
-                android:layout_marginBottom="48dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_card"
+                android:clickable="true"
+                android:focusable="true"
                 android:gravity="center"
-                android:text="@string/status_off_title"
-                android:textColor="@color/text_primary"
-                android:textSize="23sp"
+                android:minWidth="190dp"
+                android:paddingStart="30dp"
+                android:paddingTop="20dp"
+                android:paddingEnd="30dp"
+                android:paddingBottom="20dp"
+                android:text="✕  ВЫКЛ"
+                android:textColor="@color/status_off"
+                android:textSize="30sp"
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/statusTitle"
+                android:layout_width="1dp"
+                android:layout_height="1dp"
+                android:visibility="gone" />
+
+            <TextView
                 android:id="@+id/statusText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_gravity="bottom"
-                android:layout_marginBottom="27dp"
-                android:gravity="center"
-                android:text="@string/status_off_hint"
-                android:textColor="@color/text_secondary"
-                android:textSize="14sp" />
-
-            
-        </FrameLayout>
-
-        <!-- Server -->
+                android:layout_width="1dp"
+                android:layout_height="1dp"
+                android:visibility="gone" />
+        </FrameLayout>       <!-- Server -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="78dp"
