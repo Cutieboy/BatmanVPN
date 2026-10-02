@@ -66,10 +66,41 @@
                 android:src="@drawable/ic_settings" />
         </LinearLayout>
 
+        <ImageButton
+            android:id="@+id/powerButton"
+            android:layout_width="196dp"
+            android:layout_height="196dp"
+            android:layout_marginTop="28dp"
+            android:background="@drawable/bg_power_off"
+            android:contentDescription="@string/connect_toggle"
+            android:padding="50dp"
+            android:src="@drawable/ic_batman_emblem" />
+
+        <TextView
+            android:id="@+id/statusTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="15dp"
+            android:gravity="center"
+            android:text="@string/status_off_title"
+            android:textColor="@color/text_primary"
+            android:textSize="25sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="5dp"
+            android:gravity="center"
+            android:text="@string/status_off_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="15sp" />
+
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="100dp"
-            android:layout_marginTop="12dp"
+            android:layout_height="88dp"
+            android:layout_marginTop="18dp"
             android:background="@drawable/bg_card"
             android:gravity="center_vertical"
             android:orientation="horizontal"
@@ -137,44 +168,45 @@
                 android:textSize="29sp" />
         </LinearLayout>
 
-        <ImageButton
-            android:id="@+id/powerButton"
-            android:layout_width="196dp"
-            android:layout_height="196dp"
-            android:layout_marginTop="28dp"
-            android:background="@drawable/bg_power_off"
-            android:contentDescription="@string/connect_toggle"
-            android:padding="50dp"
-            android:src="@drawable/ic_batman_emblem" />
-
-        <TextView
-            android:id="@+id/statusTitle"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="15dp"
-            android:gravity="center"
-            android:text="@string/status_off_title"
-            android:textColor="@color/text_primary"
-            android:textSize="25sp"
-            android:textStyle="bold" />
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:padding="17dp">
 
-        <TextView
-            android:id="@+id/statusText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="5dp"
-            android:gravity="center"
-            android:text="@string/status_off_hint"
-            android:textColor="@color/text_secondary"
-            android:textSize="15sp" />
+            <include layout="@layout/item_status_server" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="12dp"
+                android:layout_marginBottom="12dp"
+                android:background="@color/divider" />
+
+            <include layout="@layout/item_status_traffic" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="12dp"
+                android:layout_marginBottom="12dp"
+                android:background="@color/divider" />
+
+            <include layout="@layout/item_status_time" />
+        </LinearLayout>
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="22dp"
+            android:layout_marginTop="10dp"
             android:background="@drawable/bg_card"
             android:orientation="vertical"
-            android:padding="15dp">
+            android:paddingStart="14dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="14dp"
+            android:paddingBottom="10dp">
 
             <TextView
                 android:layout_width="wrap_content"
@@ -211,35 +243,6 @@
                 android:background="@drawable/bg_input"
                 android:contentDescription="@string/protocol_title"
                 android:popupBackground="@color/surface" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:background="@drawable/bg_card"
-            android:orientation="vertical"
-            android:padding="17dp">
-
-            <include layout="@layout/item_status_server" />
-
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:layout_marginTop="12dp"
-                android:layout_marginBottom="12dp"
-                android:background="@color/divider" />
-
-            <include layout="@layout/item_status_traffic" />
-
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:layout_marginTop="12dp"
-                android:layout_marginBottom="12dp"
-                android:background="@color/divider" />
-
-            <include layout="@layout/item_status_time" />
         </LinearLayout>
 
         <Button
