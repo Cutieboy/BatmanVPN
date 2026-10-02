@@ -42,6 +42,7 @@ class MainActivity : Activity() {
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
     private lateinit var powerButton: ImageButton
+    private lateinit var connectionSpotlight: View
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
     private lateinit var statIp: TextView
@@ -93,6 +94,7 @@ class MainActivity : Activity() {
         statusTitle = findViewById(R.id.statusTitle)
         statusText = findViewById(R.id.statusText)
         powerButton = findViewById(R.id.powerButton)
+        connectionSpotlight = findViewById(R.id.connectionSpotlight)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
         statIp = findViewById(R.id.statIpValue)
@@ -423,6 +425,7 @@ class MainActivity : Activity() {
             else -> getString(R.string.status_off_hint)
         }
         powerButton.setBackgroundResource(if (connected) R.drawable.bg_power_on else R.drawable.bg_power_off)
+        connectionSpotlight.visibility = if (connected) View.VISIBLE else View.INVISIBLE
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
