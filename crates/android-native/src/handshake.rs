@@ -27,7 +27,16 @@ pub(crate) fn negotiate(
     config: &ValidatedClientConfig,
     wire: &ClientWire,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
-    negotiate_with_stop(socket, config, wire, None)
+    negotiate_with_cancel(socket, config, wire, || Ok(false))
+}
+
+pub(crate) fn negotiate_cancellable(
+    socket: UdpSocket,
+    config: &ValidatedClientConfig,
+    wire: &ClientWire,
+    mut cancelled: impl FnMut() -> Result<bool>,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    negotiate_with_cancel(socket, config, wire, &mut cancelled)
 }
 
 pub(crate) fn negotiate_interruptible(
@@ -36,29 +45,37 @@ pub(crate) fn negotiate_interruptible(
     wire: &ClientWire,
     stopping: &AtomicBool,
 ) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
-    negotiate_with_stop(socket, config, wire, Some(stopping))
+    negotiate_with_cancel(socket, config, wire, || {
+        Ok(stopping.load(Ordering::Relaxed))
+    })
 }
 
-fn negotiate_with_stop(
+fn negotiate_with_cancel<F>(
     socket: UdpSocket,
     config: &ValidatedClientConfig,
     wire: &ClientWire,
-    stopping: Option<&AtomicBool>,
-) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)> {
+    mut cancelled: F,
+) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters)>
+where
+    F: FnMut() -> Result<bool>,
+{
     socket
         .connect(config.server)
         .context("UDP connect failed")?;
     let mut transport = UdpTransport::from_socket(socket, config.server)?;
-    let (plane, parameters) = renegotiate(&mut transport, config, wire, stopping)?;
+    let (plane, parameters) = renegotiate(&mut transport, config, wire, &mut cancelled)?;
     Ok((transport, plane, parameters))
 }
 
-fn renegotiate(
+fn renegotiate<F>(
     transport: &mut UdpTransport,
     config: &ValidatedClientConfig,
     wire: &ClientWire,
-    stopping: Option<&AtomicBool>,
-) -> Result<(TunnelDataPlane, SessionParameters)> {
+    cancelled: &mut F,
+) -> Result<(TunnelDataPlane, SessionParameters)>
+where
+    F: FnMut() -> Result<bool>,
+{
     let mut session_bytes = [0_u8; 8];
     getrandom::fill(&mut session_bytes).context("random generator failed")?;
     let session_id = u64::from_be_bytes(session_bytes);
@@ -83,6 +100,9 @@ fn renegotiate(
 
     let started = Instant::now();
     let deadline = started + TIMEOUT;
+    if cancelled()? {
+        return Err(anyhow!("handshake cancelled"));
+    }
     send_prelude(transport, wire)?;
     let mut encoded_request = Vec::new();
     send_request(transport, wire, &request, &mut encoded_request)?;
@@ -91,7 +111,7 @@ fn renegotiate(
     let mut buffer = vec![0_u8; 65_535];
     let mut decoded = Vec::with_capacity(65_535);
     loop {
-        if stopping.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if cancelled()? {
             return Err(anyhow!("handshake cancelled"));
         }
         let now = Instant::now();
@@ -123,6 +143,9 @@ fn renegotiate(
         }
         let (crypto, payload) = handshake.finish(response.payload)?;
         let parameters = SessionParameters::decode(&payload)?;
+        if cancelled()? {
+            return Err(anyhow!("handshake cancelled"));
+        }
         return Ok((
             TunnelDataPlane::new(session_id, usize::from(parameters.mtu), crypto),
             parameters,
