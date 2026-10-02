@@ -465,8 +465,14 @@ class MainActivity : Activity() {
 
     private fun updateConnectionDetails() {
         val profile = runCatching { store.selected() }.getOrNull()
-        if (!connected || profile == null) {
+        if (profile == null) {
             connectionDetails.text = ""
+            connectionSubdetails.text = ""
+            return
+        }
+        if (!connected) {
+            connectionDetails.text = "Нажмите, чтобы подключиться"
+            connectionSubdetails.text = ""
             return
         }
         val policy = ExcludedApps(this).policy()
