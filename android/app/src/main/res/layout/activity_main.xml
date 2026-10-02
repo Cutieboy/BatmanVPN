@@ -115,8 +115,8 @@
 
             <ImageButton
                 android:id="@+id/powerButton"
-                android:layout_width="190dp"
-                android:layout_height="190dp"
+                android:layout_width="160dp"
+                android:layout_height="160dp"
                 android:layout_gravity="top|center_horizontal"
                 android:layout_marginTop="28dp"
                 android:background="@drawable/bg_power_off"
