@@ -201,3 +201,42 @@ pub(crate) fn bind_socket(server: SocketAddr) -> Result<UdpSocket> {
     };
     UdpSocket::bind(local).context("UDP bind failed")
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mousevpn_config::{encode_public_key, encode_secret_key, ClientConfig, ClientProtocol};
+    use mousevpn_crypto::KeyPair;
+
+    #[test]
+    fn cancellation_interrupts_a_silent_server_without_waiting_for_handshake_timeout() {
+        // Keep the peer socket open so the client waits for a reply rather than ICMP.
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_keys = KeyPair::generate().unwrap();
+        let client_keys = KeyPair::generate().unwrap();
+        let config = ClientConfig {
+            server: peer.local_addr().unwrap(),
+            server_public_key: encode_public_key(&server_keys.public),
+            client_private_key: encode_secret_key(&client_keys.secret),
+            tun_name: "cancel-test".to_owned(),
+            protocol: ClientProtocol::Legacy,
+        }
+        .validate()
+        .unwrap();
+        let wire = ClientWire::from_config(&config).unwrap();
+        let started = Instant::now();
+        let result =
+            negotiate_cancellable(bind_socket(config.server).unwrap(), &config, &wire, || {
+                Ok(started.elapsed() >= Duration::from_millis(200))
+            });
+        let Err(error) = result else {
+            panic!("cancelled handshake completed")
+        };
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation waited for the handshake deadline"
+        );
+    }
+}
