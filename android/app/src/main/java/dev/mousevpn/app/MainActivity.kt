@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
 import android.content.BroadcastReceiver
+import android.graphics.Color
 import android.content.Context
 import android.content.Intent
 import android.app.AlertDialog
@@ -429,6 +430,7 @@ class MainActivity : Activity() {
         }
         powerButton.setBackgroundResource(if (connected) R.drawable.bg_power_on else R.drawable.bg_power_off)
         connectionSpotlight.visibility = if (connected) View.VISIBLE else View.INVISIBLE
+        powerButton.setColorFilter(if (connected) Color.rgb(28, 23, 0) else Color.rgb(242, 195, 0))
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
