@@ -1,4 +1,15 @@
-<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding=
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="-2dp"
+                    android:letterSpacing="0.22"
+                    android:text="FREEDOM FLOWS"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="8sp"
+                    android:textStyle="bold" />
+
+"utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -18,13 +29,13 @@
 
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="56dp"
+            android:layout_height="58dp"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
             <ImageView
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
                 android:contentDescription="@null"
                 android:scaleType="fitCenter"
                 android:src="@drawable/ic_batman_emblem" />
@@ -51,13 +62,13 @@
 
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="112dp"
-            android:layout_marginTop="14dp"
+            android:layout_height="100dp"
+            android:layout_marginTop="12dp"
             android:background="@drawable/bg_card"
             android:gravity="center_vertical"
             android:orientation="horizontal"
             android:paddingStart="18dp"
-            android:paddingEnd="14dp">
+            android:paddingEnd="12dp">
 
             <LinearLayout
                 android:id="@+id/profileChooser"
@@ -66,7 +77,6 @@
                 android:layout_weight="1"
                 android:gravity="center_vertical"
                 android:orientation="vertical"
-                android:paddingStart="0dp"
                 android:paddingEnd="8dp">
 
                 <TextView
@@ -75,14 +85,14 @@
                     android:text="@string/profile_label"
                     android:textAllCaps="true"
                     android:textColor="@color/text_secondary"
-                    android:textSize="12sp"
+                    android:textSize="11sp"
                     android:textStyle="bold" />
 
                 <TextView
                     android:id="@+id/profileName"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="5dp"
+                    android:layout_marginTop="4dp"
                     android:ellipsize="end"
                     android:maxLines="1"
                     android:textColor="@color/text_primary"
@@ -93,16 +103,16 @@
                     android:id="@+id/serverEndpoint"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
+                    android:layout_marginTop="1dp"
                     android:ellipsize="end"
                     android:maxLines="1"
                     android:textColor="@color/text_secondary"
-                    android:textSize="14sp" />
+                    android:textSize="13sp" />
             </LinearLayout>
 
             <ImageView
-                android:layout_width="24dp"
-                android:layout_height="24dp"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
                 android:contentDescription="@null"
                 android:src="@drawable/ic_chevron" />
 
@@ -110,7 +120,7 @@
                 android:id="@+id/addProfile"
                 android:layout_width="52dp"
                 android:layout_height="52dp"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="7dp"
                 android:background="@drawable/bg_round_cyan"
                 android:contentDescription="@string/add_profile"
                 android:minHeight="0dp"
@@ -118,24 +128,24 @@
                 android:padding="0dp"
                 android:text="@string/plus"
                 android:textColor="@color/on_accent"
-                android:textSize="30sp" />
+                android:textSize="29sp" />
         </LinearLayout>
 
         <ImageButton
             android:id="@+id/powerButton"
-            android:layout_width="210dp"
-            android:layout_height="210dp"
-            android:layout_marginTop="34dp"
+            android:layout_width="196dp"
+            android:layout_height="196dp"
+            android:layout_marginTop="28dp"
             android:background="@drawable/bg_power_off"
             android:contentDescription="@string/connect_toggle"
-            android:padding="62dp"
-            android:src="@drawable/ic_power" />
+            android:padding="50dp"
+            android:src="@drawable/ic_batman_emblem" />
 
         <TextView
             android:id="@+id/statusTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="15dp"
             android:gravity="center"
             android:text="@string/status_off_title"
             android:textColor="@color/text_primary"
@@ -146,7 +156,7 @@
             android:id="@+id/statusText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="5dp"
             android:gravity="center"
             android:text="@string/status_off_hint"
             android:textColor="@color/text_secondary"
@@ -158,7 +168,7 @@
             android:layout_marginTop="22dp"
             android:background="@drawable/bg_card"
             android:orientation="vertical"
-            android:padding="17dp">
+            android:padding="15dp">
 
             <TextView
                 android:layout_width="wrap_content"
@@ -200,7 +210,7 @@
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
+            android:layout_marginTop="12dp"
             android:background="@drawable/bg_card"
             android:orientation="vertical"
             android:padding="17dp">
@@ -230,7 +240,7 @@
             android:id="@+id/networkTest"
             android:layout_width="match_parent"
             android:layout_height="56dp"
-            android:layout_marginTop="18dp"
+            android:layout_marginTop="16dp"
             android:background="@drawable/bg_primary_button"
             android:text="@string/network_test_start"
             android:textAllCaps="false"
@@ -271,5 +281,16 @@
             android:textColor="@color/accent"
             android:textSize="15sp"
             android:textStyle="bold" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center"
+            android:letterSpacing="0.12"
+            android:text="PRIVATE  •  FAST  •  SECURE"
+            android:textColor="@color/text_secondary"
+            android:textSize="8sp"
+            android:textStyle="bold" />
+
     </LinearLayout>
 </ScrollView>
