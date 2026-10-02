@@ -489,7 +489,7 @@ class MainActivity : Activity() {
         }
         connectionDetails.text = profile.endpoint
         connectionSubdetails.text = if (connected) {
-            "$suffix  •  \${formatDuration((SystemClock.elapsedRealtime() - MouseVpnService.connectedSinceElapsedRealtime).coerceAtLeast(0L))}"
+            "$suffix  •  ${formatDuration((SystemClock.elapsedRealtime() - MouseVpnService.connectedSinceElapsedRealtime).coerceAtLeast(0L))}"
         } else {
             suffix
         }
