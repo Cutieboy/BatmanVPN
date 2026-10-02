@@ -11,6 +11,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import org.json.JSONArray
+import org.json.JSONObject
 
 class ProfileStore(context: Context) {
     private val preferences = context.getSharedPreferences("mousevpn_secure", Context.MODE_PRIVATE)
@@ -60,6 +61,31 @@ class ProfileStore(context: Context) {
         val profiles = list().filterNot { it.id == id }
         write(profiles)
         preferences.edit().putString(SELECTED, profiles.firstOrNull()?.id).apply()
+    }
+
+    @Synchronized
+    fun exportJson(): JSONObject {
+        val profiles = list()
+        val values = JSONArray()
+        profiles.forEach { values.put(JSONObject(it.toJson())) }
+        return JSONObject()
+            .put("profiles", values)
+            .put("selected", selected()?.id ?: JSONObject.NULL)
+    }
+
+    @Synchronized
+    fun importJson(value: JSONObject) {
+        val values = value.optJSONArray("profiles")
+            ?: throw IllegalArgumentException("В резервной копии нет профилей")
+        val profiles = (0 until values.length()).map { index ->
+            VpnProfile.fromJson(values.getJSONObject(index).toString())
+        }
+        val selectedId = value.optString("selected").takeIf { it.isNotBlank() && it != "null" }
+        if (selectedId != null && profiles.none { it.id == selectedId }) {
+            throw IllegalArgumentException("Выбранный профиль отсутствует в резервной копии")
+        }
+        write(profiles)
+        preferences.edit().putString(SELECTED, selectedId ?: profiles.firstOrNull()?.id).apply()
     }
 
     private fun write(profiles: List<VpnProfile>) {
