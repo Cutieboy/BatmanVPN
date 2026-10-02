@@ -46,7 +46,6 @@ class MainActivity : Activity() {
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
     private lateinit var powerButton: ImageButton
-    private lateinit var heroGlow: View
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
     private lateinit var statIp: TextView
@@ -98,7 +97,6 @@ class MainActivity : Activity() {
         statusTitle = findViewById(R.id.statusTitle)
         statusText = findViewById(R.id.statusText)
         powerButton = findViewById(R.id.powerButton)
-        heroGlow = findViewById(R.id.heroGlow)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
         statIp = findViewById(R.id.statIpValue)
@@ -430,7 +428,6 @@ class MainActivity : Activity() {
         }
         powerButton.setBackgroundColor(Color.TRANSPARENT)
         powerButton.setImageResource(if (connected) R.drawable.batman_logo_flying else R.drawable.batman_logo_sleeping)
-        heroGlow.visibility = View.INVISIBLE
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
