@@ -23,9 +23,17 @@ object NativeBridge {
         serverPublicKey: String,
         clientPrivateKey: String,
         protocol: String,
+        generation: Long,
     ): String {
         unregisterDozeReceiver()
-        val result = prepareNative(service, endpoint, serverPublicKey, clientPrivateKey, protocol)
+        val result = prepareNative(
+            service,
+            endpoint,
+            serverPublicKey,
+            clientPrivateKey,
+            protocol,
+            generation,
+        )
         val handle = JSONObject(result).getLong("handle")
         dozeService = service
         dozeHandle = handle
@@ -77,6 +85,7 @@ object NativeBridge {
         serverPublicKey: String,
         clientPrivateKey: String,
         protocol: String,
+        generation: Long,
     ): String
 
     private external fun startNative(handle: Long, tunFd: Int): Boolean
