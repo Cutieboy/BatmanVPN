@@ -54,6 +54,7 @@ class MainActivity : Activity() {
     private var connecting = false
     private var bindingProtocol = true
     @Volatile private var networkTestRunning = false
+    private var pendingBackupBytes: ByteArray? = null
 
     private val clock = object : Runnable {
         override fun run() {
