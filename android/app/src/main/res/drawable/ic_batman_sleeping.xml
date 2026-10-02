@@ -1,39 +1,37 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="120dp"
-    android:height="150dp"
-    android:viewportWidth="100"
-    android:viewportHeight="120">
+    android:width="125dp"
+    android:height="155dp"
+    android:viewportWidth="125"
+    android:viewportHeight="155">
     <path
-        android:fillColor="#C69F00"
-        android:pathData="M50,18
-            C46,24 44,31 45,38
-            C36,39 27,44 20,53
-            C14,61 14,72 19,82
-            C24,92 33,98 43,102
-            L47,91
-            L50,110
-            L53,91
-            L57,102
-            C67,98 76,92 81,82
-            C86,72 86,61 80,53
-            C73,44 64,39 55,38
-            C56,31 54,24 50,18 Z" />
+        android:fillColor="#D4A900"
+        android:pathData="M62.5,12
+            C57,22 56,32 58,41
+            C48,44 39,50 31,59
+            C23,68 20,79 23,91
+            C27,108 40,121 55,130
+            L62.5,116
+            L70,130
+            C85,121 98,108 102,91
+            C105,79 102,68 94,59
+            C86,50 77,44 67,41
+            C69,32 68,22 62.5,12 Z" />
     <path
         android:fillColor="#101010"
-        android:pathData="M50,36
-            C45,37 42,42 43,48
-            C44,53 47,57 50,60
-            C53,57 56,53 57,48
-            C58,42 55,37 50,36 Z" />
+        android:pathData="M62.5,38
+            C57,39 53,44 53,50
+            C53,57 58,63 62.5,68
+            C67,63 72,57 72,50
+            C72,44 68,39 62.5,38 Z" />
     <path
         android:fillColor="#101010"
-        android:pathData="M44,48
-            C37,51 31,57 28,65
-            C34,63 39,64 44,67
-            C47,69 49,72 50,76
-            C51,72 53,69 56,67
-            C61,64 66,63 72,65
-            C69,57 63,51 56,48
-            C54,53 52,56 50,59
-            C48,56 46,53 44,48 Z" />
+        android:pathData="M53,52
+            C44,57 37,65 34,75
+            C43,72 51,75 57,82
+            C60,86 62,91 62.5,98
+            C63,91 65,86 68,82
+            C74,75 82,72 91,75
+            C88,65 81,57 72,52
+            C70,59 67,65 62.5,71
+            C58,65 55,59 53,52 Z" />
 </vector>
