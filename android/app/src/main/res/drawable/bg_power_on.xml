@@ -1,14 +1,28 @@
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_pressed="true">
         <shape android:shape="oval">
-            <solid android:color="#3A3000"/>
-            <stroke android:width="4dp" android:color="@color/accent"/>
+            <gradient
+                android:type="radial"
+                android:centerX="50%"
+                android:centerY="42%"
+                android:gradientRadius="72%"
+                android:startColor="#FFE66A"
+                android:centerColor="#F2C300"
+                android:endColor="#6A5300" />
+            <stroke android:width="4dp" android:color="#FFF0A0"/>
         </shape>
     </item>
     <item>
         <shape android:shape="oval">
-            <solid android:color="#2B2500"/>
-            <stroke android:width="4dp" android:color="@color/accent"/>
+            <gradient
+                android:type="radial"
+                android:centerX="50%"
+                android:centerY="42%"
+                android:gradientRadius="72%"
+                android:startColor="#FFD928"
+                android:centerColor="#E5B800"
+                android:endColor="#3E3100" />
+            <stroke android:width="4dp" android:color="#FFD000"/>
         </shape>
     </item>
 </selector>
