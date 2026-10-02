@@ -30,6 +30,7 @@ class MouseVpnService : VpnService() {
     @Volatile private var handle = 0L
     @Volatile private var diagnosticSessionId = 0L
     @Volatile private var underlyingNetwork = "unknown"
+    @Volatile private var currentMetricsJson = "{}"
     private val underlyingNetworks = ConcurrentHashMap<Network, UnderlyingNetworkState>()
     private var selectedUnderlyingNetwork: Network? = null
     private var selectedUnderlyingState: UnderlyingNetworkState? = null
@@ -332,6 +333,7 @@ class MouseVpnService : VpnService() {
                 )
             }
             val nativeStatus = NativeBridge.status(currentHandle)
+            currentMetricsJson = runCatching { NativeBridge.metrics(currentHandle) }.getOrDefault("{}")
             if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
                 Log.d("MouseVPNMetrics", NativeBridge.metrics(currentHandle))
             }
@@ -582,6 +584,10 @@ class MouseVpnService : VpnService() {
     companion object {
         @Volatile
         var currentStatus: String = "Отключено"
+            private set
+
+        @Volatile
+        var currentMetricsJson: String = "{}"
             private set
 
         @Volatile
