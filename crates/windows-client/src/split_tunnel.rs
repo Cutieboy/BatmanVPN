@@ -540,7 +540,7 @@ impl ReceiveLoop<'_> {
                 );
             }
             self.diverter
-                .inject_inbound(&mut buffers.injectable, self.inbound);
+                .inject_inbound(&mut buffers.injectable, self.inbound, sequence);
         } else {
             eprintln!(
                 "MOUSEVPN_INBOUND_SKIP=seq={} len={}",

@@ -624,14 +624,14 @@ impl Diverter {
     /// Failures are reported and dropped for the same reason as
     /// [`Diverter::reinject`]: one lost packet is recoverable, a torn-down
     /// tunnel is not.
-    pub(crate) fn inject_inbound(&self, packet: &mut [u8], address: Address) {
+    pub(crate) fn inject_inbound(&self, packet: &mut [u8], address: Address, sequence: u64) {
         let mut address = address;
         if let Err(error) = self.handle.calc_checksums(packet, &mut address) {
-            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+            eprintln!("MOUSEVPN_DIVERT_WARNING=seq={sequence} {error}");
             return;
         }
         if let Err(error) = self.handle.send(packet, &address) {
-            eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
+            eprintln!("MOUSEVPN_DIVERT_WARNING=seq={sequence} {error}");
         }
     }
 
