@@ -43,6 +43,7 @@ class MainActivity : Activity() {
     private lateinit var endpoint: TextView
     private lateinit var statusTitle: TextView
     private lateinit var statusText: TextView
+    private lateinit var connectionDetails: TextView
     private lateinit var powerButton: TextView
     private lateinit var statServer: TextView
     private lateinit var statTime: TextView
@@ -94,6 +95,7 @@ class MainActivity : Activity() {
         endpoint = findViewById(R.id.serverEndpoint)
         statusTitle = findViewById(R.id.statusTitle)
         statusText = findViewById(R.id.statusText)
+        connectionDetails = findViewById(R.id.connectionDetails)
         powerButton = findViewById(R.id.powerButton)
         statServer = findViewById(R.id.statServerValue)
         statTime = findViewById(R.id.statTimeValue)
@@ -186,6 +188,7 @@ class MainActivity : Activity() {
             endpoint.text = profile.endpoint
             statServer.text = profile.name
         }
+        updateConnectionDetails()
         bindingProtocol = true
         protocolMode.setSelection(profile?.protocol?.ordinal ?: VpnProtocol.LEGACY.ordinal, false)
         bindingProtocol = false
@@ -432,6 +435,7 @@ class MainActivity : Activity() {
                 else -> getColor(R.color.status_off)
             },
         )
+        updateConnectionDetails()
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
@@ -448,6 +452,25 @@ class MainActivity : Activity() {
         updatePowerEnabled()
         updateProtocolUi()
         updateNetworkTestButton()
+    }
+
+    private fun updateConnectionDetails() {
+        val profile = runCatching { store.selected() }.getOrNull()
+        if (!connected || profile == null) {
+            connectionDetails.text = ""
+            return
+        }
+        val count = ExcludedApps(this).policy().packages.size
+        connectionDetails.text = if (count == 0) {
+            profile.endpoint
+        } else {
+            val noun = when {
+                count % 10 == 1 && count % 100 != 11 -> "приложение"
+                count % 10 in 2..4 && count % 100 !in 12..14 -> "приложения"
+                else -> "приложений"
+            }
+            "${profile.endpoint} (${count} $noun в обход)"
+        }
     }
 
     private fun updateLiveMetrics(now: Long) {
