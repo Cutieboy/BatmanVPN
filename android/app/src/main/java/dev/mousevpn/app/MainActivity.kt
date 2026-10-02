@@ -7,6 +7,11 @@ import android.app.Dialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.app.AlertDialog
+import android.content.res.Configuration
+import android.net.Uri
+import android.text.InputType
+import android.widget.EditText
 import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Build
@@ -219,6 +224,14 @@ class MainActivity : Activity() {
             dialog.dismiss()
             openAddProfile()
         }
+        dialog.findViewById<View>(R.id.menuExportBackup).setOnClickListener {
+            dialog.dismiss()
+            promptBackupPassword(export = true)
+        }
+        dialog.findViewById<View>(R.id.menuImportBackup).setOnClickListener {
+            dialog.dismiss()
+            openBackupFile()
+        }
         dialog.findViewById<View>(R.id.menuDeleteProfile).apply {
             isEnabled = selected != null
             alpha = if (isEnabled) 1f else 0.42f
@@ -228,6 +241,96 @@ class MainActivity : Activity() {
             }
         }
         showDialog(dialog)
+    }
+
+    private fun promptBackupPassword(export: Boolean, backupBytes: ByteArray? = null) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            hint = getString(R.string.backup_password_hint)
+            setSingleLine(true)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (export) R.string.backup_export_title else R.string.backup_import_title)
+            .setMessage(R.string.backup_password_message)
+            .setView(input)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(if (export) R.string.backup_export else R.string.backup_import, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val password = input.text.toString()
+                if (password.length < 8) {
+                    input.error = getString(R.string.backup_password_short)
+                    return@setOnClickListener
+                }
+                dialog.dismiss()
+                if (export) {
+                    createBackup(password)
+                } else {
+                    importBackup(backupBytes ?: return@setOnClickListener, password)
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun createBackup(password: String) {
+        val bytes = runCatching {
+            BackupStore(this).export(password.toCharArray())
+        }.getOrElse {
+            toast(it.message ?: getString(R.string.backup_failed))
+            return
+        }
+        pendingBackupBytes = bytes
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("application/json")
+            .putExtra(Intent.EXTRA_TITLE, "batmanvpn-backup.json")
+        startActivityForResult(intent, BACKUP_CREATE_REQUEST)
+    }
+
+    private fun writeBackup(uri: Uri) {
+        val bytes = pendingBackupBytes ?: return
+        pendingBackupBytes = null
+        val result = runCatching {
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: error("Не удалось открыть файл для записи")
+        }
+        result.onSuccess {
+            toast(getString(R.string.backup_exported))
+        }.onFailure {
+            toast(it.message ?: getString(R.string.backup_failed))
+        }
+    }
+
+    private fun openBackupFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("application/json")
+        startActivityForResult(intent, BACKUP_OPEN_REQUEST)
+    }
+
+    private fun readBackup(uri: Uri) {
+        val bytes = runCatching {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: error("Не удалось открыть резервную копию")
+        }.getOrElse {
+            toast(it.message ?: getString(R.string.backup_failed))
+            return
+        }
+        promptBackupPassword(export = false, backupBytes = bytes)
+    }
+
+    private fun importBackup(bytes: ByteArray, password: String) {
+        val result = runCatching {
+            BackupStore(this).import(bytes, password.toCharArray())
+        }
+        result.onSuccess {
+            refreshProfile()
+            toast(getString(R.string.backup_imported))
+        }.onFailure {
+            toast(it.message ?: getString(R.string.backup_failed))
+        }
     }
 
     private fun showDeleteConfirmation(profile: VpnProfile) {
@@ -266,7 +369,15 @@ class MainActivity : Activity() {
     @Deprecated("The platform VPN consent screen still uses an activity result")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_REQUEST && resultCode == RESULT_OK) connect()
+        when (requestCode) {
+            VPN_REQUEST -> if (resultCode == RESULT_OK) connect()
+            BACKUP_CREATE_REQUEST -> if (resultCode == RESULT_OK && data?.data != null) {
+                writeBackup(data.data!!)
+            }
+            BACKUP_OPEN_REQUEST -> if (resultCode == RESULT_OK && data?.data != null) {
+                readBackup(data.data!!)
+            }
+        }
     }
 
     private fun connect() {
@@ -444,6 +555,8 @@ class MainActivity : Activity() {
 
     private companion object {
         const val VPN_REQUEST = 10
+        const val BACKUP_CREATE_REQUEST = 11
+        const val BACKUP_OPEN_REQUEST = 12
         const val NETWORK_TEST_DURATION_MS = 30_000L
         const val NETWORK_TEST_INTERVAL_MS = 1_000L
         const val NETWORK_TEST_TIMEOUT_MS = 2_000
