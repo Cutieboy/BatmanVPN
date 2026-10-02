@@ -427,7 +427,7 @@ class MainActivity : Activity() {
             else -> getString(R.string.status_off_hint)
         }
         powerButton.setBackgroundColor(Color.TRANSPARENT)
-        powerButton.setImageResource(if (connected) R.drawable.batman_logo_flying_vector else R.drawable.batman_logo_sleeping_vector)
+        powerButton.setImageResource(if (connected) R.drawable.batman_logo_flying else R.drawable.batman_logo_sleeping)
         if (!connected) {
             statTime.text = "—"
             statIp.text = "—"
