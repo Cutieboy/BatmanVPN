@@ -70,7 +70,7 @@
 
     <string name="diagnostics_open">Диагностика соединения</string>
     <string name="diagnostics_title">Диагностика</string>
-    <string name="diagnostics_privacy">Сбор полностью пассивный. MouseVPN не отправляет дополнительные пакеты и не сохраняет сайты, содержимое трафика или ключи.</string>
+    <string name="diagnostics_privacy">Сбор полностью пассивный. BatmanVPN не отправляет дополнительные пакеты и не сохраняет сайты, содержимое трафика или ключи.</string>
     <string name="diagnostics_export">Экспортировать JSON</string>
     <string name="diagnostics_clear">Очистить историю</string>
     <string name="diagnostics_cleared">История диагностики очищена</string>
