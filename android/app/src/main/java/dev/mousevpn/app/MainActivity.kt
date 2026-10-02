@@ -460,17 +460,19 @@ class MainActivity : Activity() {
             connectionDetails.text = ""
             return
         }
-        val count = ExcludedApps(this).policy().packages.size
-        connectionDetails.text = if (count == 0) {
-            profile.endpoint
-        } else {
-            val noun = when {
-                count % 10 == 1 && count % 100 != 11 -> "приложение"
-                count % 10 in 2..4 && count % 100 !in 12..14 -> "приложения"
-                else -> "приложений"
-            }
-            "${profile.endpoint} (${count} $noun в обход)"
+        val policy = ExcludedApps(this).policy()
+        val count = policy.packages.size
+        val noun = when {
+            count % 10 == 1 && count % 100 != 11 -> "приложение"
+            count % 10 in 2..4 && count % 100 !in 12..14 -> "приложения"
+            else -> "приложений"
         }
+        val suffix = if (policy.mode == AppRoutingMode.INCLUDE) {
+            "($count $noun через VPN)"
+        } else {
+            "($count $noun в обход)"
+        }
+        connectionDetails.text = "${profile.endpoint} $suffix"
     }
 
     private fun updateLiveMetrics(now: Long) {
