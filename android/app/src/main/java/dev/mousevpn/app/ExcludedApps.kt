@@ -35,6 +35,28 @@ class ExcludedApps(context: Context) {
 
     fun isExcluded(packageName: String): Boolean = packages().contains(packageName)
 
+    fun exportJson(): org.json.JSONObject = org.json.JSONObject()
+        .put("mode", policy().mode.name)
+        .put("packages", org.json.JSONArray().apply {
+            policy().packages.sorted().forEach(::put)
+        })
+
+    fun importJson(value: org.json.JSONObject) {
+        val mode = runCatching {
+            AppRoutingMode.valueOf(value.optString("mode", AppRoutingMode.EXCLUDE.name))
+        }.getOrElse { AppRoutingMode.EXCLUDE }
+        val packagesJson = value.optJSONArray("packages")
+        val packages = buildSet {
+            if (packagesJson != null) {
+                for (index in 0 until packagesJson.length()) {
+                    val packageName = packagesJson.optString(index).trim()
+                    if (packageName.isNotEmpty()) add(packageName)
+                }
+            }
+        }
+        replace(mode, packages)
+    }
+
     private companion object {
         const val PACKAGES = "excluded_packages"
         const val MODE = "routing_mode"
