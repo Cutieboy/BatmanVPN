@@ -95,6 +95,10 @@ object NativeBridge {
     private fun isDeviceIdleMode(context: Context): Boolean =
         (context.getSystemService(Context.POWER_SERVICE) as PowerManager).isDeviceIdleMode
 
+    fun releaseDozeReceiver() {
+        unregisterDozeReceiver()
+    }
+
     private fun unregisterDozeReceiver() {
         val service = dozeService
         val receiver = dozeReceiver
