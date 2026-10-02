@@ -403,6 +403,7 @@ class MouseVpnService : VpnService() {
         connectionGeneration.incrementAndGet()
         val current = handle
         finishDiagnostics("user_disconnect", null, current)
+        NativeBridge.releaseDozeReceiver()
         handle = 0L
         connectedSinceElapsedRealtime = 0L
         stopNativeAsync(current)
@@ -564,6 +565,7 @@ class MouseVpnService : VpnService() {
         task?.cancel(true)
         val current = handle
         finishDiagnostics("service_destroyed", null, current)
+        NativeBridge.releaseDozeReceiver()
         handle = 0L
         connectedSinceElapsedRealtime = 0L
         networkHandler.removeCallbacks(signalNetworkChange)
