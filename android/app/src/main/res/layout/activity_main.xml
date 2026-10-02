@@ -91,28 +91,6 @@
                 android:scaleType="fitXY"
                 android:src="@drawable/ic_gotham_skyline" />
 
-            <ImageView
-                android:id="@+id/connectionSpotlight"
-                android:layout_width="205dp"
-                android:layout_height="205dp"
-                android:layout_gravity="top|center_horizontal"
-                android:layout_marginTop="9dp"
-                android:contentDescription="@null"
-                android:src="@drawable/bg_spotlight"
-                android:visibility="invisible" />
-
-            <TextView
-                android:layout_width="70dp"
-                android:layout_height="wrap_content"
-                android:layout_gravity="start|center_vertical"
-                android:layout_marginStart="12dp"
-                android:rotation="-90"
-                android:letterSpacing="0.25"
-                android:text="PRIVATE&#10;FAST&#10;SECURE"
-                android:textColor="@color/text_secondary"
-                android:textSize="7sp"
-                android:textStyle="bold" />
-
             <ImageButton
                 android:id="@+id/powerButton"
                 android:layout_width="160dp"
