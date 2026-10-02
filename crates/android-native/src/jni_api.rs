@@ -10,7 +10,7 @@ use mousevpn_client_wire::ClientWire;
 use mousevpn_config::{ClientConfig, ClientProtocol};
 
 use crate::{
-    handshake::{bind_socket, negotiate},
+    handshake::{bind_socket, negotiate_cancellable},
     registry::{
         insert_pending, insert_running, metrics, network_changed, set_dozing, status, stop,
         take_pending, PendingSession,
@@ -28,6 +28,7 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepareNative(
     server_public_key: JString,
     client_private_key: JString,
     protocol: JString,
+    generation: jlong,
 ) -> jstring {
     let result = catch_unwind(AssertUnwindSafe(|| {
         prepare(
@@ -37,6 +38,7 @@ pub extern "system" fn Java_dev_mousevpn_app_NativeBridge_prepareNative(
             &server_public_key,
             &client_private_key,
             &protocol,
+            generation,
         )
     }));
     match result {
@@ -61,6 +63,7 @@ fn prepare(
     server_public_key: &JString,
     client_private_key: &JString,
     protocol: &JString,
+    generation: jlong,
 ) -> Result<String> {
     let protocol = parse_protocol(env.get_string(protocol)?.to_str()?)?;
     let config = ClientConfig {
@@ -75,7 +78,10 @@ fn prepare(
     let protector = SocketProtector::new(env, service)?;
     let socket = bind_socket(config.server)?;
     protector.protect(&socket)?;
-    let (transport, plane, parameters) = negotiate(socket, &config, &wire)?;
+    let (transport, plane, parameters) =
+        negotiate_cancellable(socket, &config, &wire, || {
+            protector.connection_cancelled(generation)
+        })?;
     let handle = insert_pending(PendingSession {
         transport,
         plane,
