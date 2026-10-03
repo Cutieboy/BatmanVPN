@@ -129,7 +129,6 @@ fn import_from_bytes(data: &[u8], password: &str) -> Result<ImportResult, String
         selected_profile_id,
         profile_count,
         routed_app_count,
-        autostart: snapshot.autostart,
     })
 }
 
