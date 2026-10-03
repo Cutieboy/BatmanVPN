@@ -166,13 +166,7 @@ fn clear_routed_apps() -> Result<app_exclusions::AppRoutingSettings, String> {
 fn choose_backup_file() -> Result<Option<String>, String> {
     #[cfg(windows)]
     {
-        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; \\
-            $dialog=New-Object System.Windows.Forms.OpenFileDialog; \\
-            $dialog.Title='Открыть резервную копию BatmanVPN'; \\
-            $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json|Все файлы (*.*)|*.*'; \\
-            $dialog.CheckFileExists=$true; $dialog.Multiselect=$false; \\
-            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) \\
-            {[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName}";
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title='Открыть резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json|Все файлы (*.*)|*.*'; $dialog.CheckFileExists=$true; $dialog.Multiselect=$false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
         let mut command = Command::new("powershell.exe");
         command.creation_flags(CREATE_NO_WINDOW);
         let output = command
@@ -196,15 +190,7 @@ fn choose_backup_file() -> Result<Option<String>, String> {
 fn export_backup(password: String) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; \\
-            $dialog=New-Object System.Windows.Forms.SaveFileDialog; \\
-            $dialog.Title='Сохранить резервную копию BatmanVPN'; \\
-            $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json'; \\
-            $dialog.DefaultExt='json'; $dialog.AddExtension=$true; $dialog.OverwritePrompt=$true; \\
-            $dialog.FileName='batmanvpn-backup.json'; \\
-            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { \\
-              [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName \\
-            }";
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.SaveFileDialog; $dialog.Title='Сохранить резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json'; $dialog.DefaultExt='json'; $dialog.AddExtension=$true; $dialog.OverwritePrompt=$true; $dialog.FileName='batmanvpn-backup.json'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
         let mut command = Command::new("powershell.exe");
         command.creation_flags(CREATE_NO_WINDOW);
         let output = command
