@@ -46,7 +46,6 @@ pub(crate) struct ImportResult {
     pub(crate) selected_profile_id: Option<String>,
     pub(crate) profile_count: usize,
     pub(crate) routed_app_count: usize,
-    pub(crate) autostart: Option<bool>,
 }
 
 pub(crate) fn export(mut password: String) -> Result<Vec<u8>, String> {
@@ -84,7 +83,6 @@ fn export_inner(password: &str) -> Result<Vec<u8>, String> {
         app: "BatmanVPN".to_owned(),
         profiles: crate::profiles::export_json()?,
         routing: crate::app_exclusions::export_json()?,
-        autostart: crate::autostart_enabled().ok(),
     };
     let mut plaintext = serde_json::to_vec(&snapshot).map_err(display_error)?;
     let envelope = encrypt(&plaintext, password)?;
@@ -128,10 +126,6 @@ fn import_from_bytes(data: &[u8], password: &str) -> Result<ImportResult, String
     let selected_profile_id = crate::profiles::last_used_id()?;
     let profile_count = crate::profiles::list()?.len();
     let routed_app_count = crate::app_exclusions::backup_app_count()?;
-
-    if let Some(enabled) = snapshot.autostart {
-        crate::set_autostart(enabled)?;
-    }
 
     Ok(ImportResult {
         selected_profile_id,
