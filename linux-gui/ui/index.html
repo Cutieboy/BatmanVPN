@@ -25,7 +25,10 @@
 
         <div class="profiles-heading">
           <span>Профили</span>
-          <button id="addProfileSmall" class="icon-button" aria-label="Добавить профиль">+</button>
+          <div class="profiles-heading-actions">
+            <button id="addProfileSmall" class="icon-button" aria-label="Добавить профиль">+</button>
+            <button id="profileMenu" class="icon-button" aria-label="Управление профилями">⋮</button>
+          </div>
         </div>
         <div id="profiles" class="profiles" aria-live="polite"></div>
         <button id="addProfile" class="add-profile-button">
@@ -151,6 +154,47 @@
 
         <div class="security-note"><span>⌾</span> Ключ расшифровывается только на этом компьютере</div>
         <button id="saveProfile" class="primary-button" type="submit" disabled>Добавить профиль</button>
+      </form>
+    </div>
+
+    <div id="profileMenuModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="profileMenuModalTitle">
+      <div class="modal-card small-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">УПРАВЛЕНИЕ</span>
+            <h2 id="profileMenuModalTitle">Конфигурации</h2>
+          </div>
+          <button id="closeProfileMenu" type="button" class="close-button" aria-label="Закрыть">×</button>
+        </div>
+        <p id="profileMenuCurrent" class="modal-description">—</p>
+        <div class="menu-actions">
+          <button id="menuAddProfile" class="primary-button" type="button">+&nbsp; Добавить конфигурацию</button>
+          <button id="menuExportBackup" class="secondary-button" type="button">⇩&nbsp; Экспортировать резервную копию</button>
+          <button id="menuImportBackup" class="secondary-button" type="button">⇧&nbsp; Импортировать резервную копию</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="backupPasswordModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="backupPasswordTitle">
+      <form id="backupPasswordForm" class="modal-card small-modal">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">ЗАЩИТА РЕЗЕРВНОЙ КОПИИ</span>
+            <h2 id="backupPasswordTitle">Пароль</h2>
+          </div>
+          <button id="closeBackupPassword" type="button" class="close-button" aria-label="Закрыть">×</button>
+        </div>
+        <p id="backupPasswordDescription" class="modal-description">Укажите пароль для резервной копии.</p>
+        <label for="backupPassword">Пароль</label>
+        <div class="password-field">
+          <input id="backupPassword" type="password" minlength="8" placeholder="Не менее 8 символов" autocomplete="new-password" required />
+          <button id="toggleBackupPassword" type="button">Показать</button>
+        </div>
+        <p id="backupPasswordError" class="form-error hidden"></p>
+        <div class="dialog-actions">
+          <button id="cancelBackupPassword" class="secondary-button" type="button">Отмена</button>
+          <button id="submitBackupPassword" class="primary-button" type="submit">Продолжить</button>
+        </div>
       </form>
     </div>
 
