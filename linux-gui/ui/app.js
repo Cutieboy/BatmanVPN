@@ -101,7 +101,6 @@ if (isWindows) {
     .then((available) => elements.appExclusions.classList.toggle("hidden", !available))
     .catch(() => elements.appExclusions.classList.add("hidden"));
 } else {
-  elements.protocolMode.add(new Option("Speedy — минимальная маскировка", "speedy"), 1);
   elements.reliabilityDiagnostics.classList.remove("hidden");
 }
 
