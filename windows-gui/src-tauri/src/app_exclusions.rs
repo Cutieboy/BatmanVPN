@@ -198,6 +198,10 @@ pub(crate) fn import_validated(backup: BackupRouting) -> Result<(), String> {
     save(&settings)
 }
 
+pub(crate) fn backup_app_count() -> Result<usize, String> {
+    Ok(load_resolved()?.apps.len())
+}
+
 pub(crate) fn get() -> Result<AppRoutingSettings, String> {
     let mut settings = load_resolved()?;
     normalize(&mut settings);
