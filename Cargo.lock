@@ -2694,12 +2694,17 @@ dependencies = [
 name = "mousevpn-windows-gui"
 version = "0.1.17"
 dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
  "dirs",
+ "getrandom 0.3.4",
  "mousevpn-config",
  "mousevpn-profile-cli",
  "mousevpn-windows-client",
+ "pbkdf2",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
