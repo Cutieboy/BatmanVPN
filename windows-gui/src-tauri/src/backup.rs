@@ -55,6 +55,28 @@ pub(crate) fn export(mut password: String) -> Result<Vec<u8>, String> {
     result
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_round_trip_uses_the_android_compatible_envelope() {
+        let plain = br#"{"format":1,"app":"BatmanVPN"}"#;
+        let envelope = encrypt(plain, "correct horse battery staple").unwrap();
+        assert_eq!(envelope.format, 1);
+        assert_eq!(envelope.kdf, "PBKDF2WithHmacSHA256");
+        assert_eq!(envelope.iterations, 150_000);
+        let decoded = decrypt(&envelope, "correct horse battery staple").unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn wrong_password_is_rejected() {
+        let envelope = encrypt(b"secret", "correct horse battery staple").unwrap();
+        assert!(decrypt(&envelope, "wrong password").is_err());
+    }
+}
+
 fn export_inner(password: &str) -> Result<Vec<u8>, String> {
     validate_password(password)?;
     let snapshot = Snapshot {
