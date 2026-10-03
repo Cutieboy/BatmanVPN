@@ -182,12 +182,11 @@ pub(crate) fn export_json() -> Result<serde_json::Value, String> {
             });
         }
     }
-    exported.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
-    let backup = BackupProfiles {
+    exported.sort_by_key(|profile| profile.name.to_lowercase());
+    serde_json::to_value(BackupProfiles {
         profiles: exported,
         selected: last_used_id()?,
-    };
-    serde_json::to_value(backup).map_err(display_error)
+    }).map_err(display_error)
 }
 
 pub(crate) fn validate_json(value: &serde_json::Value) -> Result<BackupProfiles, String> {
@@ -215,9 +214,7 @@ pub(crate) fn validate_json(value: &serde_json::Value) -> Result<BackupProfiles,
         }
         stored.client_config()?.validate().map_err(display_error)?;
     }
-
-    let selected = backup.selected.as_deref().map(normalized_id).transpose()?;
-    if let Some(selected) = selected {
+    if let Some(selected) = backup.selected.as_deref().map(normalized_id).transpose()? {
         if !ids.contains(&selected) {
             return Err("Выбранный профиль отсутствует в резервной копии".to_owned());
         }
@@ -228,18 +225,15 @@ pub(crate) fn validate_json(value: &serde_json::Value) -> Result<BackupProfiles,
 pub(crate) fn import_validated(backup: BackupProfiles) -> Result<(), String> {
     let directory = profiles_dir()?;
     fs::create_dir_all(&directory).map_err(display_error)?;
-
     let current_files = fs::read_dir(&directory)
         .map_err(display_error)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
         .collect::<Vec<_>>();
-
     for path in current_files {
         fs::remove_file(path).map_err(display_error)?;
     }
-
     for profile in backup.profiles {
         let id = normalized_id(&profile.id)?;
         let stored = StoredProfile {
@@ -255,13 +249,10 @@ pub(crate) fn import_validated(backup: BackupProfiles) -> Result<(), String> {
         let contents = toml::to_string_pretty(&stored).map_err(display_error)?;
         write_atomic(&path, contents.as_bytes())?;
     }
-
     let selected_path = directory.join(LAST_USED_PROFILE_FILE);
     match backup.selected {
         Some(id) => write_atomic(&selected_path, normalized_id(&id)?.as_bytes())?,
-        None => {
-            let _ = fs::remove_file(selected_path);
-        }
+        None => { let _ = fs::remove_file(selected_path); }
     }
     Ok(())
 }
