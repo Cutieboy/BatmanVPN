@@ -20,6 +20,7 @@ use tauri::{Manager, State};
 use std::os::windows::process::CommandExt;
 
 mod app_exclusions;
+mod backup;
 mod helper_log;
 mod profiles;
 mod tray;
@@ -159,6 +160,73 @@ fn set_app_routing_mode(
 #[tauri::command]
 fn clear_routed_apps() -> Result<app_exclusions::AppRoutingSettings, String> {
     app_exclusions::clear()
+}
+
+#[tauri::command]
+fn choose_backup_file() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title='Открыть резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json|Все файлы (*.*)|*.*'; $dialog.CheckFileExists=$true; $dialog.Multiselect=$false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .map_err(display_error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Не удалось открыть резервную копию: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
+        return Ok((!path.is_empty()).then_some(path));
+    }
+    #[cfg(not(windows))]
+    { Err("Резервное копирование доступно только в Windows".to_owned()) }
+}
+
+#[tauri::command]
+fn export_backup(password: String) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.SaveFileDialog; $dialog.Title='Сохранить резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json'; $dialog.DefaultExt='json'; $dialog.AddExtension=$true; $dialog.OverwritePrompt=$true; $dialog.FileName='batmanvpn-backup.json'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .map_err(display_error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Не удалось открыть сохранение резервной копии: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
+        if path.is_empty() { return Ok(false); }
+        let data = backup::export(password)?;
+        std::fs::write(path, data).map_err(display_error)?;
+        return Ok(true);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = password;
+        Err("Резервное копирование доступно только в Windows".to_owned())
+    }
+}
+
+#[tauri::command]
+fn import_backup(
+    path: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<backup::ImportResult, String> {
+    let snapshot = connection_status_inner(&state)?;
+    if snapshot.state != "disconnected" {
+        return Err("Сначала отключите активный VPN".to_owned());
+    }
+    backup::import_from_path(Path::new(path.trim()), password)
 }
 
 #[tauri::command]
@@ -629,6 +697,9 @@ fn run_gui(minimized: bool, autoconnect: bool) {
             remove_routed_app,
             set_app_routing_mode,
             clear_routed_apps,
+            choose_backup_file,
+            export_backup,
+            import_backup,
             set_installed_app_selection,
             autostart_enabled,
             set_autostart,
@@ -771,6 +842,31 @@ mod helper_status_tests {
         assert_eq!(
             snapshot.message,
             "Восстанавливаем VPN: network cleanup failed"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::autostart_command;
+    use std::path::Path;
+
+    #[test]
+    fn backup_module_is_registered() {
+        let _ = super::backup::ImportResult {
+            selected_profile_id: None,
+            profile_count: 0,
+            routed_app_count: 0,
+        };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn autostart_command_points_to_the_current_executable() {
+        assert_eq!(
+            autostart_command(Path::new(r"C:\Program Files\BatmanVPN\BatmanVPN.exe")),
+            r#""C:\Program Files\BatmanVPN\BatmanVPN.exe" --minimized --autoconnect"#
         );
     }
 }

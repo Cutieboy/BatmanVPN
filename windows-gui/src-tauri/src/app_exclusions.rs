@@ -143,6 +143,65 @@ struct StoredSettings {
     excluded_apps: Vec<PathBuf>,
 }
 
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct BackupRouting {
+    pub(crate) mode: AppRoutingMode,
+    pub(crate) apps: Vec<String>,
+}
+
+pub(crate) fn export_json() -> Result<serde_json::Value, String> {
+    let settings = load_resolved()?;
+    let mut apps = settings
+        .apps
+        .iter()
+        .map(|path| normalize_windows_path(path).display().to_string())
+        .collect::<Vec<_>>();
+    apps.sort_by_key(|path| path.to_lowercase());
+    apps.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    serde_json::to_value(BackupRouting {
+        mode: settings.mode,
+        apps,
+    }).map_err(display_error)
+}
+
+pub(crate) fn validate_json(value: &serde_json::Value) -> Result<BackupRouting, String> {
+    let backup: BackupRouting = serde_json::from_value(value.clone()).map_err(display_error)?;
+    let mut apps = Vec::with_capacity(backup.apps.len());
+    let mut seen = HashSet::new();
+    for raw in &backup.apps {
+        let path = PathBuf::from(raw.trim());
+        if !path.is_absolute() {
+            return Err("В резервной копии найден не полный путь к приложению".to_owned());
+        }
+        if !path.extension().and_then(|value| value.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+            return Err("В резервной копии найден путь не к .exe".to_owned());
+        }
+        let path = normalize_windows_path(&path);
+        let key = normalized_key(&path);
+        if seen.insert(key) {
+            apps.push(path.display().to_string());
+        }
+    }
+    Ok(BackupRouting {
+        mode: backup.mode,
+        apps,
+    })
+}
+
+pub(crate) fn import_validated(backup: BackupRouting) -> Result<(), String> {
+    let mut settings = load()?;
+    settings.mode = backup.mode;
+    settings.apps = backup.apps.into_iter().map(PathBuf::from).collect();
+    settings.excluded_apps.clear();
+    normalize(&mut settings);
+    save(&settings)
+}
+
+pub(crate) fn backup_app_count() -> Result<usize, String> {
+    Ok(load_resolved()?.apps.len())
+}
+
 pub(crate) fn get() -> Result<AppRoutingSettings, String> {
     let mut settings = load_resolved()?;
     normalize(&mut settings);

@@ -63,6 +63,23 @@ const elements = {
   applyInstalledApps: document.querySelector("#applyInstalledApps"),
   autostartSetting: document.querySelector("#autostartSetting"),
   autostartEnabled: document.querySelector("#autostartEnabled"),
+  profileMenu: document.querySelector("#profileMenu"),
+  profileMenuModal: document.querySelector("#profileMenuModal"),
+  profileMenuCurrent: document.querySelector("#profileMenuCurrent"),
+  closeProfileMenu: document.querySelector("#closeProfileMenu"),
+  menuAddProfile: document.querySelector("#menuAddProfile"),
+  menuExportBackup: document.querySelector("#menuExportBackup"),
+  menuImportBackup: document.querySelector("#menuImportBackup"),
+  backupPasswordModal: document.querySelector("#backupPasswordModal"),
+  backupPasswordForm: document.querySelector("#backupPasswordForm"),
+  backupPasswordTitle: document.querySelector("#backupPasswordTitle"),
+  backupPasswordDescription: document.querySelector("#backupPasswordDescription"),
+  backupPassword: document.querySelector("#backupPassword"),
+  toggleBackupPassword: document.querySelector("#toggleBackupPassword"),
+  backupPasswordError: document.querySelector("#backupPasswordError"),
+  cancelBackupPassword: document.querySelector("#cancelBackupPassword"),
+  closeBackupPassword: document.querySelector("#closeBackupPassword"),
+  submitBackupPassword: document.querySelector("#submitBackupPassword"),
 };
 
 let profiles = [];
@@ -73,6 +90,8 @@ let selectedId = localStorage.getItem("mousevpn.selectedProfile");
 let pendingDeleteId = null;
 let connection = { state: "disconnected", message: "VPN выключен", profileId: null };
 let connectedAt = null;
+let backupOperation = null;
+let pendingBackupPath = null;
 const isWindows = navigator.userAgent.includes("Windows");
 
 elements.protocolSelector.classList.remove("hidden");
@@ -110,6 +129,90 @@ function selectedProfile() {
 
 function connectionProfile() {
   return profiles.find((profile) => profile.id === connection.profileId) ?? null;
+}
+
+
+function closeProfileMenu() {
+  elements.profileMenuModal.classList.add("hidden");
+}
+
+function renderProfileMenu() {
+  const profile = selectedProfile();
+  elements.profileMenuCurrent.textContent = profile
+    ? "Текущий профиль: «" + profile.name + "» · " + profile.endpoint
+    : "Профили ещё не добавлены";
+}
+
+function closeBackupPasswordModal() {
+  elements.backupPasswordModal.classList.add("hidden");
+  elements.backupPassword.value = "";
+  elements.backupPasswordError.classList.add("hidden");
+  elements.backupPassword.type = "password";
+  elements.toggleBackupPassword.textContent = "Показать";
+  backupOperation = null;
+  pendingBackupPath = null;
+}
+
+function openBackupPasswordModal(operation, path = null) {
+  backupOperation = operation;
+  pendingBackupPath = path;
+  elements.backupPasswordTitle.textContent = operation === "export"
+    ? "Экспорт резервной копии"
+    : "Импорт резервной копии";
+  elements.backupPasswordDescription.textContent = operation === "export"
+    ? "Пароль защищает файл шифрованием и понадобится для восстановления профилей и настроек."
+    : "Введите пароль, которым была защищена резервная копия.";
+  elements.backupPasswordError.classList.add("hidden");
+  elements.backupPassword.value = "";
+  elements.backupPasswordModal.classList.remove("hidden");
+  setTimeout(() => elements.backupPassword.focus(), 50);
+}
+
+async function handleBackupSubmit(event) {
+  event.preventDefault();
+  const password = elements.backupPassword.value;
+  if (password.length < 8) {
+    elements.backupPasswordError.textContent = "Пароль должен содержать не менее 8 символов";
+    elements.backupPasswordError.classList.remove("hidden");
+    return;
+  }
+  const operation = backupOperation;
+  const path = pendingBackupPath;
+  elements.submitBackupPassword.disabled = true;
+  elements.submitBackupPassword.textContent = operation === "export" ? "Шифруем…" : "Восстанавливаем…";
+  elements.backupPasswordError.classList.add("hidden");
+  try {
+    if (operation === "export") {
+      const saved = await invoke("export_backup", { password });
+      closeBackupPasswordModal();
+      if (saved) window.alert("Резервная копия BatmanVPN сохранена.");
+    } else {
+      const result = await invoke("import_backup", { path, password });
+      closeBackupPasswordModal();
+      selectedId = result?.selectedProfileId ?? null;
+      if (selectedId) localStorage.setItem("mousevpn.selectedProfile", selectedId);
+      else localStorage.removeItem("mousevpn.selectedProfile");
+      await refreshProfiles(selectedId);
+      await Promise.all([refreshAppExclusions(), refreshAutostart()]);
+      window.alert("Резервная копия BatmanVPN восстановлена.");
+    }
+  } catch (error) {
+    elements.backupPasswordError.textContent = String(error);
+    elements.backupPasswordError.classList.remove("hidden");
+  } finally {
+    elements.submitBackupPassword.disabled = false;
+    elements.submitBackupPassword.textContent = "Продолжить";
+  }
+}
+
+async function startBackupImport() {
+  try {
+    const path = await invoke("choose_backup_file");
+    if (!path) return;
+    openBackupPasswordModal("import", path);
+  } catch (error) {
+    window.alert(String(error));
+  }
 }
 
 function renderProfiles() {
@@ -357,6 +460,36 @@ function validateForm() {
   elements.saveProfile.disabled = !elements.token.value.trim().startsWith("MV1.") || elements.password.value.length < 8;
 }
 
+
+elements.profileMenu.addEventListener("click", () => {
+  renderProfileMenu();
+  elements.profileMenuModal.classList.remove("hidden");
+});
+elements.closeProfileMenu.addEventListener("click", closeProfileMenu);
+elements.menuAddProfile.addEventListener("click", () => {
+  closeProfileMenu();
+  openProfileModal();
+});
+elements.menuExportBackup.addEventListener("click", () => {
+  closeProfileMenu();
+  openBackupPasswordModal("export");
+});
+elements.menuImportBackup.addEventListener("click", () => {
+  closeProfileMenu();
+  startBackupImport();
+});
+elements.backupPasswordForm.addEventListener("submit", handleBackupSubmit);
+elements.cancelBackupPassword.addEventListener("click", closeBackupPasswordModal);
+elements.closeBackupPassword.addEventListener("click", (event) => {
+  event.preventDefault();
+  closeBackupPasswordModal();
+});
+elements.toggleBackupPassword.addEventListener("click", () => {
+  const visible = elements.backupPassword.type === "text";
+  elements.backupPassword.type = visible ? "password" : "text";
+  elements.toggleBackupPassword.textContent = visible ? "Показать" : "Скрыть";
+});
+
 elements.addProfile.addEventListener("click", openProfileModal);
 elements.addProfileSmall.addEventListener("click", openProfileModal);
 document.querySelectorAll("[data-close-modal]").forEach((button) => button.addEventListener("click", closeProfileModal));
@@ -594,6 +727,14 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!elements.installedAppsModal.classList.contains("hidden")) {
     closeInstalledApps();
+    return;
+  }
+  if (!elements.backupPasswordModal.classList.contains("hidden")) {
+    closeBackupPasswordModal();
+    return;
+  }
+  if (!elements.profileMenuModal.classList.contains("hidden")) {
+    closeProfileMenu();
     return;
   }
   if (!elements.profileModal.classList.contains("hidden")) closeProfileModal();

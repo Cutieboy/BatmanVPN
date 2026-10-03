@@ -141,6 +141,122 @@ pub(crate) fn profile_path(id: &str) -> Result<PathBuf, String> {
     Ok(profiles_dir()?.join(format!("{}.toml", normalized_id(id)?)))
 }
 
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackupProfile {
+    pub(crate) version: u32,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) endpoint: String,
+    pub(crate) server_public_key: String,
+    pub(crate) client_private_key: String,
+    pub(crate) protocol: ClientProtocol,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct BackupProfiles {
+    pub(crate) profiles: Vec<BackupProfile>,
+    pub(crate) selected: Option<String>,
+}
+
+pub(crate) fn export_json() -> Result<serde_json::Value, String> {
+    let directory = profiles_dir()?;
+    let mut exported = Vec::new();
+    if directory.exists() {
+        for entry in fs::read_dir(&directory).map_err(display_error)? {
+            let path = entry.map_err(display_error)?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let contents = fs::read_to_string(path).map_err(display_error)?;
+            let profile: StoredProfile = toml::from_str(&contents).map_err(display_error)?;
+            exported.push(BackupProfile {
+                version: 1,
+                id: normalized_id(&profile.id)?,
+                name: profile.name,
+                endpoint: profile.server,
+                server_public_key: profile.server_public_key,
+                client_private_key: profile.client_private_key,
+                protocol: profile.protocol,
+            });
+        }
+    }
+    exported.sort_by_key(|profile| profile.name.to_lowercase());
+    serde_json::to_value(BackupProfiles {
+        profiles: exported,
+        selected: last_used_id()?,
+    }).map_err(display_error)
+}
+
+pub(crate) fn validate_json(value: &serde_json::Value) -> Result<BackupProfiles, String> {
+    let backup: BackupProfiles = serde_json::from_value(value.clone()).map_err(display_error)?;
+    let mut ids = std::collections::HashSet::new();
+    for profile in &backup.profiles {
+        if profile.version != 1 {
+            return Err("Неподдерживаемая версия профиля в резервной копии".to_owned());
+        }
+        let id = normalized_id(&profile.id)?;
+        if !ids.insert(id.clone()) {
+            return Err("В резервной копии обнаружены дублирующиеся профили".to_owned());
+        }
+        let stored = StoredProfile {
+            id,
+            name: profile.name.trim().to_owned(),
+            server: profile.endpoint.trim().to_owned(),
+            server_public_key: profile.server_public_key.clone(),
+            client_private_key: profile.client_private_key.clone(),
+            tun_name: "MouseVPN".to_owned(),
+            protocol: profile.protocol,
+        };
+        if stored.name.is_empty() {
+            return Err("В резервной копии есть профиль без названия".to_owned());
+        }
+        stored.client_config()?.validate().map_err(display_error)?;
+    }
+    if let Some(selected) = backup.selected.as_deref().map(normalized_id).transpose()? {
+        if !ids.contains(&selected) {
+            return Err("Выбранный профиль отсутствует в резервной копии".to_owned());
+        }
+    }
+    Ok(backup)
+}
+
+pub(crate) fn import_validated(backup: BackupProfiles) -> Result<(), String> {
+    let directory = profiles_dir()?;
+    fs::create_dir_all(&directory).map_err(display_error)?;
+    let current_files = fs::read_dir(&directory)
+        .map_err(display_error)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
+        .collect::<Vec<_>>();
+    for path in current_files {
+        fs::remove_file(path).map_err(display_error)?;
+    }
+    for profile in backup.profiles {
+        let id = normalized_id(&profile.id)?;
+        let stored = StoredProfile {
+            id: id.clone(),
+            name: profile.name.trim().to_owned(),
+            server: profile.endpoint.trim().to_owned(),
+            server_public_key: profile.server_public_key,
+            client_private_key: profile.client_private_key,
+            tun_name: "MouseVPN".to_owned(),
+            protocol: profile.protocol,
+        };
+        let path = profile_path(&id)?;
+        let contents = toml::to_string_pretty(&stored).map_err(display_error)?;
+        write_atomic(&path, contents.as_bytes())?;
+    }
+    let selected_path = directory.join(LAST_USED_PROFILE_FILE);
+    match backup.selected {
+        Some(id) => write_atomic(&selected_path, normalized_id(&id)?.as_bytes())?,
+        None => { let _ = fs::remove_file(selected_path); }
+    }
+    Ok(())
+}
+
 pub(crate) fn last_used_id() -> Result<Option<String>, String> {
     let path = profiles_dir()?.join(LAST_USED_PROFILE_FILE);
     match fs::read_to_string(path) {
