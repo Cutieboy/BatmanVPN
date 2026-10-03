@@ -872,7 +872,6 @@ mod tests {
             selected_profile_id: None,
             profile_count: 0,
             routed_app_count: 0,
-            autostart: None,
         };
     }
 
