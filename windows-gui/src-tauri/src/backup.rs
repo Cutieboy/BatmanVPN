@@ -127,7 +127,7 @@ fn import_from_bytes(data: &[u8], password: &str) -> Result<ImportResult, String
 
     let selected_profile_id = crate::profiles::last_used_id()?;
     let profile_count = crate::profiles::list()?.len();
-    let routed_app_count = crate::app_exclusions::get()?.apps.len();
+    let routed_app_count = crate::app_exclusions::backup_app_count()?;
 
     if let Some(enabled) = snapshot.autostart {
         crate::set_autostart(enabled)?;
