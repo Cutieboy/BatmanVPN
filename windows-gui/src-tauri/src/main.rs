@@ -194,7 +194,6 @@ fn choose_backup_file() -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn export_backup(password: String) -> Result<bool, String> {
-    let data = backup::export(password)?;
     #[cfg(windows)]
     {
         let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; \\
@@ -220,11 +219,15 @@ fn export_backup(password: String) -> Result<bool, String> {
         }
         let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
         if path.is_empty() { return Ok(false); }
+        let data = backup::export(password)?;
         std::fs::write(path, data).map_err(display_error)?;
         return Ok(true);
     }
     #[cfg(not(windows))]
-    { let _ = data; Err("Резервное копирование доступно только в Windows".to_owned()) }
+    {
+        let _ = password;
+        Err("Резервное копирование доступно только в Windows".to_owned())
+    }
 }
 
 #[tauri::command]
