@@ -36,8 +36,6 @@ struct Snapshot {
     app: String,
     profiles: serde_json::Value,
     routing: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    autostart: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
