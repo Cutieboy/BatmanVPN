@@ -859,3 +859,29 @@ mod helper_status_tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::autostart_command;
+    use std::path::Path;
+
+    #[test]
+    fn backup_module_is_registered() {
+        let _ = super::backup::ImportResult {
+            selected_profile_id: None,
+            profile_count: 0,
+            routed_app_count: 0,
+            autostart: None,
+        };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn autostart_command_points_to_the_current_executable() {
+        assert_eq!(
+            autostart_command(Path::new(r"C:\Program Files\BatmanVPN\BatmanVPN.exe")),
+            r#""C:\Program Files\BatmanVPN\BatmanVPN.exe" --minimized --autoconnect"#
+        );
+    }
+}
