@@ -699,7 +699,7 @@ fn main() {
             if minimized == "--minimized" && autoconnect == "--autoconnect" =>
             run_gui(true, true),
         [_, minimized] if minimized == "--minimized" => run_gui(true, false),
-        _ => run_gui(false, false),
+        _ => run_gui(false, true),
     }
 }
 
