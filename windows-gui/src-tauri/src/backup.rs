@@ -103,14 +103,18 @@ fn import_from_bytes(data: &[u8], password: &str) -> Result<ImportResult, String
     crate::profiles::import_validated(validated_profiles)?;
     crate::app_exclusions::import_validated(validated_routing)?;
 
+    let selected_profile_id = crate::profiles::last_used_id()?;
+    let profile_count = crate::profiles::list()?.len();
+    let routed_app_count = crate::app_exclusions::get()?.apps.len();
+
     if let Some(enabled) = snapshot.autostart {
         crate::set_autostart(enabled)?;
     }
 
     Ok(ImportResult {
-        selected_profile_id: crate::profiles::last_used_id()?,
-        profile_count: crate::profiles::list()?.len(),
-        routed_app_count: crate::app_exclusions::get()?.apps.len(),
+        selected_profile_id,
+        profile_count,
+        routed_app_count,
         autostart: snapshot.autostart,
     })
 }
