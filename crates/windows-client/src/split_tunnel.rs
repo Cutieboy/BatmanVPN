@@ -355,6 +355,9 @@ impl ReceiveLoop<'_> {
         };
         liveness.packet_received(Instant::now());
 
+        // DNS answer inspection must happen before destination translation:
+        // DNS records are addressed to the tunnel resolver at this point.
+        self.diverter.learn_domain_from_inbound(packet);
         let Ok(translation) = self.translation.read().map(|guard| *guard) else {
             return;
         };
