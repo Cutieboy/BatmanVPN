@@ -55,6 +55,7 @@ const elements = {
   routingExclude: document.querySelector("#routingExclude"),
   routingInclude: document.querySelector("#routingInclude"),
   appRoutingHint: document.querySelector("#appRoutingHint"),
+  domainRoutingHint: document.querySelector("#domainRoutingHint"),
   appRoutingSearch: document.querySelector("#appRoutingSearch"),
   clearRoutedApps: document.querySelector("#clearRoutedApps"),
   openInstalledApps: document.querySelector("#openInstalledApps"),
@@ -286,6 +287,11 @@ function renderAppExclusions() {
 
 function renderDomainRules() {
   const rules = domainRouting.rules ?? [];
+  if (elements.domainRoutingHint) {
+    elements.domainRoutingHint.textContent = isWindows
+      ? "Работает в режиме раздельного туннелирования (WinDivert). Если список приложений пуст и включён полный туннель, эти правила не применяются. DNS-over-HTTPS внутри браузера не отслеживается."
+      : "Правила пока сохраняются только в настройках интерфейса. Linux-маршрутизатор ещё не применяет доменные правила.";
+  }
   elements.domainRulesList.innerHTML = rules.length
     ? rules.map((rule) => `
       <div class="domain-rule-row">
