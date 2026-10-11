@@ -45,6 +45,11 @@ const elements = {
   appExclusionsModal: document.querySelector("#appExclusionsModal"),
   appExclusionsList: document.querySelector("#appExclusionsList"),
   appExclusionsError: document.querySelector("#appExclusionsError"),
+  domainRuleInput: document.querySelector("#domainRuleInput"),
+  domainRuleRoute: document.querySelector("#domainRuleRoute"),
+  addDomainRule: document.querySelector("#addDomainRule"),
+  domainRulesList: document.querySelector("#domainRulesList"),
+  domainRulesError: document.querySelector("#domainRulesError"),
   addAppExclusion: document.querySelector("#addAppExclusion"),
   closeAppExclusions: document.querySelector("#closeAppExclusions"),
   routingExclude: document.querySelector("#routingExclude"),
@@ -67,6 +72,7 @@ const elements = {
 
 let profiles = [];
 let appRouting = { mode: "exclude", apps: [] };
+let domainRouting = { rules: [] };
 let installedApps = [];
 let installedAppSelection = new Set();
 let selectedId = localStorage.getItem("mousevpn.selectedProfile");
@@ -278,6 +284,26 @@ function renderAppExclusions() {
     : `<div class="exclusions-empty">${query ? "По вашему запросу ничего не найдено" : includeMode ? "Ни одно приложение не выбрано для VPN" : "Нет приложений в обход VPN"}</div>`;
 }
 
+function renderDomainRules() {
+  const rules = domainRouting.rules ?? [];
+  elements.domainRulesList.innerHTML = rules.length
+    ? rules.map((rule) => `
+      <div class="domain-rule-row">
+        <span class="domain-rule-icon">${rule.route === "tunnel" ? "↗" : "↘"}</span>
+        <span class="domain-rule-copy">
+          <strong>${escapeHtml(rule.domain)}</strong>
+          <small>${rule.route === "tunnel" ? "Через VPN" : "Напрямую"}</small>
+        </span>
+        <button class="remove-exclusion" type="button" data-domain-rule="${escapeHtml(rule.domain)}" aria-label="Удалить правило домена">×</button>
+      </div>`).join("")
+    : '<div class="exclusions-empty domain-rules-empty">Нет правил доменов. По умолчанию сохраняется текущая маршрутизация.</div>';
+}
+
+async function refreshDomainRules() {
+  domainRouting = await invoke("get_domain_routing");
+  renderDomainRules();
+}
+
 function renderInstalledApps() {
   const query = elements.installedAppsSearch.value.trim().toLocaleLowerCase("ru");
   const visibleApps = installedApps.filter((app) =>
@@ -469,7 +495,7 @@ elements.appExclusions.addEventListener("click", async () => {
   elements.appExclusionsError.classList.add("hidden");
   elements.appExclusionsModal.classList.remove("hidden");
   try {
-    await refreshAppExclusions();
+    await Promise.all([refreshAppExclusions(), refreshDomainRules()]);
   } catch (error) {
     elements.appExclusionsError.textContent = String(error);
     elements.appExclusionsError.classList.remove("hidden");
@@ -523,6 +549,48 @@ elements.addAppExclusion.addEventListener("click", async () => {
     elements.addAppExclusion.disabled = false;
   }
 });
+elements.addDomainRule.addEventListener("click", async () => {
+  elements.domainRulesError.classList.add("hidden");
+  elements.addDomainRule.disabled = true;
+  try {
+    const domain = elements.domainRuleInput.value.trim();
+    if (!domain) throw new Error("Введите домен, например chatgpt.com");
+    domainRouting = await invoke("add_domain_rule", {
+      domain,
+      route: elements.domainRuleRoute.value,
+    });
+    elements.domainRuleInput.value = "";
+    renderDomainRules();
+  } catch (error) {
+    elements.domainRulesError.textContent = String(error);
+    elements.domainRulesError.classList.remove("hidden");
+  } finally {
+    elements.addDomainRule.disabled = false;
+  }
+});
+
+elements.domainRulesList.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-domain-rule]");
+  if (!button) return;
+  button.disabled = true;
+  elements.domainRulesError.classList.add("hidden");
+  try {
+    domainRouting = await invoke("remove_domain_rule", { domain: button.dataset.domainRule });
+    renderDomainRules();
+  } catch (error) {
+    elements.domainRulesError.textContent = String(error);
+    elements.domainRulesError.classList.remove("hidden");
+    button.disabled = false;
+  }
+});
+
+elements.domainRuleInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    elements.addDomainRule.click();
+  }
+});
+
 elements.appExclusionsList.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-exclusion-path]");
   if (!button) return;
