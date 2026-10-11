@@ -763,13 +763,21 @@ mod tests {
     }
 
     #[test]
-    fn capture_filter_includes_both_ip_families() {
+    fn capture_filter_includes_ipv6_when_server_is_ipv4() {
         let filter = filter("203.0.113.10:51820".parse().expect("address"));
-        assert!(filter.contains("ip and (tcp or udp)"));
-        assert!(filter.contains("ipv6 and (tcp or udp)"));
+        assert!(filter.contains("ip or ipv6"));
         assert!(filter.contains("203.0.113.10"));
         assert!(filter.contains("51820"));
-        assert!(filter.contains("tcp or ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820"));
+        assert!(filter.contains("tcp or (udp and (ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820))"));
+    }
+
+    #[test]
+    fn capture_filter_stays_ipv6_only_when_server_is_ipv6() {
+        let filter = filter("[2001:db8::1]:51820".parse().expect("address"));
+        assert!(filter.contains("ipv6"));
+        assert!(!filter.contains("ip or ipv6"));
+        assert!(filter.contains("2001:db8::1"));
+        assert!(filter.contains("51820"));
     }
 
     #[test]
