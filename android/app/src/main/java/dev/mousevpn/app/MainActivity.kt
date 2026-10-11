@@ -186,7 +186,8 @@ class MainActivity : Activity() {
         val routeSpinner = dialog.findViewById<Spinner>(R.id.domainRuleRoute)
         val list = dialog.findViewById<android.widget.LinearLayout>(R.id.domainRulesList)
         val warning = dialog.findViewById<TextView>(R.id.domainRulesWarning)
-        val refresh = {
+
+        fun refreshDomainRulesList() {
             list.removeAllViews()
             val rules = rulesStore.domainRules()
             if (rules.isEmpty()) {
@@ -204,31 +205,40 @@ class MainActivity : Activity() {
                 row.findViewById<TextView>(R.id.domainRuleRouteName).text =
                     getString(if (rule.route == DomainRoute.TUNNEL) R.string.domain_rules_tunnel else R.string.domain_rules_direct)
                 row.findViewById<View>(R.id.removeDomainRule).setOnClickListener {
-                    rulesStore.removeDomainRule(rule.domain)
-                    refresh.invoke()
+                    runCatching {
+                        rulesStore.removeDomainRule(rule.domain)
+                        refreshDomainRulesList()
+                    }.onFailure { error ->
+                        toast(error.message ?: getString(R.string.domain_rules_invalid))
+                    }
                 }
                 list.addView(row)
             }
         }
-        routeSpinner.adapter = ArrayAdapter(this, R.layout.item_protocol_spinner,
-            listOf(getString(R.string.domain_rules_tunnel), getString(R.string.domain_rules_direct))
+
+        routeSpinner.adapter = ArrayAdapter(
+            this,
+            R.layout.item_protocol_spinner,
+            listOf(getString(R.string.domain_rules_tunnel), getString(R.string.domain_rules_direct)),
         ).apply { setDropDownViewResource(R.layout.item_protocol_dropdown) }
+
         warning.text = getString(R.string.domain_rules_not_active) + if (Build.VERSION.SDK_INT < 33) {
-            "\nAndroid 13+ требуется для нативного исключения IP-маршрутов; на старых версиях это ограничение ещё сильнее."
+            "\\nAndroid 13+ требуется для нативного исключения IP-маршрутов; на старых версиях это ограничение ещё сильнее."
         } else {
             ""
         }
+
         dialog.findViewById<View>(R.id.addDomainRule).setOnClickListener {
             try {
                 val route = if (routeSpinner.selectedItemPosition == 0) DomainRoute.TUNNEL else DomainRoute.DIRECT
                 rulesStore.addDomainRule(input.text.toString(), route)
                 input.text.clear()
-                refresh.invoke()
+                refreshDomainRulesList()
             } catch (error: Exception) {
                 toast(error.message ?: getString(R.string.domain_rules_invalid))
             }
         }
-        refresh.invoke()
+        refreshDomainRulesList()
         showDialog(dialog)
     }
 
