@@ -250,16 +250,19 @@ pub fn check_capture_filters(extra: &[String]) -> Result<String, ClientError> {
     Ok(report)
 }
 
-/// The exclusion is written as a disjunction rather than the more obvious
-/// `not (udp and dst == server and port == p)`. `WinDivert` applies negation to
-/// a single test, not to a parenthesised group, and rejects the latter with a
-/// parse error that surfaces only as `ERROR_INVALID_PARAMETER` when the handle
-/// is opened. De Morgan's law gives the same meaning in a form it accepts.
+/// Captures the configured endpoint's IP family and all IPv6 traffic only
+/// when the endpoint is IPv4. IPv6 is not carried by the current data plane;
+/// packets classified for the tunnel are discarded rather than sent directly.
 fn filter(server: SocketAddr) -> String {
-    let family = if server.is_ipv4() { "ip" } else { "ipv6" };
+    let endpoint_family = if server.is_ipv4() { "ip" } else { "ipv6" };
+    let family_filter = if server.is_ipv4() {
+        "ip or ipv6"
+    } else {
+        "ipv6"
+    };
     format!(
-        "outbound and !loopback and {family} and \
-         (tcp or (udp and ({family}.DstAddr != {} or udp.DstPort != {})))",
+        "outbound and !loopback and ({family_filter}) and \
+         (tcp or (udp and ({endpoint_family}.DstAddr != {} or udp.DstPort != {})))",
         server.ip(),
         server.port()
     )
@@ -757,6 +760,24 @@ mod tests {
             prepare_outbound(&mut packet, &table, addresses()),
             Outcome::Discard
         );
+    }
+
+    #[test]
+    fn capture_filter_includes_ipv6_when_server_is_ipv4() {
+        let filter = filter("203.0.113.10:51820".parse().expect("address"));
+        assert!(filter.contains("ip or ipv6"));
+        assert!(filter.contains("203.0.113.10"));
+        assert!(filter.contains("51820"));
+        assert!(filter.contains("tcp or (udp and (ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820))"));
+    }
+
+    #[test]
+    fn capture_filter_stays_ipv6_only_when_server_is_ipv6() {
+        let filter = filter("[2001:db8::1]:51820".parse().expect("address"));
+        assert!(filter.contains("ipv6"));
+        assert!(!filter.contains("ip or ipv6"));
+        assert!(filter.contains("2001:db8::1"));
+        assert!(filter.contains("51820"));
     }
 
     #[test]
