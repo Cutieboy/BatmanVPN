@@ -690,6 +690,6 @@ setInterval(() => {
     : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }, 1000);
 
-Promise.all([refreshProfiles(), refreshAppExclusions(), refreshAutostart(), invoke("connection_status").then(renderConnection)]).catch((error) => {
+Promise.all([refreshProfiles(), refreshAppExclusions(), refreshDomainRules(), refreshAutostart(), invoke("connection_status").then(renderConnection)]).catch((error) => {
   renderConnection({ state: "error", message: String(error), profileId: null });
 });
