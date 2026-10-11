@@ -463,6 +463,10 @@ impl Diverter {
                 let end = offset.saturating_add(length).min(bytes);
                 let packet = &mut buffer[start..end];
                 offset = end;
+                // Capture only ordinary DNS packets here, before the source
+                // rewrite. The response path observes decrypted replies before
+                // translating their destination in split_tunnel.rs.
+                let _ = self.domains.observe_dns_packet(packet);
                 match prepare_outbound(packet, &self.table, translation, &self.domains) {
                     Outcome::PassThrough => {
                         stats.passed = stats.passed.saturating_add(1);
