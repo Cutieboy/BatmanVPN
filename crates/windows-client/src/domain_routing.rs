@@ -97,6 +97,8 @@ impl DomainRouting {
         let Some(domain) = normalize_domain(&name).ok() else { return false; };
 
         if !is_response {
+            let source_port = udp_payload(packet).map(|(_, _, _)| ());
+            let _ = source_port;
             if let Ok(mut cache) = self.cache.write() {
                 if cache.queries.len() >= MAX_DNS_NAMES { cache.queries.clear(); }
                 cache.queries.insert(id, (domain, Instant::now()));
