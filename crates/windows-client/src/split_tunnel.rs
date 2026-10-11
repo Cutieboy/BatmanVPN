@@ -19,6 +19,7 @@ use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
 use crate::{
     diagnostics::{Diagnostics, SendCounters},
+    domain_routing::{DomainRouting, DomainRule},
     handshake::connect,
     liveness::{Action, Liveness},
     netcfg, network,
@@ -55,6 +56,7 @@ pub fn run_split_tunnel(
     config: &ValidatedClientConfig,
     stopping: &Arc<AtomicBool>,
     app_routing: &AppRoutingPolicy,
+    domain_rules: Vec<DomainRule>,
 ) -> Result<(), ClientError> {
     ensure_supported_runtime()?;
     let _runtime_lock = network::RuntimeLock::acquire()?;
@@ -82,11 +84,13 @@ pub fn run_split_tunnel(
     // packets of a flow it has not classified yet pass through untranslated.
     let watcher = FlowWatcher::start(&library, app_routing)?;
     let table = watcher.table();
+    let domain_routing = DomainRouting::new(domain_rules).map_err(ClientError::Platform)?;
     let diverter = Arc::new(Diverter::open(
         &library,
         Arc::clone(&table),
         Arc::clone(&translation),
         config.server,
+        domain_routing,
     )?);
 
     let (sender, receiver) = plane.split();
@@ -351,6 +355,9 @@ impl ReceiveLoop<'_> {
         };
         liveness.packet_received(Instant::now());
 
+        // DNS answer inspection must happen before destination translation:
+        // DNS records are addressed to the tunnel resolver at this point.
+        self.diverter.learn_domain_from_inbound(packet);
         let Ok(translation) = self.translation.read().map(|guard| *guard) else {
             return;
         };

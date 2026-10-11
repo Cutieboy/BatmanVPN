@@ -15,7 +15,7 @@ use super::{
     packet::{Packet, PROTOCOL_TCP, PROTOCOL_UDP},
     Address, Handle, Library, BATCH_MAX, LAYER_NETWORK, MTU_MAX,
 };
-use crate::ClientError;
+use crate::{domain_routing::{DomainRoute, DomainRouting}, ClientError};
 
 const DNS_PORT: u16 = 53;
 
@@ -279,6 +279,7 @@ pub(crate) fn prepare_outbound(
     bytes: &mut [u8],
     table: &FlowTable,
     translation: Translation,
+    domains: &DomainRouting,
 ) -> Outcome {
     let Some(mut packet) = Packet::parse(bytes) else {
         return Outcome::PassThrough;
@@ -303,8 +304,18 @@ pub(crate) fn prepare_outbound(
     // would be routed at an address that does not answer. Every application
     // therefore resolves through the tunnel, including excluded ones.
     let resolving = packet.destination() == translation.resolver && destination_port == DNS_PORT;
-    if !resolving && table.lookup(&key) != Some(Disposition::Tunnel) {
-        return Outcome::PassThrough;
+    // Explicit domain rules override per-application routing. DNS answers are
+    // cached after authenticated tunnel decoding, including CDN address changes.
+    let domain_route = domains.route_for_ip(packet.destination());
+    if !resolving {
+        match domain_route {
+            Some(DomainRoute::Direct) => return Outcome::PassThrough,
+            Some(DomainRoute::Tunnel) => {}
+            None if table.lookup(&key) != Some(Disposition::Tunnel) => {
+                return Outcome::PassThrough;
+            }
+            None => {}
+        }
     }
     // The application bound to the physical address, but the server only
     // recognises the tunnel one. Anything else would come back to the wrong
@@ -352,6 +363,7 @@ pub(crate) struct Diverter {
     handle: Arc<Handle>,
     table: Arc<FlowTable>,
     translation: Arc<RwLock<Translation>>,
+    domains: DomainRouting,
 }
 
 impl Diverter {
@@ -366,6 +378,7 @@ impl Diverter {
         table: Arc<FlowTable>,
         translation: Arc<RwLock<Translation>>,
         server: SocketAddr,
+        domains: DomainRouting,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
         // and nothing here depends on winning against another filter.
@@ -377,6 +390,7 @@ impl Diverter {
             handle,
             table,
             translation,
+            domains,
         })
     }
 
@@ -449,7 +463,11 @@ impl Diverter {
                 let end = offset.saturating_add(length).min(bytes);
                 let packet = &mut buffer[start..end];
                 offset = end;
-                match prepare_outbound(packet, &self.table, translation) {
+                // Capture only ordinary DNS packets here, before the source
+                // rewrite. The response path observes decrypted replies before
+                // translating their destination in split_tunnel.rs.
+                let _ = self.domains.observe_dns_packet(packet);
+                match prepare_outbound(packet, &self.table, translation, &self.domains) {
                     Outcome::PassThrough => {
                         stats.passed = stats.passed.saturating_add(1);
                         // Captured but unmodified, so the checksums the stack
@@ -503,6 +521,9 @@ impl Diverter {
     /// [`Diverter::reinject`]: one lost packet is recoverable, a torn-down
     /// tunnel is not.
     pub(crate) fn inject_inbound(&self, packet: &mut [u8], address: Address) {
+        // Learn domains from DNS replies after authenticated tunnel decoding,
+        // before the packet reaches the Windows resolver.
+        let _ = self.domains.observe_dns_packet(packet);
         let mut address = address;
         if let Err(error) = self.handle.calc_checksums(packet, &mut address) {
             eprintln!("MOUSEVPN_DIVERT_WARNING={error}");
@@ -522,6 +543,7 @@ impl Diverter {
 #[cfg(test)]
 mod tests {
     use super::{filter, prepare_inbound, prepare_outbound, Address, Outcome, Translation};
+    use crate::domain_routing::DomainRouting;
     use crate::windivert::{
         flow::{Disposition, FlowKey, FlowTable},
         packet::PROTOCOL_UDP,
@@ -603,7 +625,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let table = table_with(Disposition::Tunnel);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), &DomainRouting::default()),
             Outcome::Tunnel
         );
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
@@ -618,7 +640,7 @@ mod tests {
         let original = packet.clone();
         let table = table_with(Disposition::Direct);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), &DomainRouting::default()),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
@@ -631,7 +653,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let original = packet.clone();
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), &DomainRouting::default()),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
@@ -715,7 +737,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), &DomainRouting::default()),
             Outcome::Tunnel
         );
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
@@ -728,7 +750,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), &DomainRouting::default()),
             Outcome::PassThrough
         );
     }
@@ -757,8 +779,26 @@ mod tests {
             Disposition::Tunnel,
         );
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), &DomainRouting::default()),
             Outcome::Discard
+        );
+    }
+
+    #[test]
+    fn explicit_domain_tunnel_rule_overrides_direct_application_policy() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = table_with(Disposition::Direct);
+        let domains = DomainRouting::new(vec![
+            crate::domain_routing::DomainRule {
+                domain: "example.com".to_owned(),
+                route: crate::domain_routing::DomainRoute::Tunnel,
+            },
+        ]).expect("valid domain rules");
+        // Learn the address as if example.com had just resolved to 1.1.1.1.
+        domains.learn_domain_ip_for_test("example.com", REMOTE);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), &domains),
+            Outcome::Tunnel
         );
     }
 

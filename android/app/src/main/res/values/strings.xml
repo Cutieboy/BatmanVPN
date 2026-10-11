@@ -57,6 +57,16 @@
     <string name="profile_open_error">Не удалось открыть профили: %1$s</string>
     <string name="unknown_error">Неизвестная ошибка</string>
 
+    <string name="domain_rules_open">Маршрутизация сайтов</string>
+    <string name="domain_rules_title">Доменные правила</string>
+    <string name="domain_rules_input_hint">chatgpt.com</string>
+    <string name="domain_rules_add">Добавить правило</string>
+    <string name="domain_rules_tunnel">Через VPN</string>
+    <string name="domain_rules_direct">Напрямую</string>
+    <string name="domain_rules_remove">Удалить правило</string>
+    <string name="domain_rules_empty">Нет правил доменов.</string>
+    <string name="domain_rules_not_active">Правила сохраняются на устройстве, но пока не применяются к маршрутам Android VPN. Принудительный обход домена не активен.</string>
+    <string name="domain_rules_invalid">Введите корректный домен без https:// и пути.</string>
     <string name="diagnostics_open">Диагностика соединения</string>
     <string name="diagnostics_title">Диагностика</string>
     <string name="diagnostics_privacy">Сбор полностью пассивный. MouseVPN не отправляет дополнительные пакеты и не сохраняет сайты, содержимое трафика или ключи.</string>

@@ -312,3 +312,24 @@ textarea:focus, input:focus { border-color: #42d9d0; box-shadow: 0 0 0 3px rgba(
   .app-routing-tools { grid-template-columns: 1fr; }
   .app-picker-actions, .installed-apps-tools { grid-template-columns: 1fr; }
 }
+
+
+.domain-routing-section { margin: 8px 0 16px; padding: 14px; border: 1px solid #283d54; border-radius: 14px; background: #0b1625; }
+.domain-routing-heading strong, .domain-routing-heading small { display: block; }
+.domain-routing-heading strong { color: #edf4fb; font-size: 13px; }
+.domain-routing-heading small { margin-top: 5px; color: #8296ab; font-size: 10px; line-height: 1.45; }
+.domain-rule-form { display: grid; grid-template-columns: minmax(0, 1fr) 125px auto; gap: 8px; margin-top: 12px; }
+.domain-rule-form input { height: 42px; padding: 0 10px; min-width: 0; }
+.domain-rule-form select { min-width: 0; padding: 0 8px; border: 1px solid #30445b; border-radius: 12px; background: #091321; color: #f4f8fc; }
+.domain-rule-form button { height: 42px; padding: 0 13px; }
+.domain-rules-list { display: flex; flex-direction: column; gap: 7px; max-height: 170px; overflow-y: auto; margin-top: 10px; }
+.domain-rule-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) 34px; align-items: center; gap: 9px; padding: 8px; border: 1px solid #263b50; border-radius: 11px; background: #101d2d; }
+.domain-rule-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; background: #18353d; color: #42d9d0; font-size: 17px; }
+.domain-rule-copy { min-width: 0; }
+.domain-rule-copy strong, .domain-rule-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.domain-rule-copy strong { color: #e4edf6; font-size: 12px; }
+.domain-rule-copy small { margin-top: 3px; color: #8296ab; font-size: 10px; }
+.domain-rules-empty { min-height: 58px; }
+@media (max-width: 700px) { .domain-rule-form { grid-template-columns: minmax(0, 1fr) 112px; } .domain-rule-form button { grid-column: 1 / -1; } }
+
+.domain-routing-limit { margin-top: 4px; color: #dfb569 !important; }
