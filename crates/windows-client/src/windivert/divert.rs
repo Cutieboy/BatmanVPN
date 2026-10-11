@@ -781,6 +781,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_domain_tunnel_rule_overrides_direct_application_policy() {
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = table_with(Disposition::Direct);
+        let domains = DomainRouting::new(vec![
+            crate::domain_routing::DomainRule {
+                domain: "example.com".to_owned(),
+                route: crate::domain_routing::DomainRoute::Tunnel,
+            },
+        ]).expect("valid domain rules");
+        // Learn the address as if example.com had just resolved to 1.1.1.1.
+        domains.learn_domain_ip_for_test("example.com", REMOTE);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), &domains),
+            Outcome::Tunnel
+        );
+    }
+
+    #[test]
     fn capture_filter_includes_ipv6_when_server_is_ipv4() {
         let filter = filter("203.0.113.10:51820".parse().expect("address"));
         assert!(filter.contains("ip or ipv6"));
