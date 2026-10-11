@@ -11,6 +11,7 @@ mod app_bypass;
 mod app_bypass;
 // Temporary: see the module documentation for what removing it involves.
 mod diagnostics;
+pub mod domain_routing;
 mod error;
 mod handshake;
 mod liveness;
