@@ -21,6 +21,7 @@ import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.Spinner
 import android.widget.TextView
@@ -108,6 +109,7 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.excludedApps).setOnClickListener {
             startActivity(Intent(this, AppListActivity::class.java))
         }
+        findViewById<View>(R.id.domainRules).setOnClickListener { showDomainRules() }
         findViewById<View>(R.id.openDiagnostics).setOnClickListener {
             startActivity(Intent(this, DiagnosticsActivity::class.java))
         }
@@ -171,6 +173,59 @@ class MainActivity : Activity() {
         bindingProtocol = false
         updateProtocolUi()
         updatePowerEnabled()
+    }
+
+    private fun showDomainRules() {
+        val rulesStore = ExcludedApps(this)
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setContentView(R.layout.dialog_domain_rules)
+            window?.setBackgroundDrawableResource(android.R.color.transparent)
+        }
+        val input = dialog.findViewById<EditText>(R.id.domainRuleInput)
+        val routeSpinner = dialog.findViewById<Spinner>(R.id.domainRuleRoute)
+        val list = dialog.findViewById<android.widget.LinearLayout>(R.id.domainRulesList)
+        val warning = dialog.findViewById<TextView>(R.id.domainRulesWarning)
+        val refresh = {
+            list.removeAllViews()
+            val rules = rulesStore.domainRules()
+            if (rules.isEmpty()) {
+                val empty = TextView(this).apply {
+                    text = getString(R.string.domain_rules_empty)
+                    setTextColor(getColor(R.color.text_secondary))
+                    textSize = 13f
+                    setPadding(0, 12, 0, 12)
+                }
+                list.addView(empty)
+            }
+            rules.forEach { rule ->
+                val row = layoutInflater.inflate(R.layout.item_domain_rule, list, false)
+                row.findViewById<TextView>(R.id.domainRuleName).text = rule.domain
+                row.findViewById<TextView>(R.id.domainRuleRouteName).text =
+                    getString(if (rule.route == DomainRoute.TUNNEL) R.string.domain_rules_tunnel else R.string.domain_rules_direct)
+                row.findViewById<View>(R.id.removeDomainRule).setOnClickListener {
+                    rulesStore.removeDomainRule(rule.domain)
+                    refresh.invoke()
+                }
+                list.addView(row)
+            }
+        }
+        routeSpinner.adapter = ArrayAdapter(this, R.layout.item_protocol_spinner,
+            listOf(getString(R.string.domain_rules_tunnel), getString(R.string.domain_rules_direct))
+        ).apply { setDropDownViewResource(R.layout.item_protocol_dropdown) }
+        warning.text = getString(R.string.domain_rules_not_active)
+        dialog.findViewById<View>(R.id.addDomainRule).setOnClickListener {
+            try {
+                val route = if (routeSpinner.selectedItemPosition == 0) DomainRoute.TUNNEL else DomainRoute.DIRECT
+                rulesStore.addDomainRule(input.text.toString(), route)
+                input.text.clear()
+                refresh.invoke()
+            } catch (error: Exception) {
+                toast(error.message ?: getString(R.string.domain_rules_invalid))
+            }
+        }
+        refresh.invoke()
+        showDialog(dialog)
     }
 
     private fun showProfileChooser() {
