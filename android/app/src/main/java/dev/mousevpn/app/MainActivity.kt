@@ -213,7 +213,11 @@ class MainActivity : Activity() {
         routeSpinner.adapter = ArrayAdapter(this, R.layout.item_protocol_spinner,
             listOf(getString(R.string.domain_rules_tunnel), getString(R.string.domain_rules_direct))
         ).apply { setDropDownViewResource(R.layout.item_protocol_dropdown) }
-        warning.text = getString(R.string.domain_rules_not_active)
+        warning.text = getString(R.string.domain_rules_not_active) + if (Build.VERSION.SDK_INT < 33) {
+            "\nAndroid 13+ требуется для нативного исключения IP-маршрутов; на старых версиях это ограничение ещё сильнее."
+        } else {
+            ""
+        }
         dialog.findViewById<View>(R.id.addDomainRule).setOnClickListener {
             try {
                 val route = if (routeSpinner.selectedItemPosition == 0) DomainRoute.TUNNEL else DomainRoute.DIRECT
