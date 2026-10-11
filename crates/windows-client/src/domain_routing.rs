@@ -155,6 +155,14 @@ impl DomainRouting {
         true
     }
 
+    #[cfg(test)]
+    pub fn learn_domain_ip_for_test(&self, domain: &str, ip: IpAddr) {
+        let domain = normalize_domain(domain).expect("test domain is valid");
+        let mut cache = self.cache.write().expect("cache lock");
+        cache.by_domain.entry(domain.clone()).or_default().insert(ip);
+        cache.by_ip.entry(ip).or_default().push((domain, Instant::now() + DNS_CACHE_TTL));
+    }
+
     pub fn route_for_ip(&self, ip: IpAddr) -> Option<DomainRoute> {
         let rules = self.rules.read().ok()?;
         let mut cache = self.cache.write().ok()?;
