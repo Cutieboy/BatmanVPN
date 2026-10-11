@@ -168,12 +168,15 @@ impl DomainRouting {
         let mut cache = self.cache.write().ok()?;
         let entries = cache.by_ip.get_mut(&ip)?;
         entries.retain(|(_, expires)| *expires > Instant::now());
+        let mut best: Option<(&DomainRule, usize)> = None;
         for (domain, _) in entries.iter() {
-            if let Some(rule) = rules.iter().filter(|rule| domain_matches(domain, &rule.domain)).max_by_key(|rule| rule.domain.len()) {
-                return Some(rule.route);
+            for rule in rules.iter().filter(|rule| domain_matches(domain, &rule.domain)) {
+                if best.is_none_or(|(_, length)| rule.domain.len() > length) {
+                    best = Some((rule, rule.domain.len()));
+                }
             }
         }
-        None
+        best.map(|(rule, _)| rule.route)
     }
 }
 
