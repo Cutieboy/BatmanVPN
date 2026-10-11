@@ -306,6 +306,18 @@ function renderDomainRules() {
 }
 
 async function refreshDomainRules() {
+  // The Windows Tauri backend exposes the domain-rule commands. The Linux
+  // backend does not yet enforce or persist them, so avoid failing startup
+  // initialization on a platform without those commands.
+  if (!isWindows) {
+    domainRouting = { rules: [] };
+    renderDomainRules();
+    elements.domainRulesList.innerHTML = '<div class="exclusions-empty domain-rules-empty">Доменные правила для Linux ещё не поддерживаются.</div>';
+    if (elements.domainRuleInput) elements.domainRuleInput.disabled = true;
+    if (elements.domainRuleRoute) elements.domainRuleRoute.disabled = true;
+    if (elements.addDomainRule) elements.addDomainRule.disabled = true;
+    return;
+  }
   domainRouting = await invoke("get_domain_routing");
   renderDomainRules();
 }
