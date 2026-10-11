@@ -38,7 +38,7 @@ struct StoredRules {
 struct Cache {
     by_domain: HashMap<String, HashSet<IpAddr>>,
     by_ip: HashMap<IpAddr, Vec<(String, Instant)>>,
-    queries: HashMap<u16, (String, Instant)>,
+    queries: HashMap<(u16, String), Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -99,7 +99,7 @@ impl DomainRouting {
         if !is_response {
             if let Ok(mut cache) = self.cache.write() {
                 if cache.queries.len() >= MAX_DNS_NAMES { cache.queries.clear(); }
-                cache.queries.insert(id, (domain, Instant::now()));
+                cache.queries.insert((id, domain), Instant::now());
             }
             return true;
         }
@@ -107,12 +107,14 @@ impl DomainRouting {
         let question_count = u16::from_be_bytes([payload[4], payload[5]]) as usize;
         let answer_count = u16::from_be_bytes([payload[6], payload[7]]) as usize;
         if question_count == 0 { return true; }
-        // Match only a response associated with a recent query, avoiding
-        // learning unsolicited packets as authoritative DNS answers.
+        // Match the reply against both transaction ID and question name. DNS
+        // IDs are only 16 bits, so using the ID alone can cross-associate
+        // concurrent responses for different domains.
         let queried = self.cache.write().ok().and_then(|mut cache| {
-            let entry = cache.queries.remove(&id)?;
-            (entry.1.elapsed() <= Duration::from_secs(30)).then_some(entry.0)
-        }).unwrap_or(domain);
+            let sent_at = cache.queries.remove(&(id, domain.clone()))?;
+            (sent_at.elapsed() <= Duration::from_secs(30)).then_some(domain.clone())
+        });
+        let Some(queried) = queried else { return true; };
 
         let mut offset = question_end;
         // Skip additional questions if any.
