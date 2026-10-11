@@ -20,6 +20,7 @@ use tauri::{Manager, State};
 use std::os::windows::process::CommandExt;
 
 mod app_exclusions;
+mod domain_rules;
 mod helper_log;
 mod profiles;
 mod tray;
@@ -125,6 +126,26 @@ fn delete_profile(id: String, state: State<'_, AppState>) -> Result<(), String> 
 #[tauri::command]
 fn get_app_routing() -> Result<app_exclusions::AppRoutingSettings, String> {
     app_exclusions::get()
+}
+
+#[tauri::command]
+fn get_domain_routing() -> Result<domain_rules::DomainRoutingSettings, String> {
+    domain_rules::get()
+}
+
+#[tauri::command]
+fn add_domain_rule(domain: String, route: mousevpn_windows_client::domain_routing::DomainRoute) -> Result<domain_rules::DomainRoutingSettings, String> {
+    domain_rules::add(domain, route)
+}
+
+#[tauri::command]
+fn remove_domain_rule(domain: String) -> Result<domain_rules::DomainRoutingSettings, String> {
+    domain_rules::remove(domain)
+}
+
+#[tauri::command]
+fn clear_domain_rules() -> Result<domain_rules::DomainRoutingSettings, String> {
+    domain_rules::clear()
 }
 
 #[tauri::command]
@@ -486,7 +507,7 @@ fn run_helper(path: &Path) -> Result<(), String> {
         // lifts the selected traffic out of the stack instead of an adapter and
         // routes carrying all of it.
         let session = if app_routing.is_per_application() {
-            mousevpn_windows_client::run_split_tunnel(&config, &stopping, &app_routing)
+            mousevpn_windows_client::run_split_tunnel(&config, &stopping, &app_routing, domain_rules::policy()?)
         } else {
             mousevpn_windows_client::run_with_stop(&config, &stopping, &app_routing)
         };
@@ -577,6 +598,10 @@ fn run_gui(minimized: bool) {
             set_profile_protocol,
             delete_profile,
             get_app_routing,
+            get_domain_routing,
+            add_domain_rule,
+            remove_domain_rule,
+            clear_domain_rules,
             choose_executable,
             list_installed_apps,
             add_routed_app,
