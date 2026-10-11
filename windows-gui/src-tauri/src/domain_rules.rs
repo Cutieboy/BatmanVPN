@@ -92,6 +92,31 @@ fn save(stored: &StoredRules) -> Result<(), String> {
         file.write_all(&bytes).map_err(|error| format!("Не удалось записать правила: {error}"))?;
         file.sync_all().map_err(|error| format!("Не удалось сохранить правила: {error}"))?;
     }
-    fs::rename(&temporary, &path).map_err(|error| format!("Не удалось заменить правила доменов: {error}"))?;
+    // On Windows, std::fs::rename does not replace an existing target. Preserve
+    // the last valid file until the new temporary file has been fully flushed;
+    // if replacement fails, restore the previous copy rather than losing rules.
+    #[cfg(windows)]
+    {
+        let backup = path.with_extension("json.bak");
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|error| format!("Не удалось удалить предыдущий backup правил: {error}"))?;
+        }
+        if path.exists() {
+            fs::rename(&path, &backup).map_err(|error| format!("Не удалось сохранить предыдущие правила: {error}"))?;
+        }
+        if let Err(error) = fs::rename(&temporary, &path) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &path);
+            }
+            return Err(format!("Не удалось заменить правила доменов: {error}"));
+        }
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|error| format!("Правила записаны, но не удалось удалить временный backup: {error}"))?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(&temporary, &path).map_err(|error| format!("Не удалось заменить правила доменов: {error}"))?;
+    }
     Ok(())
 }
