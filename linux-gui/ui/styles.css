@@ -331,3 +331,5 @@ textarea:focus, input:focus { border-color: #42d9d0; box-shadow: 0 0 0 3px rgba(
 .domain-rule-copy small { margin-top: 3px; color: #8296ab; font-size: 10px; }
 .domain-rules-empty { min-height: 58px; }
 @media (max-width: 700px) { .domain-rule-form { grid-template-columns: minmax(0, 1fr) 112px; } .domain-rule-form button { grid-column: 1 / -1; } }
+
+.domain-routing-limit { margin-top: 4px; color: #dfb569 !important; }
