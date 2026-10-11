@@ -60,7 +60,7 @@ class ExcludedApps(context: Context) {
     fun replaceDomainRules(rules: List<DomainRule>) {
         val encoded = rules.mapNotNull { rule ->
             val domain = normalizeDomain(rule.domain) ?: return@mapNotNull null
-            "$" + "{domain}|${rule.route.name}"
+            "${domain}|${rule.route.name}"
         }.toSet()
         preferences.edit().putStringSet(DOMAIN_RULES, encoded).apply()
     }
