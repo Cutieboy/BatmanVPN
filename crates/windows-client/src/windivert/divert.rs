@@ -636,7 +636,7 @@ mod tests {
         let original = packet.clone();
         let table = table_with(Disposition::Direct);
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), &DomainRouting::default()),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
@@ -733,7 +733,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), &DomainRouting::default()),
             Outcome::Tunnel
         );
         assert_eq!(&packet[12..16], &[10, 77, 0, 22]);
@@ -746,7 +746,7 @@ mod tests {
         let mut packet = udp_packet(PHYSICAL, RESOLVER);
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses()),
+            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), &DomainRouting::default()),
             Outcome::PassThrough
         );
     }
@@ -775,7 +775,7 @@ mod tests {
             Disposition::Tunnel,
         );
         assert_eq!(
-            prepare_outbound(&mut packet, &table, addresses()),
+            prepare_outbound(&mut packet, &table, addresses(), &DomainRouting::default()),
             Outcome::Discard
         );
     }
