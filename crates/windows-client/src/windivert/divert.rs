@@ -251,7 +251,7 @@ pub fn check_capture_filters(extra: &[String]) -> Result<String, ClientError> {
         unreachable!("the sample endpoint is a literal");
     });
     let mut report = String::new();
-    let built_in = filter(server);
+    let built_in = filter(server, false);
     for candidate in std::iter::once(&built_in).chain(extra) {
         let verdict = match library.check_filter(candidate, LAYER_NETWORK) {
             Ok(()) => "OK  ".to_owned(),
@@ -267,11 +267,25 @@ pub fn check_capture_filters(extra: &[String]) -> Result<String, ClientError> {
 /// a single test, not to a parenthesised group, and rejects the latter with a
 /// parse error that surfaces only as `ERROR_INVALID_PARAMETER` when the handle
 /// is opened. De Morgan's law gives the same meaning in a form it accepts.
-fn filter(server: SocketAddr) -> String {
-    let family = if server.is_ipv4() { "ip" } else { "ipv6" };
+/// Captures the configured endpoint's IP family and all IPv6 traffic when the
+/// endpoint is IPv4. When the tunnel uses Mousality (TCP), outbound TCP to the
+/// server on the server's port is excluded and UDP is captured; otherwise outbound
+/// UDP to the server on the server's port is excluded and TCP is captured.
+fn filter(server: SocketAddr, tcp_tunnel: bool) -> String {
+    let endpoint_family = if server.is_ipv4() { "ip" } else { "ipv6" };
+    let family_filter = if server.is_ipv4() {
+        "ip or ipv6"
+    } else {
+        "ipv6"
+    };
+    let (other, tunnel) = if tcp_tunnel {
+        ("udp", "tcp")
+    } else {
+        ("tcp", "udp")
+    };
     format!(
-        "outbound and !loopback and {family} and \
-         (tcp or (udp and ({family}.DstAddr != {} or udp.DstPort != {})))",
+        "outbound and !loopback and ({family_filter}) and \
+         ({other} or ({tunnel} and ({endpoint_family}.DstAddr != {} or {tunnel}.DstPort != {})))",
         server.ip(),
         server.port()
     )
@@ -389,9 +403,11 @@ pub(crate) fn prepare_outbound(
             // arrives, replaces this guess, so an excluded application is
             // still routed Direct even if its SYN won the race.
             //
-            // `clamp_mss` only acts on TCP SYN packets, so `modified`
-            // is a reliable indicator of a SYN.
-            if modified {
+            // An unclassified connection start (TCP SYN without ACK) is
+            // provisionally classified and pinned to the default disposition
+            // regardless of whether `clamp_mss` modified the packet (e.g. if
+            // the MSS option was absent or already within limits).
+            if packet.starts_connection() {
                 table.insert_provisional(key, translation.default_disposition);
                 translation.default_disposition
             } else {
@@ -471,11 +487,12 @@ impl Diverter {
         table: Arc<FlowTable>,
         translation: Arc<RwLock<Translation>>,
         server: SocketAddr,
+        tcp_tunnel: bool,
         geo: Option<GeoRouter>,
     ) -> Result<Self, ClientError> {
         // Priority 0 keeps MouseVPN below tools that deliberately sit high,
         // and nothing here depends on winning against another filter.
-        let handle = Arc::new(library.open(&filter(server), LAYER_NETWORK, 0, 0)?);
+        let handle = Arc::new(library.open(&filter(server, tcp_tunnel), LAYER_NETWORK, 0, 0)?);
         // This handle carries every packet the machine sends, not only the
         // tunnelled ones, so it is the one that overflows first.
         handle.tune_queues();
@@ -856,7 +873,7 @@ mod tests {
     #[test]
     fn excludes_our_own_tunnel_datagrams_from_capture() {
         let server: SocketAddr = "203.0.113.10:51820".parse().expect("address");
-        let filter = filter(server);
+        let filter = filter(server, false);
         // Without this exclusion every datagram we send would be recaptured.
         assert!(filter.contains("203.0.113.10"));
         assert!(filter.contains("51820"));
@@ -937,10 +954,42 @@ mod tests {
         // difference only as ERROR_INVALID_PARAMETER from WinDivertOpen. Both
         // spellings of negation are checked so neither creeps back in.
         for server in ["203.0.113.10:51820", "[2001:db8::1]:51820"] {
-            let filter = filter(server.parse().expect("address"));
-            assert!(!filter.contains("not ("), "{filter}");
-            assert!(!filter.contains("!("), "{filter}");
+            let filter_udp = filter(server.parse().expect("address"), false);
+            assert!(!filter_udp.contains("not ("), "{filter_udp}");
+            assert!(!filter_udp.contains("!("), "{filter_udp}");
+            let filter_tcp = filter(server.parse().expect("address"), true);
+            assert!(!filter_tcp.contains("not ("), "{filter_tcp}");
+            assert!(!filter_tcp.contains("!("), "{filter_tcp}");
         }
+    }
+
+    #[test]
+    fn capture_filter_includes_ipv6_when_server_is_ipv4() {
+        let filter = filter("203.0.113.10:51820".parse().expect("address"), false);
+        assert!(filter.contains("ip or ipv6"));
+        assert!(filter.contains("203.0.113.10"));
+        assert!(filter.contains("51820"));
+        assert!(filter.contains("tcp or (udp and (ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820))"));
+    }
+
+    #[test]
+    fn capture_filter_stays_ipv6_only_when_server_is_ipv6() {
+        let filter = filter("[2001:db8::1]:51820".parse().expect("address"), false);
+        assert!(filter.contains("ipv6"));
+        assert!(!filter.contains("ip or ipv6"));
+        assert!(filter.contains("2001:db8::1"));
+        assert!(filter.contains("51820"));
+    }
+
+    #[test]
+    fn tcp_camouflage_exclusion_keeps_other_tcp_destinations_captured() {
+        let server: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let filter = filter(server, true);
+        assert!(
+            filter.contains("udp or (tcp and (ip.DstAddr != 203.0.113.10 or tcp.DstPort != 443))")
+        );
+        assert!(!filter.contains("not ("));
+        assert!(!filter.contains("udp.DstPort"));
     }
 
     #[test]
@@ -948,7 +997,7 @@ mod tests {
         // Hoisting the address test out of the udp branch would exclude TCP to
         // the server as well, and silently stop tunnelling it.
         let server: SocketAddr = "203.0.113.10:51820".parse().expect("address");
-        let filter = filter(server);
+        let filter = filter(server, false);
         let udp_branch = filter.split("tcp or ").nth(1).expect("udp branch");
         assert!(udp_branch.contains("203.0.113.10"));
     }
@@ -1069,5 +1118,95 @@ mod tests {
             Outcome::PassThroughModified
         );
         assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 1240);
+    }
+
+    /// An IPv4 TCP SYN without any TCP options.
+    fn outbound_syn_without_options() -> Vec<u8> {
+        let (IpAddr::V4(physical), IpAddr::V4(remote)) = (PHYSICAL, REMOTE) else {
+            unreachable!("tests use IPv4")
+        };
+        let mut packet = vec![0_u8; 20 + 20];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&physical.octets());
+        packet[16..20].copy_from_slice(&remote.octets());
+        packet[20..22].copy_from_slice(&51_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        // Minimal 20-byte TCP header (data offset = 5), SYN set.
+        packet[32] = 5 << 4;
+        packet[33] = 0x02;
+        packet
+    }
+
+    #[test]
+    fn unclassified_syn_without_mss_option_is_provisionally_classified() {
+        let mut packet = outbound_syn_without_options();
+        let table = FlowTable::default();
+        let key = FlowKey {
+            protocol: 6,
+            local: PHYSICAL,
+            local_port: 51_000,
+            remote: REMOTE,
+            remote_port: 443,
+        };
+        assert_eq!(table.lookup(&key), None);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        assert_eq!(table.lookup(&key), Some(Disposition::Tunnel));
+    }
+
+    #[test]
+    fn unclassified_syn_with_small_mss_is_provisionally_classified() {
+        // MSS is 1200, which is <= 1240 limit so clamp_mss returns false.
+        let mut packet = outbound_syn(1200);
+        let table = FlowTable::default();
+        let key = FlowKey {
+            protocol: 6,
+            local: PHYSICAL,
+            local_port: 51_000,
+            remote: REMOTE,
+            remote_port: 443,
+        };
+        assert_eq!(table.lookup(&key), None);
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        assert_eq!(table.lookup(&key), Some(Disposition::Tunnel));
+        // MSS should remain 1200 untouched.
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 1200);
+    }
+
+    #[test]
+    fn authoritative_classification_overrides_provisional_classification() {
+        let mut packet = outbound_syn(1460);
+        let table = FlowTable::default();
+        let key = FlowKey {
+            protocol: 6,
+            local: PHYSICAL,
+            local_port: 51_000,
+            remote: REMOTE,
+            remote_port: 443,
+        };
+        // 1. Initial SYN arrives before FlowWatcher: provisionally pinned to Tunnel.
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        assert_eq!(table.lookup(&key), Some(Disposition::Tunnel));
+
+        // 2. FlowWatcher attributes process to Direct (e.g. excluded app).
+        table.insert(key, Disposition::Direct);
+        assert_eq!(table.lookup(&key), Some(Disposition::Direct));
+
+        // 3. Subsequent packet of this flow now routes Direct.
+        let mut data_packet = outbound_syn(1460);
+        data_packet[33] = 0x10; // ACK data packet
+        assert_eq!(
+            prepare_outbound(&mut data_packet, &table, addresses(), None),
+            Outcome::PassThrough
+        );
     }
 }

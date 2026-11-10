@@ -202,6 +202,17 @@ impl<'a> Packet<'a> {
     /// Only the first fragment of a fragmented IPv4 datagram does. The later
     /// ones still need their addresses rewritten, so they are not rejected
     /// outright: they simply have no ports to read.
+    pub(crate) fn starts_connection(&self) -> bool {
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        if self.protocol() != PROTOCOL_TCP || !self.is_first_fragment() {
+            return false;
+        }
+        self.bytes
+            .get(self.header_length + 13)
+            .is_some_and(|flags| flags & (SYN | ACK) == SYN)
+    }
+
     fn is_first_fragment(&self) -> bool {
         match self.version {
             Version::V4 => {
