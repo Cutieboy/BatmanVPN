@@ -9,7 +9,12 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+getrandom = "0.3"
+mousevpn-mousality = { path = "../mousality" }
 socket2 = "0.6"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix = { version = "0.30", features = ["socket", "uio"] }
+
+[dev-dependencies]
+mousevpn-crypto = { path = "../crypto" }

@@ -13,9 +13,11 @@ mousevpn-config = { path = "../config" }
 mousevpn-crypto = { path = "../crypto" }
 mousevpn-data-plane = { path = "../data-plane" }
 mousevpn-protocol = { path = "../protocol" }
+mousevpn-ru-bypass = { path = "../ru-bypass" }
 mousevpn-transport = { path = "../transport" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
+zeroize = "1.8"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
@@ -25,8 +27,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
     "Win32_System_Rpc",
@@ -40,3 +44,6 @@ windows-sys = { version = "0.61", features = [
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[dev-dependencies]
+mousevpn-mousality = { path = "../mousality" }
