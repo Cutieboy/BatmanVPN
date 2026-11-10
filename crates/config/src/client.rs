@@ -17,6 +17,11 @@ pub struct ClientConfig {
     pub protocol: ClientProtocol,
     #[serde(default)]
     pub mousality: Option<MousalityClientConfig>,
+    /// Sends traffic for Russian networks over the physical link instead of
+    /// the tunnel. Off unless a profile or client asks for it, so existing
+    /// profiles keep routing everything through the VPN.
+    #[serde(default)]
+    pub bypass_russia: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,9 +48,7 @@ impl ClientProtocol {
             Self::MorphParanoid => "morph_paranoid",
         }
     }
-}
 
-impl ClientProtocol {
     #[must_use]
     pub const fn morph_profile(self) -> Option<Profile> {
         match self {
@@ -87,6 +90,7 @@ pub struct ValidatedClientConfig {
     pub tun_name: String,
     pub protocol: ClientProtocol,
     pub mousality: Option<MousalityClientConfig>,
+    pub bypass_russia: bool,
 }
 
 impl ClientConfig {
@@ -131,6 +135,7 @@ impl ClientConfig {
             tun_name: self.tun_name,
             protocol: self.protocol,
             mousality: self.mousality,
+            bypass_russia: self.bypass_russia,
         })
     }
 }
@@ -153,6 +158,16 @@ mod tests {
         ))
         .expect("config");
         assert_eq!(config.protocol, ClientProtocol::Legacy);
+        assert!(!config.bypass_russia);
+    }
+
+    #[test]
+    fn russian_bypass_is_opt_in() {
+        let config: ClientConfig = toml::from_str(&format!(
+            "server = '127.0.0.1:51820'\nserver_public_key = '{SERVER_KEY}'\nclient_private_key = '{CLIENT_KEY}'\nbypass_russia = true\n"
+        ))
+        .expect("config");
+        assert!(config.validate().unwrap().bypass_russia);
     }
 
     #[test]

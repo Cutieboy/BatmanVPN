@@ -12,25 +12,115 @@ use std::{
     thread,
 };
 
-use mousevpn_config::{load_toml, ClientConfig, ClientProtocol};
+use mousevpn_config::{ClientConfig, ClientProtocol};
 use serde::Serialize;
 use tauri::{Manager, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod account;
 mod app_exclusions;
 mod backup;
 mod helper_log;
 mod profiles;
+mod routing_settings;
 mod tray;
+
+/// Appended after `--helper --config <path>` when Russian networks should
+/// bypass the tunnel. The GUI only ever starts its own executable as the
+/// helper, so both sides always understand it.
+const BYPASS_RUSSIA_FLAG: &str = "--bypass-russia";
+
+#[tauri::command]
+fn account_view() -> Result<account::AccountView, String> {
+    account::view()
+}
+
+#[tauri::command]
+async fn account_login(
+    base: String,
+    login: String,
+    password: String,
+) -> Result<account::AccountView, String> {
+    tauri::async_runtime::spawn_blocking(move || account::login(base, login, password))
+        .await
+        .map_err(display_error)?
+}
+
+#[tauri::command]
+async fn account_refresh() -> Result<account::AccountView, String> {
+    tauri::async_runtime::spawn_blocking(account::refresh)
+        .await
+        .map_err(display_error)?
+}
+
+#[tauri::command]
+async fn account_revoke_device(id: String) -> Result<account::AccountView, String> {
+    tauri::async_runtime::spawn_blocking(move || account::revoke(&id))
+        .await
+        .map_err(display_error)?
+}
+
+#[tauri::command]
+async fn account_logout() -> Result<account::AccountView, String> {
+    tauri::async_runtime::spawn_blocking(account::logout)
+        .await
+        .map_err(display_error)?
+}
+
+#[tauri::command]
+async fn billing_view() -> Result<mousevpn_account_client::BillingView, String> {
+    tauri::async_runtime::spawn_blocking(account::billing)
+        .await
+        .map_err(display_error)?
+}
+#[tauri::command]
+async fn billing_submit(
+    request: mousevpn_account_client::NewPaymentRequest,
+) -> Result<mousevpn_account_client::PaymentRequest, String> {
+    tauri::async_runtime::spawn_blocking(move || account::request_payment(request))
+        .await
+        .map_err(display_error)?
+}
+#[tauri::command]
+async fn support_tickets() -> Result<Vec<mousevpn_account_client::TicketSummary>, String> {
+    tauri::async_runtime::spawn_blocking(account::tickets)
+        .await
+        .map_err(display_error)?
+}
+#[tauri::command]
+async fn support_create(
+    subject: String,
+    text: String,
+) -> Result<mousevpn_account_client::TicketDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || account::create_ticket(&subject, &text))
+        .await
+        .map_err(display_error)?
+}
+#[tauri::command]
+async fn support_ticket(
+    id: String,
+    before: Option<i64>,
+) -> Result<mousevpn_account_client::TicketDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || account::ticket(&id, before))
+        .await
+        .map_err(display_error)?
+}
+#[tauri::command]
+async fn support_reply(
+    id: String,
+    text: String,
+) -> Result<mousevpn_account_client::TicketDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || account::reply(&id, &text))
+        .await
+        .map_err(display_error)?
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
-const AUTOSTART_TASK_NAME: &str = "BatmanVPN";
-#[cfg(windows)]
-const LEGACY_AUTOSTART_TASK_NAME: &str = "MouseVPN";
+const AUTOSTART_TASK_NAME: &str = "MouseVPN";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,73 +253,6 @@ fn clear_routed_apps() -> Result<app_exclusions::AppRoutingSettings, String> {
 }
 
 #[tauri::command]
-fn choose_backup_file() -> Result<Option<String>, String> {
-    #[cfg(windows)]
-    {
-        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title='Открыть резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json|Все файлы (*.*)|*.*'; $dialog.CheckFileExists=$true; $dialog.Multiselect=$false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
-        let mut command = Command::new("powershell.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
-        let output = command
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .output()
-            .map_err(display_error)?;
-        if !output.status.success() {
-            return Err(format!(
-                "Не удалось открыть резервную копию: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
-        return Ok((!path.is_empty()).then_some(path));
-    }
-    #[cfg(not(windows))]
-    { Err("Резервное копирование доступно только в Windows".to_owned()) }
-}
-
-#[tauri::command]
-fn export_backup(password: String) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.SaveFileDialog; $dialog.Title='Сохранить резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json'; $dialog.DefaultExt='json'; $dialog.AddExtension=$true; $dialog.OverwritePrompt=$true; $dialog.FileName='batmanvpn-backup.json'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
-        let mut command = Command::new("powershell.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
-        let output = command
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .output()
-            .map_err(display_error)?;
-        if !output.status.success() {
-            return Err(format!(
-                "Не удалось открыть сохранение резервной копии: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
-        if path.is_empty() { return Ok(false); }
-        let data = backup::export(password)?;
-        std::fs::write(path, data).map_err(display_error)?;
-        return Ok(true);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = password;
-        Err("Резервное копирование доступно только в Windows".to_owned())
-    }
-}
-
-#[tauri::command]
-fn import_backup(
-    path: String,
-    password: String,
-    state: State<'_, AppState>,
-) -> Result<backup::ImportResult, String> {
-    let snapshot = connection_status_inner(&state)?;
-    if snapshot.state != "disconnected" {
-        return Err("Сначала отключите активный VPN".to_owned());
-    }
-    backup::import_from_path(Path::new(path.trim()), password)
-}
-
-#[tauri::command]
 fn set_installed_app_selection(
     selected_paths: Vec<String>,
     discovered_paths: Vec<String>,
@@ -240,21 +263,15 @@ fn set_installed_app_selection(
 #[tauri::command]
 #[cfg(windows)]
 fn autostart_enabled() -> Result<bool, String> {
-    for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
-        let mut command = Command::new("schtasks.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
-        let exists = command
-            .args(["/Query", "/TN", task_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(display_error)?
-            .success();
-        if exists {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let mut command = Command::new("schtasks.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .args(["/Query", "/TN", AUTOSTART_TASK_NAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(display_error)
 }
 
 #[tauri::command]
@@ -272,15 +289,6 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
     if enabled {
         let executable = std::env::current_exe().map_err(display_error)?;
         let task_command = autostart_command(&executable);
-
-        let mut legacy_delete = Command::new("schtasks.exe");
-        legacy_delete.creation_flags(CREATE_NO_WINDOW);
-        let _ = legacy_delete
-            .args(["/Delete", "/TN", LEGACY_AUTOSTART_TASK_NAME, "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
         command.args([
             "/Create",
             "/TN",
@@ -289,6 +297,8 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
             "ONLOGON",
             "/RL",
             "HIGHEST",
+            "/DELAY",
+            "0000:10",
             "/TR",
             &task_command,
             "/F",
@@ -297,16 +307,7 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
         if !autostart_enabled()? {
             return Ok(false);
         }
-        for task_name in [AUTOSTART_TASK_NAME, LEGACY_AUTOSTART_TASK_NAME] {
-            let mut delete = Command::new("schtasks.exe");
-            delete.creation_flags(CREATE_NO_WINDOW);
-            let _ = delete
-                .args(["/Delete", "/TN", task_name, "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        return Ok(false);
+        command.args(["/Delete", "/TN", AUTOSTART_TASK_NAME, "/F"]);
     }
     let output = command.output().map_err(display_error)?;
     if !output.status.success() {
@@ -329,22 +330,17 @@ fn set_autostart(_enabled: bool) -> Result<bool, String> {
 
 #[cfg(any(windows, test))]
 fn autostart_command(executable: &Path) -> String {
-    format!("\"{}\" --minimized --autoconnect", executable.display())
+    format!("\"{}\" --minimized", executable.display())
 }
 
-fn autoconnect_last_profile(state: &AppState) {
-    let Ok(id) = profiles::last_used_id() else {
-        return;
-    };
-    let Some(id) = id else {
-        return;
-    };
-    if !profiles::profile_path(&id).map_or(false, |path| path.exists()) {
-        return;
-    }
-    if let Err(error) = connect_profile_inner(id, state) {
-        set_tray_error(state, error);
-    }
+#[tauri::command]
+fn get_routing_settings() -> Result<routing_settings::RoutingSettings, String> {
+    routing_settings::load()
+}
+
+#[tauri::command]
+fn set_russia_bypass(enabled: bool) -> Result<routing_settings::RoutingSettings, String> {
+    routing_settings::set_bypass_russia(enabled)
 }
 
 #[tauri::command]
@@ -358,8 +354,9 @@ pub(crate) fn connect_profile_inner(
 ) -> Result<ConnectionSnapshot, String> {
     let id = profiles::normalized_id(&id)?;
     let path = profiles::profile_path(&id)?;
-    let config: ClientConfig = load_toml(&path).map_err(display_error)?;
+    let (config, _) = profiles::connection_config(&id)?;
     config.validate().map_err(display_error)?;
+    let routing = routing_settings::load()?;
 
     let mut child_slot = lock(&state.child)?;
     if let Some(child) = child_slot.as_mut() {
@@ -371,10 +368,11 @@ pub(crate) fn connect_profile_inner(
     let mut command = Command::new(std::env::current_exe().map_err(display_error)?);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    command.arg("--helper").arg("--config").arg(path);
+    if routing.bypass_russia {
+        command.arg(BYPASS_RUSSIA_FLAG);
+    }
     let mut child = command
-        .arg("--helper")
-        .arg("--config")
-        .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -390,8 +388,7 @@ pub(crate) fn connect_profile_inner(
         profile_id: Some(id.clone()),
     };
     *lock(&state.snapshot)? = snapshot.clone();
-    *lock(&state.last_profile_id)? = Some(id.clone());
-    let _ = profiles::mark_last_used(&id);
+    *lock(&state.last_profile_id)? = Some(id);
     let shared_snapshot = Arc::clone(&state.snapshot);
     let generation = Arc::clone(&state.generation);
     let reader_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -473,7 +470,7 @@ pub(crate) fn tray_toggle(state: &AppState) -> Result<(), String> {
         _ => profiles::list()?
             .first()
             .map(|profile| profile.id().to_owned())
-            .ok_or_else(|| "Сначала добавьте профиль в окне BatmanVPN".to_owned())?,
+            .ok_or_else(|| "Сначала добавьте профиль в окне MouseVPN".to_owned())?,
     };
     connect_profile_inner(id, state).map(|_| ())
 }
@@ -569,9 +566,18 @@ fn read_helper_status(
     }
 }
 
-fn run_helper(path: &Path) -> Result<(), String> {
-    let config: ClientConfig = load_toml(path).map_err(display_error)?;
-    let config = config.validate().map_err(display_error)?;
+/// How often a running managed profile re-checks that it is still allowed.
+///
+/// Each check reads the profile and unseals the account through DPAPI, which
+/// is a round trip to LSASS. Once a second kept both processes waking for the
+/// whole session; a few seconds is still well inside what signing out or a
+/// lapsed subscription needs.
+const SUBSCRIPTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn run_helper(path: &Path, bypass_russia: bool) -> Result<(), String> {
+    let config: ClientConfig = profiles::load_config(path)?;
+    let mut config = config.validate().map_err(display_error)?;
+    config.bypass_russia |= bypass_russia;
     let app_routing = if split_tunneling_available() {
         app_exclusions::policy()?
     } else {
@@ -587,6 +593,29 @@ fn run_helper(path: &Path) -> Result<(), String> {
         let _ = std::io::stdin().read_line(&mut line);
         stdin_stopping.store(true, Ordering::Release);
     });
+    if let Some(id) = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|id| profiles::is_managed(id).unwrap_or(false))
+    {
+        let id = id.to_owned();
+        let stopping = Arc::clone(&stopping);
+        thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                if profiles::profile_path(&id)
+                    .and_then(|path| profiles::load_config(&path))
+                    .is_err()
+                {
+                    eprintln!(
+                        "MOUSEVPN_ERROR=Подписка истекла или доступ отключён. Обновите аккаунт."
+                    );
+                    stopping.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(SUBSCRIPTION_CHECK_INTERVAL);
+            }
+        });
+    }
     let mut backoff = std::time::Duration::from_secs(1);
     eprintln!("MOUSEVPN_STATE=connecting");
     loop {
@@ -614,7 +643,7 @@ fn run_helper(path: &Path) -> Result<(), String> {
 }
 
 fn run_probe(path: &Path) -> Result<(), String> {
-    let config: ClientConfig = load_toml(path).map_err(display_error)?;
+    let config: ClientConfig = profiles::load_config(path)?;
     let config = config.validate().map_err(display_error)?;
     let parameters = mousevpn_windows_client::probe(&config).map_err(display_error)?;
     println!(
@@ -646,7 +675,75 @@ fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn run_gui(minimized: bool, autoconnect: bool) {
+
+#[tauri::command]
+fn choose_backup_file() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title='Открыть резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json|Все файлы (*.*)|*.*'; $dialog.CheckFileExists=$true; $dialog.Multiselect=$false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .map_err(display_error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Не удалось открыть резервную копию: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
+        return Ok((!path.is_empty()).then_some(path));
+    }
+    #[cfg(not(windows))]
+    { Err("Резервное копирование доступно только в Windows".to_owned()) }
+}
+
+#[tauri::command]
+fn export_backup(password: String) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.SaveFileDialog; $dialog.Title='Сохранить резервную копию BatmanVPN'; $dialog.Filter='BatmanVPN backup (*.json)|*.json|JSON (*.json)|*.json'; $dialog.DefaultExt='json'; $dialog.AddExtension=$true; $dialog.OverwritePrompt=$true; $dialog.FileName='batmanvpn-backup.json'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Write-Output $dialog.FileName }";
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .map_err(display_error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Не удалось открыть сохранение резервной копии: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8(output.stdout).map_err(display_error)?.trim().to_owned();
+        if path.is_empty() { return Ok(false); }
+        let data = backup::export(password)?;
+        std::fs::write(path, data).map_err(display_error)?;
+        return Ok(true);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = password;
+        Err("Резервное копирование доступно только в Windows".to_owned())
+    }
+}
+
+#[tauri::command]
+fn import_backup(
+    path: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<backup::ImportResult, String> {
+    let snapshot = connection_status_inner(&state)?;
+    if snapshot.state != "disconnected" {
+        return Err("Сначала отключите активный VPN".to_owned());
+    }
+    backup::import_from_path(Path::new(path.trim()), password)
+}
+
+fn run_gui(minimized: bool) {
     let builder = tauri::Builder::default();
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(
@@ -663,14 +760,8 @@ fn run_gui(minimized: bool, autoconnect: bool) {
             tray::install(app)?;
             if minimized {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    hide_main_window(&window);
                 }
-            }
-            if autostart_enabled().unwrap_or(false) {
-                let _ = set_autostart(true);
-            }
-            if autoconnect {
-                autoconnect_last_profile(app.state::<AppState>().inner());
             }
             Ok(())
         })
@@ -679,12 +770,25 @@ fn run_gui(minimized: bool, autoconnect: bool) {
                 let state = window.state::<AppState>();
                 if !state.quitting.load(Ordering::Acquire) {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if let Some(window) = window.get_webview_window(window.label()) {
+                        hide_main_window(&window);
+                    }
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             runtime_diagnostics,
+            account_view,
+            account_login,
+            account_refresh,
+            account_revoke_device,
+            account_logout,
+            billing_view,
+            billing_submit,
+            support_tickets,
+            support_create,
+            support_ticket,
+            support_reply,
             split_tunneling_available,
             list_profiles,
             import_profile,
@@ -697,12 +801,14 @@ fn run_gui(minimized: bool, autoconnect: bool) {
             remove_routed_app,
             set_app_routing_mode,
             clear_routed_apps,
+            set_installed_app_selection,
             choose_backup_file,
             export_backup,
             import_backup,
-            set_installed_app_selection,
             autostart_enabled,
             set_autostart,
+            get_routing_settings,
+            set_russia_bypass,
             connect_profile,
             disconnect,
             connection_status,
@@ -716,11 +822,24 @@ fn should_reveal_existing_instance(arguments: &[String]) -> bool {
     !arguments.iter().any(|argument| argument == "--minimized")
 }
 
-#[cfg(windows)]
-fn reveal_main_window(app: &tauri::AppHandle) {
+/// Hides the main window into the tray.
+///
+/// Hiding only the native window leaves `WebView2` believing the page is on
+/// screen, so it kept repainting the once-a-second status and session timer
+/// for a window nobody could see. Hiding the webview as well marks the page
+/// hidden, which is what lets the page stop polling and `WebView2` throttle it.
+fn hide_main_window<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+    let webview: &tauri::Webview<R> = window.as_ref();
+    let _ = webview.hide();
+    let _ = window.hide();
+}
+
+pub(crate) fn reveal_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
+        let webview: &tauri::Webview<_> = window.as_ref();
+        let _ = webview.show();
         let _ = window.set_focus();
     }
 }
@@ -755,7 +874,15 @@ fn main() {
             }
         }
         [_, helper, config, path] if helper == "--helper" && config == "--config" => {
-            if let Err(error) = run_helper(Path::new(path)) {
+            if let Err(error) = run_helper(Path::new(path), false) {
+                eprintln!("MOUSEVPN_ERROR={error}");
+                std::process::exit(1);
+            }
+        }
+        [_, helper, config, path, bypass]
+            if helper == "--helper" && config == "--config" && bypass == BYPASS_RUSSIA_FLAG =>
+        {
+            if let Err(error) = run_helper(Path::new(path), true) {
                 eprintln!("MOUSEVPN_ERROR={error}");
                 std::process::exit(1);
             }
@@ -766,11 +893,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        [_, minimized, autoconnect]
-            if minimized == "--minimized" && autoconnect == "--autoconnect" =>
-            run_gui(true, true),
-        [_, minimized] if minimized == "--minimized" => run_gui(true, false),
-        _ => run_gui(false, true),
+        [_, minimized] if minimized == "--minimized" => run_gui(true),
+        _ => run_gui(false),
     }
 }
 
@@ -802,7 +926,7 @@ mod helper_status_tests {
             autostart_command(std::path::Path::new(
                 r"C:\Program Files\MouseVPN\MouseVPN.exe"
             )),
-            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized --autoconnect"#
+            r#""C:\Program Files\MouseVPN\MouseVPN.exe" --minimized"#
         );
     }
 
@@ -842,31 +966,6 @@ mod helper_status_tests {
         assert_eq!(
             snapshot.message,
             "Восстанавливаем VPN: network cleanup failed"
-        );
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::autostart_command;
-    use std::path::Path;
-
-    #[test]
-    fn backup_module_is_registered() {
-        let _ = super::backup::ImportResult {
-            selected_profile_id: None,
-            profile_count: 0,
-            routed_app_count: 0,
-        };
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn autostart_command_points_to_the_current_executable() {
-        assert_eq!(
-            autostart_command(Path::new(r"C:\Program Files\BatmanVPN\BatmanVPN.exe")),
-            r#""C:\Program Files\BatmanVPN\BatmanVPN.exe" --minimized --autoconnect"#
         );
     }
 }
