@@ -10,11 +10,6 @@ use std::{
     time::Instant,
 };
 
-use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
-use mousevpn_config::ValidatedClientConfig;
-use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelReceiver, TunnelSender};
-use mousevpn_protocol::Datagram;
-use mousevpn_transport::{DatagramTransport, UdpTransport};
 use crate::{
     diagnostics::{Diagnostics, SendCounters},
     handshake::connect,
@@ -30,6 +25,11 @@ use crate::{
     },
     AppRoutingMode, AppRoutingPolicy, ClientError,
 };
+use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
+use mousevpn_config::ValidatedClientConfig;
+use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelReceiver, TunnelSender};
+use mousevpn_protocol::Datagram;
+use mousevpn_transport::{ClientTransport, DatagramTransport};
 
 const DATAGRAM_BUFFER_LEN: usize = 65_535;
 
@@ -158,7 +158,7 @@ pub fn run_split_tunnel(
     let _runtime_lock = network::RuntimeLock::acquire()?;
 
     let wire = ClientWire::from_config(config)?;
-    let (incoming, plane, parameters) = connect(config, &wire)?;
+    let (mut incoming, plane, parameters) = connect(config, &wire)?;
     incoming.set_read_timeout(Some(UDP_POLL))?;
     let outgoing = incoming.try_clone()?;
 
@@ -192,12 +192,13 @@ pub fn run_split_tunnel(
         Arc::clone(&table),
         Arc::clone(&translation),
         config.server,
+        config.protocol == mousevpn_config::ClientProtocol::Mousality,
         Some(geo_router),
     )?);
 
     let (sender, receiver) = plane.split();
     let sender = Arc::new(Mutex::new(sender));
-    let (transport_tx, transport_rx) = mpsc::sync_channel(1);
+    let (transport_tx, transport_rx) = mpsc::sync_channel::<ClientTransport>(1);
     let counters = Arc::new(SendCounters::default());
 
     eprintln!("MOUSEVPN_STATE=connected");
@@ -246,8 +247,8 @@ fn spawn_outbound(
     sender: &Arc<Mutex<TunnelSender>>,
     stopping: &Arc<AtomicBool>,
     wire: ClientWire,
-    mut transport: UdpTransport,
-    replacements: mpsc::Receiver<UdpTransport>,
+    mut transport: ClientTransport,
+    replacements: mpsc::Receiver<ClientTransport>,
     counters: &Arc<SendCounters>,
 ) -> Result<thread::JoinHandle<Result<(), ClientError>>, ClientError> {
     let diverter = Arc::clone(diverter);
@@ -276,8 +277,9 @@ fn spawn_outbound(
                                 // An application may emit a packet larger than
                                 // the tunnel can carry. Dropping one packet is
                                 // recoverable; stopping is not.
-                                DataPlaneError::PacketExceedsMtu { .. }
-                                | DataPlaneError::Ip(_) => Skip,
+                                DataPlaneError::PacketExceedsMtu { .. } | DataPlaneError::Ip(_) => {
+                                    Skip
+                                }
                                 error => Fatal(error.into()),
                             })
                     });
@@ -291,8 +293,7 @@ fn spawn_outbound(
                         let flags = tcp_flags(packet);
                         let is_control = flags.is_some_and(|f| (f & SYN) != 0 || (f & RST) != 0);
                         if is_control {
-                            let desc =
-                                describe_packet(packet).unwrap_or_else(|| "?".to_owned());
+                            let desc = describe_packet(packet).unwrap_or_else(|| "?".to_owned());
                             eprintln!(
                                 "MOUSEVPN_OUTBOUND_OK=flags=0x{:02x} {}",
                                 flags.unwrap_or(0),
@@ -353,10 +354,7 @@ fn spawn_outbound(
                     Err(error) => {
                         counters.failed();
                         let desc = describe_packet(packet).unwrap_or_else(|| "?".to_owned());
-                        eprintln!(
-                            "MOUSEVPN_SEND_ERROR={error} {}",
-                            desc,
-                        );
+                        eprintln!("MOUSEVPN_SEND_ERROR={error} {}", desc,);
                     }
                 }
             })
@@ -370,14 +368,14 @@ fn spawn_outbound(
 struct ReceiveLoop<'a> {
     config: &'a ValidatedClientConfig,
     wire: &'a ClientWire,
-    transport: UdpTransport,
+    transport: ClientTransport,
     receiver: TunnelReceiver,
     sender: &'a Arc<Mutex<TunnelSender>>,
     translation: &'a Arc<RwLock<Translation>>,
     table: &'a Arc<FlowTable>,
     diverter: &'a Diverter,
     counters: &'a Arc<SendCounters>,
-    outbound_transport: &'a mpsc::SyncSender<UdpTransport>,
+    outbound_transport: &'a mpsc::SyncSender<ClientTransport>,
     inbound: Address,
     default_disposition: Disposition,
 }
@@ -604,7 +602,7 @@ impl ReceiveLoop<'_> {
         // from what the session started with.
         let physical = IpAddr::V4(network::physical_addresses()?.ipv4);
         let route = netcfg::default_ipv4_route(None)?;
-        let (transport, plane, parameters) = connect(self.config, self.wire)?;
+        let (mut transport, plane, parameters) = connect(self.config, self.wire)?;
         transport.set_read_timeout(Some(UDP_POLL))?;
         let outgoing = transport.try_clone()?;
 

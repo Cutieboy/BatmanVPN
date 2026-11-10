@@ -78,7 +78,7 @@ pub fn run_with_stop(
         })();
         (handshake.join(), device)
     });
-    let (incoming, plane, mut parameters) = handshake.map_err(|_| {
+    let (mut incoming, plane, mut parameters) = handshake.map_err(|_| {
         ClientError::Platform("the MouseVPN handshake thread panicked".to_owned())
     })??;
     let (_wintun, adapter) = device?;
@@ -151,7 +151,7 @@ pub fn run_with_stop(
             }
 
             let attempt: Result<_, ClientError> = (|| {
-                let (next_incoming, next_plane, next_parameters) = connect(config, &wire)?;
+                let (mut next_incoming, next_plane, next_parameters) = connect(config, &wire)?;
                 next_incoming.set_read_timeout(Some(packet_loop::UDP_POLL))?;
                 let next_outgoing = next_incoming.try_clone()?;
                 adapter

@@ -6,11 +6,14 @@ use std::{
 };
 
 use mousevpn_client_wire::ClientWire;
-use mousevpn_config::ValidatedClientConfig;
+use mousevpn_config::{ClientProtocol, ValidatedClientConfig};
 use mousevpn_crypto::ClientHandshake;
 use mousevpn_data_plane::TunnelDataPlane;
 use mousevpn_protocol::{Datagram, Header, PacketKind, SessionParameters};
-use mousevpn_transport::{DatagramTransport, UdpTransport};
+use mousevpn_transport::{
+    connect_pooled, is_unauthenticated, ClientTransport, DatagramTransport, MousalityTransport,
+    UdpTransport,
+};
 
 use crate::ClientError;
 
@@ -21,18 +24,42 @@ const DATAGRAM_BUFFER_LEN: usize = 65_535;
 pub(crate) fn connect(
     config: &ValidatedClientConfig,
     wire: &ClientWire,
-) -> Result<(UdpTransport, TunnelDataPlane, SessionParameters), ClientError> {
+) -> Result<(ClientTransport, TunnelDataPlane, SessionParameters), ClientError> {
     let local = match config.server {
         SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
         SocketAddr::V6(_) => SocketAddr::from(([0_u16; 8], 0)),
     };
-    let mut transport = UdpTransport::bind(local, config.server)?;
+    let mut transport = if config.protocol == ClientProtocol::Mousality {
+        let settings = config.mousality.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing Mousality settings")
+        })?;
+        let names: Vec<_> = settings.names().collect();
+        validate_server_names(&names)?;
+        eprintln!("MOUSEVPN_ENDPOINT={}", config.server);
+        ClientTransport::Mousality(connect_pooled(
+            config.server,
+            &names,
+            |server_name, version| {
+                eprintln!("MOUSEVPN_MOUSALITY_SNI={server_name}");
+                MousalityTransport::connect_version(
+                    config.server,
+                    server_name,
+                    *config.server_public_key.as_bytes(),
+                    HANDSHAKE_TIMEOUT,
+                    version,
+                )
+            },
+            is_unauthenticated,
+        )?)
+    } else {
+        ClientTransport::Udp(UdpTransport::bind(local, config.server)?)
+    };
     let (plane, parameters) = negotiate(&mut transport, config, wire)?;
     Ok((transport, plane, parameters))
 }
 
 pub(crate) fn negotiate(
-    transport: &mut UdpTransport,
+    transport: &mut ClientTransport,
     config: &ValidatedClientConfig,
     wire: &ClientWire,
 ) -> Result<(TunnelDataPlane, SessionParameters), ClientError> {
@@ -76,7 +103,18 @@ pub(crate) fn negotiate(
         transport.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
         let length = match transport.receive(&mut buffer) {
             Ok(length) => length,
-            Err(error) if is_retryable(&error) => continue,
+            Err(error)
+                if is_retryable(&error)
+                    && (!transport.is_mousality()
+                        || matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                        )) =>
+            {
+                continue
+            }
             Err(error) => return Err(error.into()),
         };
         let Ok(true) = wire.decode(&buffer[..length], &mut decoded) else {
@@ -102,7 +140,7 @@ pub(crate) fn negotiate(
 }
 
 fn send_request(
-    transport: &mut UdpTransport,
+    transport: &mut ClientTransport,
     wire: &ClientWire,
     request: &[u8],
     encoded: &mut Vec<u8>,
@@ -110,12 +148,23 @@ fn send_request(
     wire.encode(request, encoded)?;
     match transport.send(encoded) {
         Ok(()) => Ok(()),
-        Err(error) if is_retryable(&error) => Ok(()),
+        Err(error)
+            if is_retryable(&error)
+                && (!transport.is_mousality()
+                    || matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                    )) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error.into()),
     }
 }
 
-fn send_prelude(transport: &mut UdpTransport, wire: &ClientWire) -> Result<(), ClientError> {
+fn send_prelude(transport: &mut ClientTransport, wire: &ClientWire) -> Result<(), ClientError> {
     let mut cover = Vec::new();
     for _ in 0..wire.cover_count()? {
         wire.encode_cover(&mut cover)?;
@@ -144,4 +193,13 @@ fn random_session_id() -> Result<u64, ClientError> {
     let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes)?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+fn validate_server_names(names: &[&str]) -> Result<(), ClientError> {
+    if names.is_empty() || names.len() > 16 {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid Mousality SNI pool").into(),
+        );
+    }
+    Ok(())
 }

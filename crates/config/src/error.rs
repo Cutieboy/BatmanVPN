@@ -15,6 +15,7 @@ pub enum ConfigError {
     InvalidPrefix(u8),
     InvalidMtu(u16),
     EmptyClients,
+    InvalidMousality,
 }
 
 impl fmt::Display for ConfigError {
@@ -43,6 +44,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidPrefix(prefix) => write!(formatter, "invalid IPv4 prefix length {prefix}"),
             Self::InvalidMtu(mtu) => write!(formatter, "invalid tunnel MTU {mtu}"),
             Self::EmptyClients => formatter.write_str("server must authorize at least one client"),
+            Self::InvalidMousality => formatter.write_str("Mousality requires a valid server name and nonzero endpoints; server requires one SNI and a separate real TLS fallback"),
         }
     }
 }

@@ -11,7 +11,7 @@ use mousevpn_client_wire::{ClientWire, MAX_WIRE_DATAGRAM_LEN};
 use mousevpn_config::ValidatedClientConfig;
 use mousevpn_data_plane::{DataPlaneError, Decoded, TunnelDataPlane, TunnelReceiver, TunnelSender};
 use mousevpn_protocol::{Datagram, SessionParameters};
-use mousevpn_transport::{DatagramTransport, UdpTransport};
+use mousevpn_transport::{ClientTransport, DatagramTransport};
 use windows_sys::Win32::{
     Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::WaitForSingleObject,
@@ -34,8 +34,8 @@ const DATAGRAM_BUFFER_LEN: usize = 65_535;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     config: &ValidatedClientConfig,
-    incoming: UdpTransport,
-    outgoing: UdpTransport,
+    incoming: ClientTransport,
+    outgoing: ClientTransport,
     plane: TunnelDataPlane,
     parameters: SessionParameters,
     session: &Arc<Session>,
@@ -104,7 +104,7 @@ pub(crate) fn run(
 
 struct IncomingLoop<'a> {
     config: &'a ValidatedClientConfig,
-    transport: UdpTransport,
+    transport: ClientTransport,
     parameters: SessionParameters,
     receiver: TunnelReceiver,
     sender: Arc<Mutex<TunnelSender>>,
@@ -112,7 +112,7 @@ struct IncomingLoop<'a> {
     stopping: &'a AtomicBool,
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
-    outgoing_transport: mpsc::SyncSender<UdpTransport>,
+    outgoing_transport: mpsc::SyncSender<ClientTransport>,
     worker: mpsc::Receiver<Result<(), ClientError>>,
     network: &'a mut NetworkGuard,
     wire: &'a ClientWire,
@@ -243,7 +243,7 @@ impl IncomingLoop<'_> {
 
     fn establish_replacement(&mut self) -> Result<(), ClientError> {
         self.network.refresh()?;
-        let (replacement_transport, replacement, parameters) = connect(self.config, self.wire)?;
+        let (mut replacement_transport, replacement, parameters) = connect(self.config, self.wire)?;
         replacement_transport.set_read_timeout(Some(UDP_POLL))?;
         let replacement_outgoing = replacement_transport.try_clone()?;
         if parameters != self.parameters {
@@ -320,12 +320,12 @@ impl Drop for PeriodicWorker {
 #[allow(clippy::too_many_arguments)]
 fn spawn_outgoing(
     session: Arc<Session>,
-    mut transport: UdpTransport,
+    mut transport: ClientTransport,
     sender: Arc<Mutex<TunnelSender>>,
     stopping: Arc<AtomicBool>,
     reconnecting: Arc<AtomicBool>,
     reconnect_requested: Arc<AtomicBool>,
-    transport_replacements: mpsc::Receiver<UdpTransport>,
+    transport_replacements: mpsc::Receiver<ClientTransport>,
     result_tx: mpsc::SyncSender<Result<(), ClientError>>,
     wire: ClientWire,
 ) -> thread::JoinHandle<()> {
