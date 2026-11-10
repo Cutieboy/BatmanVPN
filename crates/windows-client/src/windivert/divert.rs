@@ -19,6 +19,7 @@ use super::{
 use crate::ClientError;
 
 const DNS_PORT: u16 = 53;
+const FLOW_WAIT_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// The staging buffer for one batch, in bytes.
 ///
@@ -425,8 +426,12 @@ pub(crate) fn prepare_outbound(
             // is provisionally classified and pinned to the default disposition
             // so its first packet does not leak the physical IP.
             if packet.starts_connection() || packet.protocol() == PROTOCOL_UDP {
-                table.insert_provisional(key, translation.default_disposition);
-                translation.default_disposition
+                if let Some(resolved) = table.lookup_or_wait(&key, FLOW_WAIT_TIMEOUT) {
+                    resolved
+                } else {
+                    table.insert_provisional(key, translation.default_disposition);
+                    translation.default_disposition
+                }
             } else {
                 // Non-SYN TCP packets of unclassified flows stay on the
                 // physical link; the flow was already established before

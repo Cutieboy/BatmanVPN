@@ -6,9 +6,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
@@ -76,7 +77,10 @@ struct Entry {
 pub(crate) struct FlowTable {
     entries: RwLock<HashMap<FlowKey, Entry>>,
     /// IPs learned from direct-domain DNS answers for the lifetime of their DNS TTL.
-    geo_direct_ips: RwLock<HashMap<IpAddr, std::time::Instant>>,
+    geo_direct_ips: RwLock<HashMap<IpAddr, Instant>>,
+    has_watcher: AtomicBool,
+    stopped: AtomicBool,
+    notify: (Mutex<()>, Condvar),
 }
 
 impl FlowTable {
@@ -85,6 +89,54 @@ impl FlowTable {
             .read()
             .ok()
             .and_then(|entries| entries.get(key).map(|entry| entry.disposition))
+    }
+
+    pub(crate) fn enable_wait(&self) {
+        self.has_watcher.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stop_waiting(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.wake_waiters();
+    }
+
+    fn wake_waiters(&self) {
+        let _guard = self.notify.0.lock();
+        self.notify.1.notify_all();
+    }
+
+    /// Looks up `key`, waiting briefly for the live FlowWatcher to classify
+    /// a newly opened connection if `enable_wait` was called.
+    pub(crate) fn lookup_or_wait(&self, key: &FlowKey, timeout: Duration) -> Option<Disposition> {
+        if let Some(disposition) = self.lookup(key) {
+            return Some(disposition);
+        }
+        if !self.has_watcher.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+            || timeout.is_zero()
+        {
+            return None;
+        }
+        let deadline = Instant::now() + timeout;
+        let Ok(mut guard) = self.notify.0.lock() else {
+            return self.lookup(key);
+        };
+        loop {
+            if let Some(disposition) = self.lookup(key) {
+                return Some(disposition);
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.lookup(key);
+            }
+            let Ok((next_guard, _)) = self.notify.1.wait_timeout(guard, remaining) else {
+                return self.lookup(key);
+            };
+            guard = next_guard;
+        }
     }
 
     pub(crate) fn route_direct_ip(&self, address: IpAddr, ttl: std::time::Duration) {
@@ -126,6 +178,7 @@ impl FlowTable {
                     provisional: false,
                 });
         }
+        self.wake_waiters();
     }
 
     /// Records a decision that could not be attributed to a process.
@@ -146,6 +199,7 @@ impl FlowTable {
                 provisional: false,
             });
         }
+        self.wake_waiters();
     }
 
     /// Records a provisional decision made by the packet path for an
@@ -232,6 +286,7 @@ impl FlowWatcher {
         policy: &AppRoutingPolicy,
     ) -> Result<Self, ClientError> {
         let table = Arc::new(FlowTable::default());
+        table.enable_wait();
         let stopping = Arc::new(AtomicBool::new(false));
         let classifier = Arc::new(Classifier::new(policy));
         // The two layers classify the same flows by different means, so losing
@@ -287,6 +342,7 @@ impl FlowWatcher {
 impl Drop for FlowWatcher {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
+        self.table.stop_waiting();
         // Each watcher parks inside `recv`, so it only observes `stopping`
         // after the shutdown drains its queue and wakes it.
         for handle in &self.handles {
@@ -550,7 +606,7 @@ impl Classifier {
         // PIDs; require each parent to have been created no later than its
         // child before accepting the ancestry.
         let listed = self.matches(&path)
-            || self.matches_excluded_ancestor(process_id, created);
+            || (!self.apps.is_empty() && self.matches_excluded_ancestor(process_id, created));
 
         if let Ok(mut cache) = self.cache.lock() {
             // Dropping everything is cruder than evicting the coldest entry
@@ -965,5 +1021,22 @@ mod tests {
             Path::new(r"C:\Apps\Browser.exe"),
             Path::new(r"c:\apps\browser.EXE")
         ));
+    }
+
+    #[test]
+    fn lookup_or_wait_wakes_when_watcher_inserts_decision() {
+        let table = std::sync::Arc::new(FlowTable::default());
+        table.enable_wait();
+        let writer_table = std::sync::Arc::clone(&table);
+        let flow = key();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            writer_table.insert(flow, Disposition::Direct);
+        });
+        assert_eq!(
+            table.lookup_or_wait(&key(), std::time::Duration::from_millis(200)),
+            Some(Disposition::Direct)
+        );
+        handle.join().expect("writer thread");
     }
 }
