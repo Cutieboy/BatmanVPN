@@ -272,7 +272,6 @@ pub fn check_capture_filters(extra: &[String]) -> Result<String, ClientError> {
 /// server on the server's port is excluded and UDP is captured; otherwise outbound
 /// UDP to the server on the server's port is excluded and TCP is captured.
 fn filter(server: SocketAddr, tcp_tunnel: bool) -> String {
-    let endpoint_family = if server.is_ipv4() { "ip" } else { "ipv6" };
     let family_filter = if server.is_ipv4() {
         "ip or ipv6"
     } else {
@@ -283,28 +282,45 @@ fn filter(server: SocketAddr, tcp_tunnel: bool) -> String {
     } else {
         ("tcp", "udp")
     };
-    format!(
-        "outbound and !loopback and ({family_filter}) and \
-         ({other} or ({tunnel} and ({endpoint_family}.DstAddr != {} or {tunnel}.DstPort != {})))",
-        server.ip(),
-        server.port()
-    )
+    let exclusion = if server.is_ipv4() {
+        format!(
+            "(ipv6 or ip.DstAddr != {} or {tunnel}.DstPort != {})",
+            server.ip(),
+            server.port()
+        )
+    } else {
+        format!(
+            "(ipv6.DstAddr != {} or {tunnel}.DstPort != {})",
+            server.ip(),
+            server.port()
+        )
+    };
+    format!("outbound and !loopback and ({family_filter}) and ({other} or ({tunnel} and {exclusion}))")
 }
 
-/// Returns whether an address belongs to a private/local network that must
-/// remain on the physical interface instead of entering VPN transformation.
+/// Returns whether an address belongs to a local, loopback, multicast, or
+/// broadcast network that must remain on the physical interface instead of
+/// entering VPN transformation.
 fn is_local_network(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [a, b, ..] = address.octets();
-            (a == 10)
+            address.is_loopback()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_unspecified()
+                || (a == 10)
                 || (a == 172 && (16..=31).contains(&b))
                 || (a == 192 && b == 168)
                 || (a == 169 && b == 254)
         }
         IpAddr::V6(address) => {
             let first = address.octets()[0];
-            (first & 0xfe) == 0xfc || (first & 0xc0) == 0x80
+            address.is_loopback()
+                || address.is_multicast()
+                || address.is_unspecified()
+                || (first & 0xfe) == 0xfc
+                || (first & 0xc0) == 0x80
         }
     }
 }
@@ -403,16 +419,18 @@ pub(crate) fn prepare_outbound(
             // arrives, replaces this guess, so an excluded application is
             // still routed Direct even if its SYN won the race.
             //
-            // An unclassified connection start (TCP SYN without ACK) is
-            // provisionally classified and pinned to the default disposition
-            // regardless of whether `clamp_mss` modified the packet (e.g. if
-            // the MSS option was absent or already within limits).
-            if packet.starts_connection() {
+            // An unclassified connection start (TCP SYN without ACK) or
+            // first-fragment UDP datagram (for example unconnected QUIC/HTTP3
+            // or STUN before `LAYER_FLOW` delivers `EVENT_FLOW_ESTABLISHED`)
+            // is provisionally classified and pinned to the default disposition
+            // so its first packet does not leak the physical IP.
+            if packet.starts_connection() || packet.protocol() == PROTOCOL_UDP {
                 table.insert_provisional(key, translation.default_disposition);
                 translation.default_disposition
             } else {
-                // Non-SYN packets of unclassified flows stay on the
-                // physical link; the flow will be classified soon.
+                // Non-SYN TCP packets of unclassified flows stay on the
+                // physical link; the flow was already established before
+                // capture or is not a connection start.
                 return Outcome::PassThrough;
             }
         }
@@ -811,16 +829,47 @@ mod tests {
     }
 
     #[test]
-    fn passes_through_a_flow_the_watcher_has_not_classified() {
-        // Racing the flow layer must not swallow traffic: an unknown packet
-        // keeps working on the physical link.
+    fn passes_through_unclassified_udp_in_include_mode() {
+        // In Include mode the default disposition is Direct, so an unknown
+        // UDP flow stays on the physical link unless selected.
         let mut packet = udp_packet(PHYSICAL, REMOTE);
         let original = packet.clone();
+        let mut translation = addresses();
+        translation.default_disposition = Disposition::Direct;
         assert_eq!(
-            prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
+            prepare_outbound(&mut packet, &FlowTable::default(), translation, None),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn tunnels_unclassified_udp_in_exclude_mode_to_prevent_quic_leak() {
+        // Unconnected UDP (such as browser QUIC/HTTP3 or STUN) raises no
+        // SOCKET_CONNECT event before sending. Provisionally pinning it to
+        // Tunnel prevents the first datagram from leaking the physical IP.
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
+        let table = FlowTable::default();
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Tunnel
+        );
+        let key = FlowKey {
+            protocol: PROTOCOL_UDP,
+            local: PHYSICAL,
+            local_port: 54_518,
+            remote: REMOTE,
+            remote_port: 443,
+        };
+        assert_eq!(table.lookup(&key), Some(Disposition::Tunnel));
+
+        // An authoritative Direct decision from FlowWatcher overrides it.
+        table.insert(key, Disposition::Direct);
+        let mut packet2 = udp_packet(PHYSICAL, REMOTE);
+        assert_eq!(
+            prepare_outbound(&mut packet2, &table, addresses(), None),
+            Outcome::PassThrough
+        );
     }
 
     #[test]
@@ -908,14 +957,14 @@ mod tests {
     }
 
     #[test]
-    fn leaves_other_traffic_to_the_resolver_alone() {
-        // Only port 53 is name resolution. The resolver may run other services
-        // and an unclassified flow to one of them is not ours to redirect.
-        let mut packet = udp_packet(PHYSICAL, RESOLVER);
+    fn treats_only_port_53_as_dns_bypass_to_resolver() {
+        // Only port 53 is unconditionally passed through as DNS. Port 443 to
+        // a public resolver such as 1.1.1.1 (DoH/DoQ/QUIC) follows policy.
+        let mut packet = udp_packet(PHYSICAL, REMOTE);
         packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
         assert_eq!(
             prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
-            Outcome::PassThrough
+            Outcome::Tunnel
         );
     }
 
@@ -923,11 +972,12 @@ mod tests {
     fn discards_a_routed_flow_it_cannot_translate() {
         // An IPv6 flow of a routed application has no tunnel address to take.
         // Handing it back would put protected traffic on the physical link.
+        let remote_v6 = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
         let mut packet = vec![0_u8; 60];
         packet[0] = 0x60;
         packet[6] = PROTOCOL_UDP;
         packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        packet[24..40].copy_from_slice(&remote_v6.octets());
         packet[40..42].copy_from_slice(&54_518_u16.to_be_bytes());
         packet[42..44].copy_from_slice(&443_u16.to_be_bytes());
 
@@ -937,7 +987,7 @@ mod tests {
                 protocol: PROTOCOL_UDP,
                 local: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 local_port: 54_518,
-                remote: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                remote: IpAddr::V6(remote_v6),
                 remote_port: 443,
             },
             Disposition::Tunnel,
@@ -969,7 +1019,7 @@ mod tests {
         assert!(filter.contains("ip or ipv6"));
         assert!(filter.contains("203.0.113.10"));
         assert!(filter.contains("51820"));
-        assert!(filter.contains("tcp or (udp and (ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820))"));
+        assert!(filter.contains("tcp or (udp and (ipv6 or ip.DstAddr != 203.0.113.10 or udp.DstPort != 51820))"));
     }
 
     #[test]
@@ -986,10 +1036,26 @@ mod tests {
         let server: SocketAddr = "203.0.113.10:443".parse().unwrap();
         let filter = filter(server, true);
         assert!(
-            filter.contains("udp or (tcp and (ip.DstAddr != 203.0.113.10 or tcp.DstPort != 443))")
+            filter.contains("udp or (tcp and (ipv6 or ip.DstAddr != 203.0.113.10 or tcp.DstPort != 443))")
         );
         assert!(!filter.contains("not ("));
         assert!(!filter.contains("udp.DstPort"));
+    }
+
+    #[test]
+    fn bypasses_multicast_and_broadcast_even_when_unclassified() {
+        for dest in [
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+            IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+        ] {
+            let mut packet = udp_packet(PHYSICAL, dest);
+            assert_eq!(
+                prepare_outbound(&mut packet, &FlowTable::default(), addresses(), None),
+                Outcome::PassThrough,
+                "destination {dest}"
+            );
+        }
     }
 
     #[test]

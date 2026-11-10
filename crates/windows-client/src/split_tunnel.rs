@@ -181,19 +181,22 @@ pub fn run_split_tunnel(
     // observes ordinary Windows DNS responses and turns direct-domain answers
     // into short-lived IP decisions before the corresponding application
     // connection is diverted.
-    let geo_router = GeoRouter::embedded()?;
-    // The watcher must be running before the diverter captures anything:
-    // packets of a flow it has not classified yet pass through untranslated.
     let watcher = FlowWatcher::start(&library, app_routing)?;
     let table = watcher.table();
-    let _dns_geo = DnsWatcher::start(&library, geo_router.clone(), Arc::clone(&table))?;
+    let (geo_router, _dns_geo) = if config.bypass_russia {
+        let router = GeoRouter::embedded()?;
+        let dns_watcher = DnsWatcher::start(&library, router.clone(), Arc::clone(&table))?;
+        (Some(router), Some(dns_watcher))
+    } else {
+        (None, None)
+    };
     let diverter = Arc::new(Diverter::open(
         &library,
         Arc::clone(&table),
         Arc::clone(&translation),
         config.server,
         config.protocol == mousevpn_config::ClientProtocol::Mousality,
-        Some(geo_router),
+        geo_router,
     )?);
 
     let (sender, receiver) = plane.split();
