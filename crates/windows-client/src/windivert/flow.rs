@@ -83,6 +83,10 @@ struct Entry {
     /// watcher had classified the flow. Such a guess must not outlive the
     /// watcher's authoritative answer.
     provisional: bool,
+    /// `true` when seeded at startup from `GetExtendedTcpTable`. Because
+    /// `LAYER_FLOW` may not emit `FLOW_DELETED` for pre-existing sockets,
+    /// a subsequent `EVENT_SOCKET_CONNECT` reusing the 5-tuple replaces it.
+    preexisting: bool,
 }
 
 /// The decisions taken so far, shared with the packet path.
@@ -178,20 +182,59 @@ impl FlowTable {
     /// preventing a later event from a different layer from flip-flopping
     /// the routing of an already-established flow.
     pub(crate) fn insert(&self, key: FlowKey, disposition: Disposition) {
-        if let Ok(mut entries) = self.entries.write() {
+        self.insert_with_provenance(key, disposition, false, false);
+    }
+
+    fn insert_preexisting(&self, key: FlowKey, disposition: Disposition) {
+        self.insert_with_provenance(key, disposition, true, false);
+    }
+
+    fn insert_socket_connect(&self, key: FlowKey, disposition: Disposition, attributed: bool) {
+        if attributed {
+            self.insert_with_provenance(key, disposition, false, true);
+        } else if let Ok(mut entries) = self.entries.write() {
             entries
                 .entry(key)
                 .and_modify(|existing| {
-                    // Override a provisional guess with the authoritative
-                    // answer; leave an authoritative answer alone.
-                    if existing.provisional {
+                    if existing.preexisting {
                         existing.disposition = disposition;
                         existing.provisional = false;
+                        existing.preexisting = false;
                     }
                 })
                 .or_insert(Entry {
                     disposition,
                     provisional: false,
+                    preexisting: false,
+                });
+            drop(entries);
+            self.wake_waiters();
+        }
+    }
+
+    fn insert_with_provenance(
+        &self,
+        key: FlowKey,
+        disposition: Disposition,
+        preexisting: bool,
+        replace_preexisting: bool,
+    ) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries
+                .entry(key)
+                .and_modify(|existing| {
+                    // Override a provisional guess (or a stale preexisting
+                    // entry when a brand-new socket connect reuses the tuple).
+                    if existing.provisional || (replace_preexisting && existing.preexisting) {
+                        existing.disposition = disposition;
+                        existing.provisional = false;
+                        existing.preexisting = preexisting;
+                    }
+                })
+                .or_insert(Entry {
+                    disposition,
+                    provisional: false,
+                    preexisting,
                 });
         }
         self.wake_waiters();
@@ -213,6 +256,7 @@ impl FlowTable {
             entries.entry(key).or_insert(Entry {
                 disposition,
                 provisional: false,
+                preexisting: false,
             });
         }
         self.wake_waiters();
@@ -230,6 +274,7 @@ impl FlowTable {
             entries.entry(key).or_insert(Entry {
                 disposition,
                 provisional: true,
+                preexisting: false,
             });
         }
     }
@@ -428,7 +473,11 @@ fn run(
             // A connect event carries the process before the first packet is
             // sent, which is the only moment that helps a destination that is
             // unreachable without the tunnel.
-            EVENT_SOCKET_CONNECT | EVENT_FLOW_ESTABLISHED => {
+            EVENT_SOCKET_CONNECT => {
+                let (disposition, attributed) = classifier.classify(flow.process_id);
+                table.insert_socket_connect(key, disposition, attributed);
+            }
+            EVENT_FLOW_ESTABLISHED => {
                 let (disposition, attributed) = classifier.classify(flow.process_id);
                 if attributed {
                     table.insert(key, disposition);
@@ -916,7 +965,7 @@ fn apply_preclassified_tcp_entry(
         Disposition::Direct => Disposition::Direct,
         Disposition::Tunnel | Disposition::Discard => Disposition::Discard,
     };
-    table.insert(key, effective);
+    table.insert_preexisting(key, effective);
     Some(effective)
 }
 
@@ -1330,5 +1379,47 @@ mod tests {
                 && super::decode_tcp_port(row.dwRemotePort) == addr.port()
         });
         assert!(found, "expected live TCP socket in GetExtendedTcpTable");
+    }
+
+    #[test]
+    fn new_socket_connect_replaces_stale_preexisting_entry() {
+        let table = FlowTable::default();
+        let direct_reused = key();
+        table.insert_preexisting(direct_reused, Disposition::Direct);
+        table.insert_socket_connect(direct_reused, Disposition::Tunnel, true);
+        assert_eq!(table.lookup(&direct_reused), Some(Disposition::Tunnel));
+
+        let mut discard_reused = key();
+        discard_reused.local_port = 51_001;
+        table.insert_preexisting(discard_reused, Disposition::Discard);
+        table.insert_socket_connect(discard_reused, Disposition::Tunnel, true);
+        assert_eq!(table.lookup(&discard_reused), Some(Disposition::Tunnel));
+    }
+
+    #[test]
+    fn lookup_or_wait_handles_high_concurrent_flow_creation_without_starvation() {
+        let table = std::sync::Arc::new(FlowTable::default());
+        table.enable_wait();
+        let total = 200_u16;
+        let writer_table = std::sync::Arc::clone(&table);
+        let base = key();
+        let writer = std::thread::spawn(move || {
+            for offset in 0..total {
+                let mut flow = base;
+                flow.local_port = 40_000 + offset;
+                writer_table.insert_socket_connect(flow, Disposition::Tunnel, true);
+            }
+        });
+        let started = std::time::Instant::now();
+        for offset in 0..total {
+            let mut flow = base;
+            flow.local_port = 40_000 + offset;
+            assert_eq!(
+                table.lookup_or_wait(&flow, std::time::Duration::from_millis(500)),
+                Some(Disposition::Tunnel)
+            );
+        }
+        writer.join().expect("writer thread");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 }
