@@ -190,6 +190,7 @@ pub fn run_split_tunnel(
     } else {
         (None, None)
     };
+    watcher.preclassify_existing_tcp(config.server, geo_router.as_ref(), std::process::id());
     let diverter = Arc::new(Diverter::open(
         &library,
         Arc::clone(&table),

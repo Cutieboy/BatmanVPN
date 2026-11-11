@@ -18,7 +18,7 @@ use super::{
 };
 use crate::ClientError;
 
-const DNS_PORT: u16 = 53;
+pub(super) const DNS_PORT: u16 = 53;
 const FLOW_WAIT_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// The staging buffer for one batch, in bytes.
@@ -302,7 +302,7 @@ fn filter(server: SocketAddr, tcp_tunnel: bool) -> String {
 /// Returns whether an address belongs to a local, loopback, multicast, or
 /// broadcast network that must remain on the physical interface instead of
 /// entering VPN transformation.
-fn is_local_network(address: IpAddr) -> bool {
+pub(super) fn is_local_network(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [a, b, ..] = address.octets();
@@ -432,20 +432,27 @@ pub(crate) fn prepare_outbound(
                     table.insert_provisional(key, translation.default_disposition);
                     translation.default_disposition
                 }
+            } else if translation.default_disposition == Disposition::Tunnel {
+                // Fail-closed in Exclude mode: never pass an unclassified
+                // non-SYN TCP flow out through the physical ISP interface.
+                return Outcome::Discard;
             } else {
-                // Non-SYN TCP packets of unclassified flows stay on the
-                // physical link; the flow was already established before
-                // capture or is not a connection start.
+                // In Include mode, non-selected applications default to
+                // Direct unless pre-classified as Tunnel/Discard.
                 return Outcome::PassThrough;
             }
         }
     };
 
-    if disposition != Disposition::Tunnel {
-        if modified {
-            return Outcome::PassThroughModified;
+    match disposition {
+        Disposition::Direct => {
+            if modified {
+                return Outcome::PassThroughModified;
+            }
+            return Outcome::PassThrough;
         }
-        return Outcome::PassThrough;
+        Disposition::Discard => return Outcome::Discard,
+        Disposition::Tunnel => {}
     }
     // The application bound to the physical address, but the server only
     // recognises the tunnel one. Anything else would come back to the wrong
@@ -1129,19 +1136,53 @@ mod tests {
     }
 
     #[test]
-    fn leaves_an_unclassified_non_syn_byte_for_byte_alone() {
-        // Only the handshake carries an MSS option to clamp. A mid-stream
-        // segment of an unclassified flow must pass through untouched.
+    fn discards_unclassified_non_syn_in_exclude_mode_and_passes_in_include_mode() {
+        // In Exclude mode (default Tunnel), an unclassified non-SYN segment
+        // must fail closed rather than leaking through the ISP.
         let mut packet = outbound_syn(1460);
-        // Clear SYN: a normal data segment.
-        packet[33] = 0x10;
-        let original = packet.clone();
+        packet[33] = 0x10; // ACK data segment
         let table = FlowTable::default();
         assert_eq!(
             prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Discard
+        );
+
+        // In Include mode (default Direct), an unlisted app non-SYN passes through.
+        let original = packet.clone();
+        let mut include_translation = addresses();
+        include_translation.default_disposition = Disposition::Direct;
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, include_translation, None),
             Outcome::PassThrough
         );
         assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn discards_preexisting_tcp_flow_marked_for_discard_in_both_modes() {
+        let mut packet = outbound_syn(1460);
+        packet[33] = 0x10;
+        let table = FlowTable::default();
+        table.insert_for_test(
+            FlowKey {
+                protocol: 6,
+                local: PHYSICAL,
+                local_port: 51_000,
+                remote: REMOTE,
+                remote_port: 443,
+            },
+            Disposition::Discard,
+        );
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, addresses(), None),
+            Outcome::Discard
+        );
+        let mut include_translation = addresses();
+        include_translation.default_disposition = Disposition::Direct;
+        assert_eq!(
+            prepare_outbound(&mut packet, &table, include_translation, None),
+            Outcome::Discard
+        );
     }
 
     #[test]

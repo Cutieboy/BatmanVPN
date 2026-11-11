@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,7 +13,17 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+        NO_ERROR,
+    },
+    NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, SetTcpEntry, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_LH, MIB_TCPROW_LH_0, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        MIB_TCP_STATE_CLOSED, MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_LISTEN,
+        MIB_TCP_STATE_TIME_WAIT, TCP_TABLE_OWNER_PID_ALL,
+    },
+    Networking::WinSock::{AF_INET, AF_INET6},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -27,7 +37,10 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    Address, Handle, Library, EVENT_FLOW_DELETED, EVENT_FLOW_ESTABLISHED, EVENT_SOCKET_CLOSE,
+    divert::{is_local_network, DNS_PORT},
+    geo::GeoRouter,
+    packet::PROTOCOL_TCP,
+    Address, Handle, Library, EVENT_FLOW_DELETED, EVENT_FLOW_ESTABLISHED,
     EVENT_SOCKET_CONNECT, FLAG_RECV_ONLY, FLAG_SNIFF, LAYER_FLOW, LAYER_SOCKET,
 };
 use crate::{normalize_windows_path, AppRoutingMode, AppRoutingPolicy, ClientError};
@@ -52,6 +65,9 @@ pub(crate) enum Disposition {
     Tunnel,
     /// The flow must reach the internet over the physical adapter.
     Direct,
+    /// Pre-existing direct TCP flow belonging to a policy-tunnelled app:
+    /// blocked/discarded so it cannot keep leaking over the ISP.
+    Discard,
 }
 
 /// A routing decision and how it was reached.
@@ -258,6 +274,7 @@ impl FlowTable {
 pub(crate) struct FlowWatcher {
     handles: Vec<Arc<Handle>>,
     table: Arc<FlowTable>,
+    classifier: Arc<Classifier>,
     stopping: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
 }
@@ -329,6 +346,7 @@ impl FlowWatcher {
         Ok(Self {
             handles,
             table,
+            classifier,
             stopping,
             threads,
         })
@@ -336,6 +354,19 @@ impl FlowWatcher {
 
     pub(crate) fn table(&self) -> Arc<FlowTable> {
         Arc::clone(&self.table)
+    }
+
+    /// Enumerates TCP sockets established before capture began so excluded
+    /// apps remain Direct and tunnelled apps cannot silently continue over
+    /// the physical ISP link.
+    pub(crate) fn preclassify_existing_tcp(
+        &self,
+        server: SocketAddr,
+        geo: Option<&GeoRouter>,
+        own_pid: u32,
+    ) {
+        preclassify_ipv4_tcp(&self.table, &self.classifier, server, geo, own_pid);
+        preclassify_ipv6_tcp(&self.table, &self.classifier, server, geo, own_pid);
     }
 }
 
@@ -405,7 +436,9 @@ fn run(
                     table.insert_unattributed(key, disposition);
                 }
             }
-            EVENT_SOCKET_CLOSE | EVENT_FLOW_DELETED => table.remove(&key),
+            // Remove on FLOW_DELETED rather than SOCKET_CLOSE so graceful
+            // closing FIN-ACK/LAST_ACK packets keep their flow disposition.
+            EVENT_FLOW_DELETED => table.remove(&key),
             _ => {}
         }
     }
@@ -483,6 +516,7 @@ pub fn probe(seconds: u64, policy: &AppRoutingPolicy) -> Result<(), ClientError>
             // policy decision about the application.
             (Disposition::Tunnel, false) => "tunnel?",
             (Disposition::Direct, false) => "direct?",
+            (Disposition::Discard, _) => "DISCARD",
         };
         match decoded {
             Some(key) => println!(
@@ -841,6 +875,177 @@ fn decode_address(words: [u32; 4], ipv6: bool) -> Option<IpAddr> {
         .then(|| IpAddr::V4(Ipv4Addr::from(words[0])))
 }
 
+fn decode_tcp_port(raw: u32) -> u16 {
+    u16::from_be((raw & 0xffff) as u16)
+}
+
+fn is_active_tcp_state(state: u32) -> bool {
+    !matches!(
+        state,
+        x if x == MIB_TCP_STATE_CLOSED as u32
+            || x == MIB_TCP_STATE_LISTEN as u32
+            || x == MIB_TCP_STATE_TIME_WAIT as u32
+    )
+}
+
+fn apply_preclassified_tcp_entry(
+    table: &FlowTable,
+    classifier: &Classifier,
+    server: SocketAddr,
+    geo: Option<&GeoRouter>,
+    own_pid: u32,
+    key: FlowKey,
+    pid: u32,
+) -> Option<Disposition> {
+    if pid == own_pid || pid == 0 {
+        return None;
+    }
+    if SocketAddr::new(key.remote, key.remote_port) == server
+        || key.remote_port == DNS_PORT
+        || is_local_network(key.remote)
+        || geo.is_some_and(|router| router.is_direct_ip(key.remote) || table.is_geo_direct_ip(key.remote))
+    {
+        return None;
+    }
+    // FlowWatcher is already running: never clobber a flow opened after startup.
+    if table.lookup(&key).is_some() {
+        return None;
+    }
+    let (disposition, _attributed) = classifier.classify(pid);
+    let effective = match disposition {
+        Disposition::Direct => Disposition::Direct,
+        Disposition::Tunnel | Disposition::Discard => Disposition::Discard,
+    };
+    table.insert(key, effective);
+    Some(effective)
+}
+
+fn read_extended_tcp_table(family: u32) -> Option<Vec<u64>> {
+    let mut size = 0_u32;
+    let status = unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &raw mut size,
+            0,
+            family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+        return None;
+    }
+    let words = (size as usize).div_ceil(std::mem::size_of::<u64>()) + 8;
+    let mut buffer = vec![0_u64; words];
+    let mut actual_size = u32::try_from(std::mem::size_of_val(buffer.as_slice())).ok()?;
+    let status = unsafe {
+        GetExtendedTcpTable(
+            buffer.as_mut_ptr().cast(),
+            &raw mut actual_size,
+            0,
+            family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    (status == NO_ERROR).then_some(buffer)
+}
+
+fn preclassify_ipv4_tcp(
+    table: &FlowTable,
+    classifier: &Classifier,
+    server: SocketAddr,
+    geo: Option<&GeoRouter>,
+    own_pid: u32,
+) {
+    let Some(buffer) = read_extended_tcp_table(u32::from(AF_INET)) else {
+        return;
+    };
+    if buffer.len() < std::mem::size_of::<u32>() {
+        return;
+    }
+    let table_ptr = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+    let count = unsafe { (*table_ptr).dwNumEntries as usize };
+    let rows_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+    let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+    let max_rows = std::mem::size_of_val(buffer.as_slice()).saturating_sub(rows_offset) / row_size;
+    let rows = unsafe { std::slice::from_raw_parts((*table_ptr).table.as_ptr(), count.min(max_rows)) };
+    let mut reset_count = 0_u64;
+    for row in rows {
+        if !is_active_tcp_state(row.dwState) {
+            continue;
+        }
+        let key = FlowKey {
+            protocol: PROTOCOL_TCP,
+            local: IpAddr::V4(Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes())),
+            local_port: decode_tcp_port(row.dwLocalPort),
+            remote: IpAddr::V4(Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes())),
+            remote_port: decode_tcp_port(row.dwRemotePort),
+        };
+        if apply_preclassified_tcp_entry(table, classifier, server, geo, own_pid, key, row.dwOwningPid)
+            == Some(Disposition::Discard)
+        {
+            let delete_row = MIB_TCPROW_LH {
+                Anonymous: MIB_TCPROW_LH_0 {
+                    dwState: MIB_TCP_STATE_DELETE_TCB as u32,
+                },
+                dwLocalAddr: row.dwLocalAddr,
+                dwLocalPort: row.dwLocalPort,
+                dwRemoteAddr: row.dwRemoteAddr,
+                dwRemotePort: row.dwRemotePort,
+            };
+            if unsafe { SetTcpEntry(&raw const delete_row) } == NO_ERROR {
+                reset_count = reset_count.saturating_add(1);
+            }
+        }
+    }
+    if reset_count > 0 {
+        eprintln!("MOUSEVPN_PREEXISTING_TCP_RESET=ipv4 count={reset_count}");
+    }
+}
+
+fn preclassify_ipv6_tcp(
+    table: &FlowTable,
+    classifier: &Classifier,
+    server: SocketAddr,
+    geo: Option<&GeoRouter>,
+    own_pid: u32,
+) {
+    let Some(buffer) = read_extended_tcp_table(u32::from(AF_INET6)) else {
+        return;
+    };
+    if buffer.len() < std::mem::size_of::<u32>() {
+        return;
+    }
+    let table_ptr = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
+    let count = unsafe { (*table_ptr).dwNumEntries as usize };
+    let rows_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
+    let row_size = std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>();
+    let max_rows = std::mem::size_of_val(buffer.as_slice()).saturating_sub(rows_offset) / row_size;
+    let rows = unsafe { std::slice::from_raw_parts((*table_ptr).table.as_ptr(), count.min(max_rows)) };
+    let mut discard_count = 0_u64;
+    for row in rows {
+        if !is_active_tcp_state(row.dwState) {
+            continue;
+        }
+        let key = FlowKey {
+            protocol: PROTOCOL_TCP,
+            local: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+            local_port: decode_tcp_port(row.dwLocalPort),
+            remote: IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)),
+            remote_port: decode_tcp_port(row.dwRemotePort),
+        };
+        if apply_preclassified_tcp_entry(table, classifier, server, geo, own_pid, key, row.dwOwningPid)
+            == Some(Disposition::Discard)
+        {
+            discard_count = discard_count.saturating_add(1);
+        }
+    }
+    if discard_count > 0 {
+        eprintln!("MOUSEVPN_PREEXISTING_TCP_DISCARD=ipv6 count={discard_count}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -848,7 +1053,7 @@ mod tests {
         Classifier, Disposition, FlowKey, FlowTable, Process,
     };
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
     };
 
@@ -1038,5 +1243,92 @@ mod tests {
             Some(Disposition::Direct)
         );
         handle.join().expect("writer thread");
+    }
+
+    #[test]
+    fn preclassification_respects_policy_server_lan_and_watcher_race() {
+        let executable = std::env::current_exe().expect("exe");
+        let server: SocketAddr = "203.0.113.10:443".parse().expect("server");
+        let pid = std::process::id();
+        let other_pid = pid.saturating_add(1);
+        let make_key = |port: u16, remote: IpAddr, remote_port: u16| FlowKey {
+            protocol: 6,
+            local: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            local_port: port,
+            remote,
+            remote_port,
+        };
+
+        // Exclude mode: listed app stays Direct; unlisted or dead PID becomes Discard.
+        let exclude_classifier = super::Classifier::new(&AppRoutingPolicy {
+            mode: AppRoutingMode::Exclude,
+            apps: vec![executable.clone()],
+            package_sids: Vec::new(),
+        });
+        let table = FlowTable::default();
+        let k_excluded = make_key(50_001, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let k_dead = make_key(50_002, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let k_lan = make_key(50_003, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 80);
+        let k_server = make_key(50_004, server.ip(), server.port());
+        let k_own = make_key(50_005, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let k_raced = make_key(50_006, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        table.insert(k_raced, Disposition::Tunnel);
+
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, other_pid, k_excluded, pid), Some(Disposition::Direct));
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, other_pid, k_dead, 999_999_999), Some(Disposition::Discard));
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, other_pid, k_lan, pid), None);
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, other_pid, k_server, pid), None);
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, pid, k_own, pid), None);
+        // FlowWatcher already inserted Tunnel -> preclassification must not overwrite it.
+        assert_eq!(super::apply_preclassified_tcp_entry(&table, &exclude_classifier, server, None, other_pid, k_raced, pid), None);
+        assert_eq!(table.lookup(&k_excluded), Some(Disposition::Direct));
+        assert_eq!(table.lookup(&k_dead), Some(Disposition::Discard));
+        assert_eq!(table.lookup(&k_raced), Some(Disposition::Tunnel));
+
+        // Include mode: listed app pre-existing flow becomes Discard; dead PID stays Direct.
+        let include_classifier = super::Classifier::new(&AppRoutingPolicy {
+            mode: AppRoutingMode::Include,
+            apps: vec![executable],
+            package_sids: Vec::new(),
+        });
+        let include_table = FlowTable::default();
+        assert_eq!(super::apply_preclassified_tcp_entry(&include_table, &include_classifier, server, None, other_pid, k_excluded, pid), Some(Disposition::Discard));
+        assert_eq!(super::apply_preclassified_tcp_entry(&include_table, &include_classifier, server, None, other_pid, k_dead, 999_999_999), Some(Disposition::Direct));
+    }
+
+    #[test]
+    fn lookup_or_wait_unblocks_immediately_on_stop_waiting() {
+        let table = std::sync::Arc::new(FlowTable::default());
+        table.enable_wait();
+        let stopper = std::sync::Arc::clone(&table);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            stopper.stop_waiting();
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            table.lookup_or_wait(&key(), std::time::Duration::from_secs(2)),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        handle.join().expect("stopper thread");
+    }
+
+    #[test]
+    fn enumerates_live_windows_tcp_socket_with_correct_port_endianness() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let local_port = client.local_addr().expect("client addr").port();
+        let buf = super::read_extended_tcp_table(u32::from(super::AF_INET)).expect("tcp4 table");
+        let ptr = buf.as_ptr().cast::<super::MIB_TCPTABLE_OWNER_PID>();
+        let count = unsafe { (*ptr).dwNumEntries as usize };
+        let rows = unsafe { std::slice::from_raw_parts((*ptr).table.as_ptr(), count) };
+        let found = rows.iter().any(|row| {
+            row.dwOwningPid == std::process::id()
+                && super::decode_tcp_port(row.dwLocalPort) == local_port
+                && super::decode_tcp_port(row.dwRemotePort) == addr.port()
+        });
+        assert!(found, "expected live TCP socket in GetExtendedTcpTable");
     }
 }
