@@ -1,5 +1,7 @@
 # Upstream MouseVPN Modernization: Authentication, Server Discovery & Protocol Analysis
 
+> **Path note (2026-11-24):** This research records the baseline location used at the time of investigation (`D:\BatmanVPN-test`). Following workspace consolidation, the current canonical locations are `D:\Develop\BatmanVPN\repositories\BatmanVPN-test` (baseline) and `D:\Develop\BatmanVPN\repositories\BatmanVPN-feature-upstream` (feature worktree). Historical path references below are retained as evidence of the original test environment.
+
 ## Executive Summary
 
 A comprehensive investigation and reverse-engineering of upstream MouseVPN (`https://github.com/Zumka1991/MouseVPN.git`) was conducted against the local BatmanVPN baseline repository (`D:\BatmanVPN-test`). Upstream has evolved from a standalone static-profile VPN to a centralized subscription service powered by `crates/control-plane` and `crates/account-client`, while introducing **Mousality** (a TLS 1.3/Chrome 156-camouflaged TCP VPN transport) and an authenticated dynamic server discovery catalog with strict device-limit quotas (2 devices per account).

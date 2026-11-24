@@ -1,5 +1,7 @@
 # BatmanVPN — Upstream Integration & Verification Report
 
+> **Path note (2026-11-24):** This report is historical and retains the paths used during the 2026-11-10 test run. Current canonical locations are `D:\Develop\BatmanVPN\repositories\BatmanVPN-feature-upstream` (feature worktree) and `D:\Develop\BatmanVPN\repositories\BatmanVPN-test` (base/baseline). The three IDE-managed Antigravity worktrees remain under the user's `.gemini\antigravity\worktrees` directory and are linked to the relocated base repository.
+
 **Date:** 2026-11-10  
 **Target Feature Branch:** `feature/upstream-auth-server-discovery`  
 **Worktree:** `D:\BatmanVPN-feature-upstream`  
